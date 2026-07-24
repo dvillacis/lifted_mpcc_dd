@@ -1,0 +1,67 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite both the software (this record) and the
+  accompanying paper (see `preferred-citation`).
+title: >-
+  lifted-mpcc-dd: a domain-decomposition IPOPT linear solver for the lifted
+  TV-denoising MPCC
+abstract: >-
+  Companion code for the domain-decomposition (arrowhead / Schur-complement)
+  linear solver used inside IPOPT to solve the bilevel total-variation image
+  denoising problem written as a lifted mathematical program with complementarity
+  constraints (MPCC), in the unit-ball dual formulation. The C++ plugin injects a
+  custom SparseSymLinearSolverInterface that produces every interior-point Newton
+  step by domain decomposition (local HSL MA57/MA97 factorizations plus a direct
+  or preconditioned-CG interface solve), answering IPOPT's inertia query via the
+  Haynsworth identity without ever factorizing the full KKT. Ships with the Python
+  reference implementations it is validated against and the scripts that reproduce
+  every figure.
+type: software
+version: 1.0.0
+date-released: "2026-07-24"
+license: BSD-3-Clause
+# TODO before minting the DOI — confirm the public repository slug:
+repository-code: "https://github.com/dvillacis/lifted-mpcc-dd"
+authors:
+  - family-names: Villacís
+    given-names: David
+    email: david@villacis.net
+    orcid: "https://orcid.org/0000-0002-8016-9062"
+    affiliation: "Departamento de Métodos Cuantitativos, Universidad Loyola Andalucía"
+  - family-names: De los Reyes
+    given-names: Juan Carlos
+    # TODO before minting the DOI — add ORCID (Zenodo validates it; a malformed
+    # one is rejected, which is why it is omitted rather than faked) and confirm
+    # the affiliation string.
+    affiliation: "Research Center on Mathematical Modelling (MODEMAT), Escuela Politécnica Nacional, Quito, Ecuador"
+  - family-names: Riera
+    given-names: Daniela
+    # TODO before minting the DOI — add ORCID and confirm the affiliation.
+    affiliation: "TODO — confirm affiliation"
+keywords:
+  - bilevel optimization
+  - MPCC
+  - complementarity constraints
+  - total variation denoising
+  - domain decomposition
+  - interior-point methods
+  - Schur complement
+  - Haynsworth inertia additivity
+  - IPOPT
+preferred-citation:
+  type: article
+  # TODO before minting the DOI — replace with the exact published title.
+  title: >-
+    Bilevel Optimization as a Mathematical Program with Complementarity
+    Constraints: Applications in Imaging
+  authors:
+    - family-names: Villacís
+      given-names: David
+    - family-names: De los Reyes
+      given-names: Juan Carlos
+    - family-names: Riera
+      given-names: Daniela
+  year: 2026
+  # TODO before minting the DOI — uncomment and fill once the article DOI is assigned:
+  # journal: "..."
+  # doi: "10.xxxx/xxxxx"

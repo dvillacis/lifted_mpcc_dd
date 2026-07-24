@@ -1,0 +1,43 @@
+# Compiled C++ drivers & artifacts
+cpp/dd_solve
+cpp/dd_solve_1d
+cpp/dd_solve_2d
+cpp/dd_solve*_omp
+cpp/dd_solve*_prof
+cpp/ma97_smoke
+cpp/ma97_smoke_par
+*.o
+*.dSYM/
+*.dwarf
+
+# Solver output (regenerated)
+cpp/results/
+cpp/plots/
+cpp/sol_*.txt
+cpp/dd_*.txt
+cpp/*.png
+
+# SLURM logs
+slurm/*.out
+slurm/*.err
+slurm-*.out
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Rendered figures at the top level / python side
+python/*.png
+*.png
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# Keep the vendored sample image and bundled data despite the *.png / .txt rules above
+!images/cameraman.png
+!python/images/cameraman.png
+!cpp/data/*.txt

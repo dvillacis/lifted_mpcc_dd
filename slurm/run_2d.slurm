@@ -1,0 +1,112 @@
+#!/bin/bash
+# 2D staggered DD sweep on the mariposa image — RUNS PREBUILT BINARIES ONLY
+# (compile beforehand with ./build_all_ma97_omp.sh; validate once per machine
+# per that script's header). Each size N runs the PNG route (C++ hybrid-CP warm
+# start, area-downsample loader) under four solvers: IPOPT-ma97 monolithic
+# reference, DD direct interface, DD CG, DD MINRES. Logs, solution/arrowhead
+# dumps, a summary, and (best-effort) the plots land in results/slurm_<jobid>/.
+#
+#   sbatch run_2d.slurm                      # from cpp/ on the cluster
+#   REPO=/path/to/lifted-mpcc-dd sbatch run_2d.slurm
+#
+# Notes:
+#   * The PNG route's noise draw differs from Python (std::mt19937 vs NumPy
+#     PCG64) — self-consistent across solvers here, but not comparable to
+#     Python numbers; use dump_data_2d.py dumps for that (see cpp/README.md).
+#   * The 2D driver defaults to the μ-coupled t-update (single solve). It has
+#     no best-completed-level fallback — if a size misbehaves (mariposa has a
+#     known bad-α₀ barrier-stall mode), re-run that size with
+#     `--t-update geometric`.
+#   * MA97 threading: W_k factorization serial, backsolves parallel (settled
+#     2026-07-23); OMP_NUM_THREADS also feeds MA97's internal parallelism,
+#     which the big monolithic ma97 runs use fully.
+#
+#SBATCH --job-name=mpcc_dd2d
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --partition=normal
+#SBATCH --time=12:00:00
+
+set -o pipefail
+
+# --- 0. Configuration --------------------------------------------------------
+REPO="${REPO:-$HOME/lifted-mpcc-dd}"           # directory holding cpp/ and images/
+BIN=./dd_solve_2d                               # prebuilt (build_all_ma97_omp.sh)
+IMG=../images/cameraman.png                     # bundled; override with any image (e.g. a higher-res one for large N)
+NS=(32 48 64 80 96 128)                         # image sizes to sweep
+KS=( 8  8  8  8  8   8)                         # nsub per size (edit per-entry)
+
+# --- 1. Environment ----------------------------------------------------------
+source /opt/ohpc/pub/apps/conda/etc/profile.d/conda.sh
+conda activate mkl_imaging
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export MKL_THREADING_LAYER=SEQUENTIAL          # keep MKL off libiomp5 under our libgomp threads
+export OMP_PROC_BIND=close                     # pin threads to cores (no migration)
+export OMP_PLACES=cores
+
+cd "$REPO/cpp" || { echo "error: $REPO/cpp not found (set REPO=)"; exit 1; }
+[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma97_omp.sh"; exit 1; }
+[ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
+
+RUN="results/slurm_${SLURM_JOB_ID}"
+mkdir -p "$RUN/logs" "$RUN/sols" "$RUN/plots"
+echo "🚀 Job started at: $(date)   results -> $REPO/cpp/$RUN"
+
+# --- 2. Runs -----------------------------------------------------------------
+for i in "${!NS[@]}"; do
+  n="${NS[$i]}"; k="${KS[$i]}"
+  tag="mariposa_N${n}_k${k}"
+  common=(--data "$IMG" --size "$n" --nsub "$k" --init cp)
+
+  $BIN "${common[@]}" --solver ma97 \
+      > "$RUN/logs/${tag}_ma97.log" 2>&1
+  $BIN "${common[@]}" --solver dd \
+      --save-solution "$RUN/sols/sol_${tag}.txt" --save-dd "$RUN/sols/dd_${tag}.txt" \
+      > "$RUN/logs/${tag}_dd.log" 2>&1
+  $BIN "${common[@]}" --solver dd --interface cg \
+      > "$RUN/logs/${tag}_dd_cg.log" 2>&1
+  $BIN "${common[@]}" --solver dd --interface minres \
+      > "$RUN/logs/${tag}_dd_minres.log" 2>&1
+  echo "  done $tag  ($(date +%T))"
+done
+
+# --- 3. Summary --------------------------------------------------------------
+{
+  echo "job $SLURM_JOB_ID  node $(hostname)  $(date)"
+  echo "binary: $BIN  image: $IMG  OMP_NUM_THREADS=$OMP_NUM_THREADS  MKL_THREADING_LAYER=$MKL_THREADING_LAYER"
+  for f in "$RUN"/logs/mariposa_*.log; do
+    echo; echo "===== $(basename "$f") ====="; tail -n 15 "$f"
+  done
+} > "$RUN/summary.txt"
+
+# --- 4. Plots (best-effort: needs cyipopt+matplotlib in the env; the dumps in
+#         sols/ let you plot locally with python/plot_2d.py otherwise) ----------
+export MPLBACKEND=Agg
+PLOT_FAIL=0
+for i in "${!NS[@]}"; do
+  n="${NS[$i]}"; k="${KS[$i]}"
+  tag="mariposa_N${n}_k${k}"
+  [ -f "$RUN/sols/sol_${tag}.txt" ] || continue
+  python ../python/plot_2d.py --solution "$RUN/sols/sol_${tag}.txt" \
+      --dd-dump "$RUN/sols/dd_${tag}.txt" \
+      --save-plot "$RUN/plots/sol_${tag}.png" \
+      --save-domains "$RUN/plots/dom_${tag}.png" \
+      --save-dd-plot "$RUN/plots/dd_${tag}.png" \
+      >> "$RUN/logs/plots.log" 2>&1 || PLOT_FAIL=1
+done
+if [ "$PLOT_FAIL" -ne 0 ]; then
+  echo "note: some plots failed — last errors:"
+  tail -n 20 "$RUN/logs/plots.log"
+  echo "(dumps in $RUN/sols can be plotted locally with python/plot_2d.py)"
+fi
+
+# keep the SLURM stdout/err with the rest (still open, cp not mv)
+cp "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out" \
+   "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.err" "$RUN/logs/" 2>/dev/null
+
+echo "🏁 Job finished at: $(date)   see $RUN/summary.txt"
+conda deactivate

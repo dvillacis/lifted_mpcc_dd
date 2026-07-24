@@ -1,0 +1,13 @@
+# Python reference + reproduction helpers for lifted-mpcc-dd.
+# Python 3.11 (the reference was developed and validated on 3.11.x).
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# cyipopt needs an IPOPT install to build/link against (Homebrew `ipopt` on
+# macOS, conda-forge `ipopt` on Linux). See ../README.md.
+numpy>=1.26
+scipy>=1.11
+cyipopt>=1.4
+pillow>=10.0
+matplotlib>=3.8
