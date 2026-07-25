@@ -34,7 +34,21 @@
 set -o pipefail
 
 # --- 0. Configuration --------------------------------------------------------
-REPO="${REPO:-$HOME/lifted-mpcc-dd}"           # directory holding cpp/ and images/
+# Repo root = the directory holding cpp/ and images/. Explicit REPO= always
+# wins; otherwise walk UP from the submit directory looking for that pair, so
+# `sbatch` works from the repo root, from cpp/, or from slurm/ without anyone
+# having to know the checkout's name. (sbatch copies the script to a node spool
+# dir, so $BASH_SOURCE is useless here — SLURM_SUBMIT_DIR is the reliable
+# anchor.) The old default hardcoded ~/lifted-mpcc-dd, which does not match what
+# `git clone` of lifted_mpcc_dd produces.
+if [ -z "${REPO:-}" ]; then
+  _d="${SLURM_SUBMIT_DIR:-$PWD}"
+  while [ "$_d" != "/" ] && [ -n "$_d" ]; do
+    if [ -d "$_d/cpp" ] && [ -d "$_d/images" ]; then REPO="$_d"; break; fi
+    _d="$(dirname "$_d")"
+  done
+fi
+REPO="${REPO:-$HOME/lifted-mpcc-dd}"           # last-resort default
 BIN=./dd_solve_2d                               # prebuilt (build_all_ma97_omp.sh)
 IMG=../images/cameraman.png                     # bundled; override with any image (e.g. a higher-res one for large N)
 NS=(32 48 64 80 96 128)                         # image sizes to sweep
@@ -48,7 +62,12 @@ export MKL_THREADING_LAYER=SEQUENTIAL          # keep MKL off libiomp5 under our
 export OMP_PROC_BIND=close                     # pin threads to cores (no migration)
 export OMP_PLACES=cores
 
-cd "$REPO/cpp" || { echo "error: $REPO/cpp not found (set REPO=)"; exit 1; }
+cd "$REPO/cpp" || {
+  echo "error: no cpp/ under REPO=$REPO"
+  echo "       searched upward from ${SLURM_SUBMIT_DIR:-$PWD} for a dir holding cpp/ and images/"
+  echo "       fix: REPO=/path/to/checkout sbatch $0"
+  exit 1
+}
 [ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma97_omp.sh"; exit 1; }
 [ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
 
