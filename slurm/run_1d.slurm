@@ -51,6 +51,12 @@ KS=(4 8 16 32)
 # --- 1. Environment ----------------------------------------------------------
 source /opt/ohpc/pub/apps/conda/etc/profile.d/conda.sh
 conda activate mkl_imaging
+# Numeric output must be locale-independent. On a machine with a comma decimal
+# separator (es_*, de_*, fr_* ...) awk/printf emit "1,32" — which silently turns
+# every timings.csv row into one with an extra field, and makes the solver's own
+# tables unparseable. C locale for the whole job, so every number logged here is
+# machine-readable wherever it runs.
+export LC_ALL=C
 # THREADS: how many OpenMP threads the DD loops get. Defaults to the whole
 # allocation, but note the parallel loops run ONE TASK PER SUBDOMAIN, so the
 # thread count wants to divide nsub^2. At nsub=8 that is 64 tasks:

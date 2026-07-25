@@ -67,6 +67,12 @@ REPO="${REPO:-$HOME/lifted-mpcc-dd}"
 # --- 2. Environment ----------------------------------------------------------
 source /opt/ohpc/pub/apps/conda/etc/profile.d/conda.sh
 conda activate mkl_imaging
+# Numeric output must be locale-independent. On a machine with a comma decimal
+# separator (es_*, de_*, fr_* ...) awk/printf emit "1,32" — which silently turns
+# every timings.csv row into one with an extra field, and makes the solver's own
+# tables unparseable. C locale for the whole job, so every number logged here is
+# machine-readable wherever it runs.
+export LC_ALL=C
 # One task per subdomain, so the thread count wants to divide nsub^2; with the
 # bracket above (144/256/576 subdomains) 44 is fine — all are >> 44, so the
 # tail wave is a small fraction. THREADS= overrides without touching SBATCH.
@@ -121,8 +127,50 @@ if [ "$NOREF" != "1" ]; then
     || echo "warning: no libhsl_ma57.so found — the --solver ma57 baseline will fail (DD runs unaffected)"
 fi
 
+# --- timing ------------------------------------------------------------------
+# $SECONDS is integer and wall-only. At this size three numbers matter: WALL
+# (what you wait), CPU (with 44 threads this is far larger — their ratio is the
+# achieved parallelism), and PEAK RSS (what decides whether the next size fits
+# at all, and the first thing to check when a job dies silently). GNU time -v
+# supplies CPU and RSS; wall is taken here so it stays exact even without it.
+_now() {   # seconds with sub-second resolution where date supports %N
+  local t; t=$(date +%s.%N 2>/dev/null)
+  case "$t" in *N*|"") date +%s;; *) printf '%s' "$t";; esac
+}
+HAVE_GNUTIME=0
+/usr/bin/time -v true >/dev/null 2>&1 && HAVE_GNUTIME=1
+[ "$HAVE_GNUTIME" = "1" ] || echo "note: GNU time -v unavailable — wall clock only, no CPU/RSS"
+
+run_timed() {   # run_timed <tag> <label> <logfile> -- cmd...
+  local tag="$1" lbl="$2" log="$3"; shift 3; [ "$1" = "--" ] && shift
+  local t0 t1 wall cpu rss rc tf us sy
+  tf="$(mktemp)"; t0=$(_now)
+  if [ "$HAVE_GNUTIME" = "1" ]; then
+    /usr/bin/time -v -o "$tf" "$@" >> "$log" 2>&1; rc=$?
+  else
+    "$@" >> "$log" 2>&1; rc=$?
+  fi
+  t1=$(_now)
+  wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+  cpu=NA; rss=NA
+  if [ -s "$tf" ]; then
+    us=$(awk -F': ' '/User time/{print $2}' "$tf")
+    sy=$(awk -F': ' '/System time/{print $2}' "$tf")
+    cpu=$(awk -v u="$us" -v s="$sy" 'BEGIN{printf "%.2f", u+s}')
+    rss=$(awk -F': ' '/Maximum resident set size/{printf "%.0f", $2/1024}' "$tf")
+    { echo; echo "--- GNU time -v ---"; cat "$tf"; } >> "$log"
+  fi
+  rm -f "$tf"
+  printf '%s,%s,%s,%s,%s,%s\n' "$tag" "$lbl" "$wall" "$cpu" "$rss" "$rc" >> "$TIMINGS"
+  echo "[timing] $tag $lbl  wall ${wall}s  cpu ${cpu}s  maxRSS ${rss}MB  exit $rc" >> "$log"
+  echo "  $lbl k=${k:-?}  wall ${wall}s  cpu ${cpu}s  maxRSS ${rss}MB  exit $rc"
+  return $rc
+}
+
 RUN="$(cd .. && pwd)/results/slurm_${SLURM_JOB_ID}"
 mkdir -p "$RUN/logs" "$RUN/sols" "$RUN/plots"
+TIMINGS="$RUN/timings.csv"
+echo "tag,solver,wall_s,cpu_s,maxrss_MB,exit" > "$TIMINGS"
 echo "🚀 N=$N  nsub in [$KS]  threads=$OMP_NUM_THREADS  pilot=$PILOT  $(date)"
 echo "   results -> $RUN"
 
@@ -131,11 +179,8 @@ for k in $KS; do
   tag="${IMGTAG}_N${N}_k${k}"
   common=(--data "$IMG" --size "$N" --nsub "$k" --init cp "${EXTRA[@]}")
 
-  t0=$SECONDS
-  $BIN "${common[@]}" --solver dd \
-      --save-solution "$RUN/sols/sol_${tag}.txt" \
-      > "$RUN/logs/${tag}_dd.log" 2>&1
-  echo "  dd   k=$k  $((SECONDS-t0))s  ($(date +%T))"
+  run_timed "$tag" dd "$RUN/logs/${tag}_dd.log" -- \
+      $BIN "${common[@]}" --solver dd --save-solution "$RUN/sols/sol_${tag}.txt"
   # Plot THIS solution now, not at the end of the job: a sweep at this size can
   # be killed by walltime or the OOM killer partway through, and figures for the
   # cases that did finish are worth having. --only keeps it to the one tag, so
@@ -146,9 +191,8 @@ for k in $KS; do
     || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
 
   if [ "$NOREF" != "1" ]; then
-    t0=$SECONDS
-    $BIN "${common[@]}" --solver ma57 > "$RUN/logs/${tag}_ma57.log" 2>&1
-    echo "  ma57 k=$k  $((SECONDS-t0))s"
+    run_timed "$tag" ma57 "$RUN/logs/${tag}_ma57.log" -- \
+        $BIN "${common[@]}" --solver ma57
     break   # the baseline does not depend on nsub — run it once
   fi
 done
@@ -160,6 +204,9 @@ done
   for f in "$RUN"/logs/*_N*.log; do
     echo; echo "===== $(basename "$f") ====="; tail -n 20 "$f"
   done
+  echo
+  echo "--- timings (wall/cpu seconds, peak RSS MB) ---"
+  column -t -s, "$TIMINGS" 2>/dev/null || cat "$TIMINGS"
 } > "$RUN/summary.txt"
 
 cp "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out" \
