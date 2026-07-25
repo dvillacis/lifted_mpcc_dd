@@ -19,9 +19,12 @@ cpp/sol_*.txt
 cpp/dd_*.txt
 cpp/*.png
 
-# SLURM logs
-slurm/*.out
-slurm/*.err
+# SLURM logs. The batch scripts write %x_%j.out/.err into SLURM_SUBMIT_DIR, and
+# since they now locate the repo themselves that can be the repo root, cpp/ or
+# slurm/ — so these are global rather than slurm/-scoped. Nothing tracked has
+# either extension; re-check before adding one that should be committed.
+*.out
+*.err
 slurm-*.out
 
 # Python
