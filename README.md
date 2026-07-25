@@ -73,7 +73,7 @@ lifted-mpcc-dd/
 │   ├── ma97_block.hpp        HSL MA97 wrapper (HPC backend)
 │   ├── image_io.hpp          image / phantom loader (vendored)
 │   ├── third_party/          stb_image.h (vendored, public-domain/MIT)
-│   ├── build*.sh             build helpers (macOS / Linux / MA97+OpenMP)
+│   ├── build*.sh             build helpers (macOS / Linux / MA57+OMP / MA97+OMP)
 │   ├── data/                 sample 1D instances (.txt)
 │   └── README.md             detailed technical notes & measurements
 ├── python/                ← reproduction helpers (data generation + plotting)
@@ -129,8 +129,9 @@ cd cpp
 
 # Linux (conda env active; auto-picks MA57 or MA97):
 ./build_linux.sh dd_solve_1d.cpp -o dd_solve_1d
-# ... or build everything with MA97 + OpenMP on the cluster:
-./build_all_ma97_omp.sh
+# ... or build everything with OpenMP across the subdomains:
+./build_all_ma57_omp.sh          # MA57 (all parallel regions live)
+./build_all_ma97_omp.sh          # MA97 on the cluster (serial W_k factorization)
 ```
 
 The build scripts document their environment assumptions and the `HSLDIR` /

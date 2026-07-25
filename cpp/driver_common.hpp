@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -115,12 +116,42 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
   if (solver == "mumps" || solver == "ma57" || solver == "ma97")
     app->Options()->SetStringValue("linear_solver", solver);
   if (solver == "ma57") {
-    // Same dylib the Python drivers use (overridable via the HSLLIB env var).
-    const char *hsl = std::getenv("HSLLIB");
-    app->Options()->SetStringValue(
-        "hsllib", hsl ? hsl
-                      : "/Users/davidvillacis/src/hsl/hsl_ma57-5.3.2/src/.libs/"
-                        "libhsl_ma57.dylib");
+    // IPOPT's OWN ma57 route loads the library at runtime through its `hsllib`
+    // option, so it needs a path rather than a link. Search order, first hit
+    // wins:
+    //   HSLLIB                 explicit override (what the SLURM scripts set)
+    //   $HSLDIR/lib            the prefix build.sh compiles the DD route against
+    //   ~/.local/hsl-ma57/lib  build.sh's documented default prefix
+    //   bare soname            let the dynamic loader search DYLD_/LD_LIBRARY_PATH
+    // The bare name is the last resort rather than a hard error: MA57 is
+    // proprietary and legitimately absent on many machines, and IPOPT emits its
+    // own clear load failure if nothing resolves. (Before 2026-07-25 this fell
+    // back to a developer-machine absolute path, which resolved for exactly one
+    // user and silently sent everyone else down IPOPT's error path.)
+#ifdef __APPLE__
+    const char *soname = "libhsl_ma57.dylib";
+#else
+    const char *soname = "libhsl_ma57.so";
+#endif
+    auto readable = [](const std::string &p) {
+      std::ifstream f(p.c_str());
+      return f.good();
+    };
+    std::string lib;
+    if (const char *env = std::getenv("HSLLIB")) lib = env;
+    if (lib.empty())
+      if (const char *dir = std::getenv("HSLDIR")) {
+        const std::string c = std::string(dir) + "/lib/" + soname;
+        if (readable(c)) lib = c;
+      }
+    if (lib.empty())
+      if (const char *home = std::getenv("HOME")) {
+        const std::string c =
+            std::string(home) + "/.local/hsl-ma57/lib/" + soname;
+        if (readable(c)) lib = c;
+      }
+    if (lib.empty()) lib = soname;
+    app->Options()->SetStringValue("hsllib", lib);
   }
   if (app->Initialize() != Ipopt::Solve_Succeeded) {
     std::cerr << "IPOPT initialization failed\n";

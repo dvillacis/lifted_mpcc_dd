@@ -876,7 +876,7 @@ beside the stock one — nothing existing is overwritten, and the in-tree
 `src/.libs` that IPOPT's own `--solver ma57` loads via `HSLLIB` is untouched:
 
 ```bash
-cp -R ~/src/hsl/hsl_ma57-5.3.2 /tmp/ma57acc && cd /tmp/ma57acc
+cp -R "$HSL_MA57_SRC" /tmp/ma57acc && cd /tmp/ma57acc   # your unpacked hsl_ma57-5.3.x
 make distclean
 # cp's timestamp skew otherwise triggers a maintainer-mode autotools rebuild
 touch configure.ac aclocal.m4
