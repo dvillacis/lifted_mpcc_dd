@@ -83,25 +83,14 @@ done
   done
 } > "$RUN/summary.txt"
 
-# --- 4. Plots (best-effort: needs cyipopt+matplotlib in the env; the dumps in
-#         sols/ let you plot locally with python/plot_2d.py otherwise) ----------
+# --- 4. Plots (best-effort: needs matplotlib; the self-contained --save-solution
+#         dumps in sols/ can also be plotted later with python/plot_slurm.py) ----
 export MPLBACKEND=Agg
-PLOT_FAIL=0
-for i in "${!NS[@]}"; do
-  n="${NS[$i]}"; k="${KS[$i]}"
-  tag="mariposa_N${n}_k${k}"
-  [ -f "$RUN/sols/sol_${tag}.txt" ] || continue
-  python ../python/plot_2d.py --solution "$RUN/sols/sol_${tag}.txt" \
-      --dd-dump "$RUN/sols/dd_${tag}.txt" \
-      --save-plot "$RUN/plots/sol_${tag}.png" \
-      --save-domains "$RUN/plots/dom_${tag}.png" \
-      --save-dd-plot "$RUN/plots/dd_${tag}.png" \
-      >> "$RUN/logs/plots.log" 2>&1 || PLOT_FAIL=1
-done
-if [ "$PLOT_FAIL" -ne 0 ]; then
-  echo "note: some plots failed — last errors:"
+if ! python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" \
+        >> "$RUN/logs/plots.log" 2>&1; then
+  echo "note: plotting failed — last errors:"
   tail -n 20 "$RUN/logs/plots.log"
-  echo "(dumps in $RUN/sols can be plotted locally with python/plot_2d.py)"
+  echo "(the self-contained sols/ dumps can be plotted later with python/plot_slurm.py)"
 fi
 
 # keep the SLURM stdout/err with the rest (still open, cp not mv)

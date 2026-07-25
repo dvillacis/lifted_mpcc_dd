@@ -76,23 +76,9 @@ done
   done
 } > "$RUN/summary.txt"
 
-# --- 4. Plots (best-effort: needs cyipopt+matplotlib in the env; the dumps in
-#         sols/ let you plot locally with python/plot_1d.py otherwise) ----------
-export MPLBACKEND=Agg
-PLOT_FAIL=0
-for n in "${NS[@]}"; do
-  for k in "${KS[@]}"; do
-    tag="n${n}_k${k}"
-    [ -f "$RUN/sols/sol_${tag}.txt" ] || continue
-    python ../python/plot_1d.py --data "data/data_1d_${tag}.txt" \
-        --solution "$RUN/sols/sol_${tag}.txt" --dd-dump "$RUN/sols/dd_${tag}.txt" \
-        --save-plot "$RUN/plots/sol_${tag}.png" \
-        --save-dd-plot "$RUN/plots/dd_${tag}.png" \
-        >> "$RUN/logs/plots.log" 2>&1 || PLOT_FAIL=1
-  done
-done
-[ "$PLOT_FAIL" -ne 0 ] && \
-  echo "note: some plots failed (logs/plots.log) — plot the sols/ dumps locally"
+# --- 4. Plots — 1D figures are drawn by the reference implementation's plotter,
+#         which is not part of this archival package. The self-contained
+#         --save-solution / --save-dd dumps in sols/ are kept for external plotting.
 
 # keep the SLURM stdout/err with the rest (still open, cp not mv)
 cp "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out" \
