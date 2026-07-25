@@ -29,6 +29,10 @@ __pycache__/
 .venv/
 venv/
 .ipynb_checkpoints/
+# uv: the environment is disposable (.venv above), the lockfile is NOT —
+# python/uv.lock is committed so `uv sync` reproduces the exact versions a
+# recorded run used.
+.uv-cache/
 
 # Rendered figures at the top level / python side
 python/*.png

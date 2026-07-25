@@ -80,7 +80,10 @@ lifted-mpcc-dd/
 │   ├── mpcc_utils.py         data-gen core extracted from the Python reference
 │   ├── dump_data*.py         write byte-identical instances for the C++ solver
 │   ├── plot_slurm.py         render 2D result figures from --save-solution dumps
-│   ├── requirements.txt
+│   ├── pyproject.toml        uv project: dependencies + Python floor
+│   ├── .python-version       pinned CPython 3.11
+│   ├── uv.lock               exact resolved versions (committed)
+│   ├── requirements.txt      generated pip fallback
 │   └── README.md
 ├── slurm/                 ← example HPC batch scripts
 └── images/                ← the bundled test image (cameraman)
@@ -102,9 +105,17 @@ lifted-mpcc-dd/
   IPOPT's bundled MUMPS (`--solver mumps`), but the DD route (`--solver dd`)
   requires MA57/MA97.
 
-**Python helpers** (data generation + plotting only — no IPOPT needed) — Python
-3.11 and `pip install -r python/requirements.txt` (numpy, scipy, pillow,
-matplotlib). See [`python/README.md`](python/README.md).
+**Python helpers** (data generation + plotting only — no IPOPT needed) — managed
+with [uv](https://docs.astral.sh/uv/):
+
+```bash
+cd python && uv sync
+```
+
+`uv` fetches the pinned CPython 3.11 itself, so no system Python is needed; the
+dependencies are numpy, scipy, pillow and matplotlib, locked in `python/uv.lock`.
+Without uv, `pip install -r python/requirements.txt` into a 3.11 venv installs the
+same versions. See [`python/README.md`](python/README.md).
 
 ## Build
 
@@ -151,7 +162,7 @@ dump with the Python helper first:
 
 ```bash
 cd python
-python dump_data_1d.py --n 64 --nsub 4 -o ../cpp/data/data_1d_64.txt
+uv run python dump_data_1d.py --n 64 --nsub 4 -o ../cpp/data/data_1d_64.txt
 cd ../cpp && ./dd_solve_1d --data data/data_1d_64.txt --nsub 4 --solver dd
 ```
 

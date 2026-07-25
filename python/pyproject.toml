@@ -1,0 +1,23 @@
+[project]
+name = "lifted-mpcc-dd-helpers"
+version = "1.0.0"
+description = "Data-generation and plotting helpers for the lifted-mpcc-dd C++ domain-decomposition solver"
+readme = "README.md"
+license = { file = "../LICENSE" }
+authors = [{ name = "David Villacís", email = "david@villacis.net" }]
+# 3.11 is what the reference formulation was developed and validated on; the
+# generated instances must stay byte-identical to the recorded runs, so the
+# floor is a statement about validation, not just syntax.
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pillow>=10.0",   # load_image (mpcc_utils) reads PNG/JPEG via PIL.Image
+    "matplotlib>=3.8",  # plot_slurm.py figures
+]
+
+# Scripts, not a library: there is nothing to build or install, so uv manages
+# only the environment. Without this uv would try to build a wheel from this
+# directory and fail — the modules here are imported by path, not packaged.
+[tool.uv]
+package = false

@@ -38,7 +38,13 @@ Placeholders that MUST be filled or they will appear verbatim on the public DOI 
 - [ ] **Sanity-build** — from a clean checkout, `cd cpp && ./build.sh
       dd_solve_1d.cpp -o dd_solve_1d && ./dd_solve_1d --data
       data/data_1d_n256_k4.txt --nsub 4 --self-check` should pass; the Python
-      helpers should `import` (`cd python && python -c "import mpcc_utils"`).
+      helpers should sync and import (`cd python && uv sync && uv run python -c
+      "import mpcc_utils"`).
+- [ ] **Byte-identical instances** — the pinned environment must still reproduce
+      the bundled data, or the Python↔C++ comparison the package is built around
+      no longer holds:
+      `cd python && uv run python dump_data_1d.py --n 256 --nsub 4 -o /tmp/r.txt
+      && cmp /tmp/r.txt ../cpp/data/data_1d_n256_k4.txt`
 
 ## One-time setup
 
