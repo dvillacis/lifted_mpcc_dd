@@ -100,6 +100,15 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
       app->Options()->SetIntegerValue("limited_memory_max_history", std::atoi(h));
     if (const char *a = std::getenv("DD_LM_AUG"))
       app->Options()->SetStringValue("limited_memory_aug_solver", a);
+    // DD_NEG_CURV=tol (EXPERIMENT): IPOPT's inertia-free curvature test
+    // (Chiang & Zavala). With tol > 0 the filter line search certifies negative
+    // curvature from the computed step instead of from In(A), so the linear
+    // solver no longer has to report inertia at all. For this solver that is the
+    // whole ball game: In(A) = sum In(W_k) + In(S) is exact ONLY because S is
+    // factorized directly every Newton step, and that factorization is the
+    // serial O(p^1.5) floor. See cpp/README.md.
+    if (const char *nc = std::getenv("DD_NEG_CURV"))
+      app->Options()->SetNumericValue("neg_curv_test_tol", std::atof(nc));
   }
   app->Options()->SetNumericValue("acceptable_tol", 1e-2);
   app->Options()->SetNumericValue("acceptable_dual_inf_tol", 1e2);
