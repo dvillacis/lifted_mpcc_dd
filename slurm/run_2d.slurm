@@ -50,7 +50,7 @@ if [ -z "${REPO:-}" ]; then
 fi
 REPO="${REPO:-$HOME/lifted-mpcc-dd}"           # last-resort default
 BIN=./dd_solve_2d                               # prebuilt (build_all_ma57_omp.sh)
-IMG=../images/cameraman.png                     # bundled; override with any image (e.g. a higher-res one for large N)
+# (IMG/IMGTAG resolved below, after the repo root is known)
 NS=(32 48 64 80 96 128)                         # image sizes to sweep
 KS=( 8  8  8  8  8   8)                         # nsub per size (edit per-entry)
 
@@ -89,6 +89,17 @@ cd "$REPO/cpp" || {
   echo "       fix: REPO=/path/to/checkout sbatch $0"
   exit 1
 }
+# Image. mariposa.png if it is there, else the bundled cameraman. IMG= overrides.
+# The TAG is derived from whatever is actually loaded, so logs, solution dumps
+# and figures can never again claim one image while the run used another (which
+# is what "mariposa_*" tags on cameraman runs used to do).
+if [ -z "${IMG:-}" ]; then
+  for _c in ../images/mariposa.png ../images/cameraman.png; do
+    [ -f "$_c" ] && { IMG="$_c"; break; }
+  done
+fi
+IMG="${IMG:-../images/cameraman.png}"
+IMGTAG="$(basename "$IMG")"; IMGTAG="${IMGTAG%.*}"
 [ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma57_omp.sh"; exit 1; }
 # IPOPT's OWN --solver ma57 reference run dlopen()s MA57 at RUNTIME via its
 # hsllib option, unlike the DD runs which link it at build time through an
@@ -121,7 +132,7 @@ echo "🚀 Job started at: $(date)   results -> $RUN"
 # --- 2. Runs -----------------------------------------------------------------
 for i in "${!NS[@]}"; do
   n="${NS[$i]}"; k="${KS[$i]}"
-  tag="mariposa_N${n}_k${k}"
+  tag="${IMGTAG}_N${n}_k${k}"
   common=(--data "$IMG" --size "$n" --nsub "$k" --init cp)
 
   $BIN "${common[@]}" --solver ma57 \
@@ -133,6 +144,14 @@ for i in "${!NS[@]}"; do
       > "$RUN/logs/${tag}_dd_cg.log" 2>&1
   $BIN "${common[@]}" --solver dd --interface minres \
       > "$RUN/logs/${tag}_dd_minres.log" 2>&1
+  # Plot THIS solution now, not at the end of the job: a sweep at this size can
+  # be killed by walltime or the OOM killer partway through, and figures for the
+  # cases that did finish are worth having. --only keeps it to the one tag, so
+  # nothing is re-rendered on later passes.
+  MPLBACKEND=Agg python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" --only "$tag" \
+      >> "$RUN/logs/plots.log" 2>&1 \
+    && echo "  plot k=$k  -> $RUN/plots" \
+    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
   echo "  done $tag  ($(date +%T))"
 done
 
@@ -140,20 +159,13 @@ done
 {
   echo "job $SLURM_JOB_ID  node $(hostname)  $(date)"
   echo "binary: $BIN  image: $IMG  OMP_NUM_THREADS=$OMP_NUM_THREADS  MKL_THREADING_LAYER=$MKL_THREADING_LAYER"
-  for f in "$RUN"/logs/mariposa_*.log; do
+  for f in "$RUN"/logs/*_N*.log; do
     echo; echo "===== $(basename "$f") ====="; tail -n 15 "$f"
   done
 } > "$RUN/summary.txt"
 
 # --- 4. Plots (best-effort: needs matplotlib; the self-contained --save-solution
 #         dumps in sols/ can also be plotted later with python/plot_slurm.py) ----
-export MPLBACKEND=Agg
-if ! python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" \
-        >> "$RUN/logs/plots.log" 2>&1; then
-  echo "note: plotting failed — last errors:"
-  tail -n 20 "$RUN/logs/plots.log"
-  echo "(the self-contained sols/ dumps can be plotted later with python/plot_slurm.py)"
-fi
 
 # keep the SLURM stdout/err with the rest (still open, cp not mv)
 cp "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out" \

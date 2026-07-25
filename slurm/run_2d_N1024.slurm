@@ -58,7 +58,7 @@ set -o pipefail
 N=1024
 KS="${KS:-24 32 40}"
 BIN=./dd_solve_2d
-IMG="${IMG:-../images/cameraman.png}"
+# (IMG/IMGTAG resolved below, after the repo root is known)
 PILOT="${PILOT:-0}"
 NOREF="${NOREF:-1}"                             # default OFF at this size — see note 2
 ALLOW_UPSAMPLE="${ALLOW_UPSAMPLE:-0}"
@@ -90,6 +90,17 @@ cd "$REPO/cpp" || {
   echo "       fix: REPO=/path/to/checkout sbatch $0"
   exit 1
 }
+# Image. mariposa.png if it is there, else the bundled cameraman. IMG= overrides.
+# The TAG is derived from whatever is actually loaded, so logs, solution dumps
+# and figures can never again claim one image while the run used another (which
+# is what "mariposa_*" tags on cameraman runs used to do).
+if [ -z "${IMG:-}" ]; then
+  for _c in ../images/mariposa.png ../images/cameraman.png; do
+    [ -f "$_c" ] && { IMG="$_c"; break; }
+  done
+fi
+IMG="${IMG:-../images/cameraman.png}"
+IMGTAG="$(basename "$IMG")"; IMGTAG="${IMGTAG%.*}"
 [ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma57_omp.sh"; exit 1; }
 [ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
 
@@ -127,7 +138,7 @@ echo "   results -> $RUN"
 
 # --- 3. Runs -----------------------------------------------------------------
 for k in $KS; do
-  tag="cameraman_N${N}_k${k}"
+  tag="${IMGTAG}_N${N}_k${k}"
   common=(--data "$IMG" --size "$N" --nsub "$k" --init cp "${EXTRA[@]}")
 
   t0=$SECONDS
@@ -137,13 +148,21 @@ for k in $KS; do
       --save-solution "$RUN/sols/sol_${tag}.txt" \
       > "$RUN/logs/${tag}_dd.log" 2>&1
   echo "  dd   k=$k  $((SECONDS-t0))s  ($(date +%T))"
+  # Plot THIS solution now, not at the end of the job: a sweep at this size can
+  # be killed by walltime or the OOM killer partway through, and figures for the
+  # cases that did finish are worth having. --only keeps it to the one tag, so
+  # nothing is re-rendered on later passes.
+  MPLBACKEND=Agg python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" --only "$tag" \
+      >> "$RUN/logs/plots.log" 2>&1 \
+    && echo "  plot k=$k  -> $RUN/plots" \
+    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
 done
 
 if [ "$NOREF" != "1" ]; then
   k=$(echo $KS | awk '{print $1}')
   t0=$SECONDS
   $BIN --data "$IMG" --size "$N" --nsub "$k" --init cp "${EXTRA[@]}" --solver ma57 \
-      > "$RUN/logs/cameraman_N${N}_ma57.log" 2>&1
+      > "$RUN/logs/${IMGTAG}_N${N}_ma57.log" 2>&1
   echo "  ma57 $((SECONDS-t0))s (exit $?)"
 fi
 
@@ -156,14 +175,10 @@ fi
   for f in "$RUN"/logs/*_dd.log; do
     echo "$(basename "$f"): $(grep 'dd-time' "$f" | tail -1)"
   done
-  for f in "$RUN"/logs/cameraman_*.log; do
+  for f in "$RUN"/logs/*_N*.log; do
     echo; echo "===== $(basename "$f") ====="; tail -n 20 "$f"
   done
 } > "$RUN/summary.txt"
-
-export MPLBACKEND=Agg
-python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" >> "$RUN/logs/plots.log" 2>&1 \
-  || echo "note: plotting failed (see logs/plots.log); sols/ dumps can be plotted later"
 
 cp "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out" \
    "${SLURM_SUBMIT_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.err" "$RUN/logs/" 2>/dev/null
