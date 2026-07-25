@@ -4,7 +4,7 @@
 # per that script's header). Each size N runs the PNG route (C++ hybrid-CP warm
 # start, area-downsample loader) under four solvers: IPOPT-ma97 monolithic
 # reference, DD direct interface, DD CG, DD MINRES. Logs, solution/arrowhead
-# dumps, a summary, and (best-effort) the plots land in results/slurm_<jobid>/.
+# dumps, a summary, and (best-effort) the plots land in <repo>/results/slurm_<jobid>/.
 #
 #   sbatch run_2d.slurm                      # from cpp/ on the cluster
 #   REPO=/path/to/lifted-mpcc-dd sbatch run_2d.slurm
@@ -52,9 +52,13 @@ cd "$REPO/cpp" || { echo "error: $REPO/cpp not found (set REPO=)"; exit 1; }
 [ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma97_omp.sh"; exit 1; }
 [ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
 
-RUN="results/slurm_${SLURM_JOB_ID}"
+# Results go to the REPO ROOT, not into cpp/ — cpp/ is source, and a sweep
+# writes hundreds of MB of dumps and figures. Resolved absolutely (after the cd)
+# so a relative REPO= still lands somewhere unambiguous, and so the path printed
+# below is the one to actually cd into.
+RUN="$(cd .. && pwd)/results/slurm_${SLURM_JOB_ID}"
 mkdir -p "$RUN/logs" "$RUN/sols" "$RUN/plots"
-echo "🚀 Job started at: $(date)   results -> $REPO/cpp/$RUN"
+echo "🚀 Job started at: $(date)   results -> $RUN"
 
 # --- 2. Runs -----------------------------------------------------------------
 for i in "${!NS[@]}"; do

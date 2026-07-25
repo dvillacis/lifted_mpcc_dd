@@ -5,7 +5,7 @@
 # instance (data/data_1d_n*_k*.txt) is run under three solvers (IPOPT-ma97
 # monolithic reference, DD direct interface, DD CG interface); logs,
 # solution/arrowhead dumps, a summary, and (best-effort) the plots land in
-# results/slurm_<jobid>/.
+# <repo>/results/slurm_<jobid>/.
 #
 #   sbatch run_1d.slurm                      # from cpp/ on the cluster
 #   REPO=/path/to/lifted-mpcc-dd sbatch run_1d.slurm   # repo elsewhere
@@ -45,9 +45,13 @@ export OMP_PLACES=cores
 cd "$REPO/cpp" || { echo "error: $REPO/cpp not found (set REPO=)"; exit 1; }
 [ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma97_omp.sh"; exit 1; }
 
-RUN="results/slurm_${SLURM_JOB_ID}"
+# Results go to the REPO ROOT, not into cpp/ — cpp/ is source, and a sweep
+# writes hundreds of MB of dumps and figures. Resolved absolutely (after the cd)
+# so a relative REPO= still lands somewhere unambiguous, and so the path printed
+# below is the one to actually cd into.
+RUN="$(cd .. && pwd)/results/slurm_${SLURM_JOB_ID}"
 mkdir -p "$RUN/logs" "$RUN/sols" "$RUN/plots"
-echo "🚀 Job started at: $(date)   results -> $REPO/cpp/$RUN"
+echo "🚀 Job started at: $(date)   results -> $RUN"
 
 # --- 2. Runs -----------------------------------------------------------------
 for n in "${NS[@]}"; do

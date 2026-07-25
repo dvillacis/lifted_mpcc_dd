@@ -101,7 +101,7 @@ radius δ / MPCC index sets / complementarity residual / continuation path) from
 the self-contained `dd_solve_2d --save-solution` files a batch run produces:
 
 ```bash
-uv run python plot_slurm.py ../cpp/results/slurm_<id>   # one PNG set per solution in the dir
+uv run python plot_slurm.py ../results/slurm_<id>      # one PNG set per solution in the dir
 ```
 
 ## The bundled test image

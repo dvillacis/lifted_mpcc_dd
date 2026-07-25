@@ -13,6 +13,7 @@ cpp/mumps_smoke
 
 # Solver output (regenerated)
 cpp/results/
+/results/
 cpp/plots/
 cpp/sol_*.txt
 cpp/dd_*.txt

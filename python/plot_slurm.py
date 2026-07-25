@@ -1,4 +1,4 @@
-"""Publication figures from a SLURM result directory (``../cpp/results/slurm_<id>/``).
+"""Publication figures from a SLURM result directory (``<repo>/results/slurm_<id>/``).
 
 For every ``sols/sol_<tag>.txt`` a run produced (the self-contained
 ``dd_solve_2d --save-solution`` file — it carries the instance *and* the μ-trace,
@@ -21,10 +21,10 @@ comp)`` trace. Decoding is the fixed staggered offset arithmetic; the two tiny
 helpers (``psnr``, ``index_sets``) are copied verbatim from ``lifted_mpcc_2d`` so
 the numbers match the solver's own reports.
 
-    python plot_slurm.py ../cpp/results/slurm_4266
-    python plot_slurm.py ../cpp/results/slurm_4266 --out /tmp/figs --dpi 200
-    python plot_slurm.py ../cpp/results/slurm_4266 --only mariposa_N128_k8
-    python plot_slurm.py ../cpp/results/slurm_4266 --diff residual
+    python plot_slurm.py ../results/slurm_4266
+    python plot_slurm.py ../results/slurm_4266 --out /tmp/figs --dpi 200
+    python plot_slurm.py ../results/slurm_4266 --only mariposa_N128_k8
+    python plot_slurm.py ../results/slurm_4266 --diff residual
 """
 
 import argparse
