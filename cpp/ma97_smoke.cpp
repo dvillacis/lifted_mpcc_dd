@@ -34,7 +34,10 @@ static double resid3(const double A[9], const double* x, const double* b) {
 }
 
 int main() {
-   std::printf("sizeof(ma97::control)=%zu  sizeof(ma97::info)=%zu\n",
+   // Our side of the layout is compile-gated (static_assert in ma97_block.hpp);
+   // the printed sizes are informational. The defaults canary below checks the
+   // LIBRARY side — an ILP64 build shifts every field and prints garbage.
+   std::printf("sizeof(ma97::control)=%zu  sizeof(ma97::info)=%zu  (compile-gated)\n",
                sizeof(ma97::control), sizeof(ma97::info));
 
    ma97::control c;
@@ -72,6 +75,24 @@ int main() {
                      ok ? "OK" : "FAIL");
          if (!ok) ++fails;
       }
+   }
+   {  // rank-deficient 3×3: the action=1 "continue on singularity, report rank"
+      // path the DD solver's SINGULAR routing relies on (a θ-gauge W_k block
+      // factorizes with rank < n and must report singular(), not error out).
+      // A = [[1,1,0],[1,1,0],[0,0,2]]: rank 2, PSD ⇒ 0 negative eigenvalues.
+      Ma97Block blk;
+      const std::vector<int> sirn = {1, 2, 2, 3};
+      const std::vector<int> sjcn = {1, 1, 2, 3};
+      const double sav[4] = {1, 1, 1, 2};
+      if (!blk.analyze(3, sirn, sjcn)) { std::printf("FAIL analyze/sing (flag=%d)\n", blk.status()); return 1; }
+      for (int e = 0; e < 4; ++e) blk.values()[e] = sav[e];
+      const bool fok = blk.factorize();
+      const bool ok = fok && blk.singular() && blk.rank() == 2 &&
+                      blk.negative_eigenvalues() == 0 && !blk.resource_failure();
+      std::printf("singular: fact=%s  rank=%d/3  neg=%d  flag=%d  %s\n",
+                  fok ? "ok" : "FAIL", blk.rank(), blk.negative_eigenvalues(),
+                  blk.status(), ok ? "OK" : "FAIL");
+      if (!ok) ++fails;
    }
    {  // scaling_off instance: JOB 2→3→4 must reproduce JOB 1 (MINRES contract)
       Ma97Block blk;
