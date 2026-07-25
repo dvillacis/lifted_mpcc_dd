@@ -1,8 +1,8 @@
 #!/bin/bash
 # 1D staggered DD sweep on the HPC — RUNS PREBUILT BINARIES ONLY (no build, no
-# gates: compile beforehand with ./build_all_ma97_omp.sh and validate once with
-# ma97_smoke + a DD_CHECK run — see that script's header). Every bundled
-# instance (data/data_1d_n*_k*.txt) is run under three solvers (IPOPT-ma97
+# gates: compile beforehand with ./build_all_ma57_omp.sh and validate once with
+# --self-check + a DD_CHECK run — see that script's header). Every bundled
+# instance (data/data_1d_n*_k*.txt) is run under three solvers (IPOPT-ma57
 # monolithic reference, DD direct interface, DD CG interface); logs,
 # solution/arrowhead dumps, a summary, and (best-effort) the plots land in
 # <repo>/results/slurm_<jobid>/.
@@ -44,7 +44,7 @@ if [ -z "${REPO:-}" ]; then
   done
 fi
 REPO="${REPO:-$HOME/lifted-mpcc-dd}"           # last-resort default
-BIN=./dd_solve_1d                               # prebuilt (build_all_ma97_omp.sh)
+BIN=./dd_solve_1d                               # prebuilt (build_all_ma57_omp.sh)
 NS=(256 512 1024 2048)                          # instances: data_1d_n${n}_k${k}.txt
 KS=(4 8 16 32)
 
@@ -58,11 +58,12 @@ conda activate mkl_imaging
 #     T=44 -> 2 waves,  73%      (the second wave leaves 24 cores idle)
 # So 44 threads can be SLOWER than 32 on the same node. Amdahl bites too: the
 # measured serial share is ~10-26%, capping speedup near 4-5x however many cores
-# are thrown at it, and under MA97 the W_k FACTORIZE loop is serial by necessity
-# (concurrent ma97_factor heap-corrupts), which shrinks the parallel part
-# further. The full allocation is still worth requesting: the monolithic
-# --solver ma97 reference run uses MA97's own internal parallelism across all of
-# it, and owning the node keeps the timings clean.
+# are thrown at it. Unlike MA97 — whose W_k factorize loop must run serial,
+# because concurrent ma97_factor heap-corrupts — MA57 is validated concurrent, so
+# EVERY parallel region is live here and the parallel fraction is as large as this
+# solver gets. The full allocation is still worth requesting: the monolithic
+# --solver ma57 reference run uses its BLAS across all of it, and owning the node
+# keeps the timings clean.
 #
 # MEASURE BEFORE COMMITTING A SWEEP — one size, a few thread counts:
 #   for T in 8 16 32 44; do
@@ -82,7 +83,25 @@ cd "$REPO/cpp" || {
   echo "       fix: REPO=/path/to/checkout sbatch $0"
   exit 1
 }
-[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma97_omp.sh"; exit 1; }
+[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma57_omp.sh"; exit 1; }
+# IPOPT's OWN --solver ma57 reference run dlopen()s MA57 at RUNTIME via its
+# hsllib option, unlike the DD runs which link it at build time through an
+# rpath. So the reference can fail on a node where the DD runs are perfectly
+# fine. driver_common.hpp searches HSLLIB, then $HSLDIR/lib, then
+# ~/.local/hsl-ma57/lib, then the bare soname. Warn rather than abort: a sweep
+# whose DD numbers are good but whose baseline is missing is still worth having,
+# and IPOPT prints its own DYNAMIC_LIBRARY_FAILURE into the ma57 log.
+_ma57_found=""
+for _c in "$HSLLIB" "$HSLDIR/lib/libhsl_ma57.so" "$HOME/.local/hsl-ma57/lib/libhsl_ma57.so"; do
+  [ -n "$_c" ] && [ -f "$_c" ] && { _ma57_found="$_c"; break; }
+done
+if [ -n "$_ma57_found" ]; then
+  echo "MA57 for the monolithic reference: $_ma57_found"
+else
+  echo "warning: no libhsl_ma57.so found via HSLLIB / \$HSLDIR/lib / ~/.local/hsl-ma57/lib."
+  echo "         The DD runs are unaffected (they link it directly); the --solver ma57"
+  echo "         baseline will fail. Set HSLLIB=/path/to/libhsl_ma57.so to fix."
+fi
 
 # Results go to the REPO ROOT, not into cpp/ — cpp/ is source, and a sweep
 # writes hundreds of MB of dumps and figures. Resolved absolutely (after the cd)
@@ -99,8 +118,8 @@ for n in "${NS[@]}"; do
     [ -f "$data" ] || { echo "skip: $data missing"; continue; }
     tag="n${n}_k${k}"
 
-    $BIN --data "$data" --nsub "$k" --solver ma97 \
-        > "$RUN/logs/${tag}_ma97.log" 2>&1
+    $BIN --data "$data" --nsub "$k" --solver ma57 \
+        > "$RUN/logs/${tag}_ma57.log" 2>&1
     $BIN --data "$data" --nsub "$k" --solver dd \
         --save-solution "$RUN/sols/sol_${tag}.txt" --save-dd "$RUN/sols/dd_${tag}.txt" \
         > "$RUN/logs/${tag}_dd.log" 2>&1
