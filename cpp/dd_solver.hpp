@@ -131,6 +131,9 @@ using SymBlock = Ma97Block;
 using SymBlock = Ma57Block;
 #endif
 
+// Second arrowhead level on S (--nested). Needs SymBlock, hence the position.
+#include "nested_interface.hpp"
+
 // Optional MUMPS W_k backend (--wk-backend mumps): the partial-factorization
 // Schur — each subdomain factorization returns S_k as a byproduct instead of
 // paying p_k dense backsolves (the measured 97.5% of the S_k phase). Compiled
@@ -267,6 +270,16 @@ public:
    // the W_k blocks (the JOB=2/3 partials only compose without it).
    static void config_schur_forward(bool on) { cfgSchurFwd() = on; }
    static bool& cfgSchurFwd() { static bool v = false; return v; }
+   // NESTED INTERFACE (--nested). owner2 is indexed by KKT index like the outer
+   // owner map, but is read ONLY at border positions: it gives the level-1 group
+   // there, or −1 for the level-2 separator. The drivers build it from the tile
+   // geometry, so the solver stays formulation-agnostic.
+   static void config_owner2(std::vector<int> owner2, int ng) {
+      cfgOwner2() = std::move(owner2);
+      cfgNg2() = ng;
+   }
+   static std::vector<int>& cfgOwner2() { static std::vector<int> v; return v; }
+   static int& cfgNg2() { static int v = 0; return v; }
    static int& cfgIface() { static int v = IFACE_DIRECT; return v; }
    static int& cfgPrecond() { static int v = PRECOND_ASD; return v; }
    static bool& cfgAlphaPeel() { static bool v = true; return v; }
@@ -969,6 +982,28 @@ private:
             return false;
          }
       }
+      // ---- optional SECOND arrowhead level on S (--nested) ----------------
+      // Built from the same frozen Ssp_ pattern the flat path uses, so the two
+      // routes see byte-identical values; only who factorizes them differs.
+      nested_ok_ = false;
+      if (!cfgOwner2().empty() && cfgNg2() > 0) {
+         if ((int)cfgOwner2().size() != dim_) {
+            std::cerr << "[nested] owner2 has " << cfgOwner2().size()
+                      << " entries, expected dim=" << dim_ << " — ignoring\n";
+         } else {
+            std::vector<int> grp(p_, -1);
+            for (Index i2 = 0; i2 < dim_; ++i2)
+               if (owner_[i2] < 0) grp[ypos_[i2]] = cfgOwner2()[i2];
+            nested_ok_ = nested_.analyze(Ssp_, grp, cfgNg2());
+            if (std::getenv("DD_DEBUG") || std::getenv("DD_STATS"))
+               std::cerr << "[nested] " << (nested_ok_ ? "active" : "REFUSED")
+                         << ": p=" << p_ << " groups=" << cfgNg2()
+                         << " separator=" << nested_.separator()
+                         << " (" << (p_ ? 100.0 * nested_.separator() / p_ : 0.0)
+                         << "% of p)\n";
+         }
+      }
+
       {
          std::vector<Trip> tC;
          tC.reserve(2 * cpairs.size());
@@ -1300,12 +1335,22 @@ private:
       // (measured: it reported 485–491 negatives where the true count was 512).
       // Getting In(S) wrong would break the correction loop that is supposed to
       // make S definite in the first place.
-      {
+      bool okS;
+      bool nested_resource = false;
+      if (nested_ok_) {
+         // In(S) = sum_j In(S_j) + In(S') — Haynsworth again, one level down.
+         // s_neg_ below then reads the SAME quantity the flat path produces, so
+         // every inertia consumer (the CG gate, the peel accounting, IPOPT's
+         // query through nneg_) is untouched.
+         const int st = nested_.factorize(Ssp_);
+         okS = (st == NestedInterface::OK);
+         nested_resource = (st == NestedInterface::RESOURCE);
+      } else {
          double* a = s_ma57_->values();
          const double* sv = Ssp_.valuePtr();
          for (size_t e = 0; e < spat_.size(); ++e) a[e] = sv[ma57_src_[e]];
+         okS = s_ma57_->factorize() && !s_ma57_->singular();
       }
-      const bool okS = s_ma57_->factorize() && !s_ma57_->singular();
       t_sfact_ += std::chrono::duration<double>(
          std::chrono::steady_clock::now() - tic2).count();
       ++n_fact_;
@@ -1315,7 +1360,7 @@ private:
                    << "s (scatter " << t_scatter_ << "s)  S-fact " << t_sfact_
                    << "s  solve " << t_solve_ << "s\n";
       if (!okS) {
-         if (s_ma57_->resource_failure()) {
+         if (nested_resource || (!nested_ok_ && s_ma57_->resource_failure())) {
             std::cerr << "[dd] interface-matrix factorization ran out of "
                          "memory/workspace (p=" << p_
                       << ", status=" << s_ma57_->status()
@@ -1340,7 +1385,11 @@ private:
             if (csp2_[e] >= 0) cv[csp2_[e]] += v;
          }
       }
-      s_neg_ = s_ma57_->negative_eigenvalues();   // In(S)_neg — also the CG SPD gate
+      // In(S)_neg — also the CG SPD gate. Under --nested this is
+      // sum_j In(S_j)_neg + In(S')_neg, which IS In(S)_neg by Haynsworth, so no
+      // consumer downstream can tell the two routes apart.
+      s_neg_ = nested_ok_ ? nested_.negative_eigenvalues()
+                          : s_ma57_->negative_eigenvalues();
       nneg_ += s_neg_;                            // Haynsworth: In(A) = ΣIn(W_k)+In(S)
       // Signed-MA57 MINRES: age the snapshot preconditioner; rebuild every
       // minres_lag_-th factorization (lag=1 ⇒ every one). s_ma57_ above stays
@@ -2118,7 +2167,8 @@ private:
       else if (iface_ == IFACE_MINRES) cg_ok = solve_interface_minres(ry, dy);
       if (!cg_ok) {
          dy = ry;
-         s_ma57_->solve(dy.data(), 1);
+         if (nested_ok_) nested_.solve(dy.data());
+         else s_ma57_->solve(dy.data(), 1);
       }
       // Δx_k = W_k⁻¹(r_k − B̄_kᵀ N_kᵀ Δy)
       //
@@ -2167,6 +2217,11 @@ private:
    bool sgn_valid_ = false;     // snapshot factorized + |D⁻¹| recovered + checked
    int sgn_p_ = -1;             // pattern the snapshot was analyzed for
    size_t sgn_ne_ = 0;
+   // Second arrowhead level on S (--nested). nested_ok_ is the single gate: the
+   // structure build refuses rather than degrades, so a bad or absent owner2 map
+   // simply leaves the validated flat path in charge.
+   NestedInterface nested_;
+   bool nested_ok_ = false;
    std::unique_ptr<SymBlock> sgn_ma57_;   // the snapshot factorization (MC64 off)
    std::vector<int> sgn_partner_;          // |D⁻¹| 2×2 partner (−1 = 1×1 block)
    std::vector<double> sgn_diag_, sgn_offv_;  // |D⁻¹| entries (symmetric)

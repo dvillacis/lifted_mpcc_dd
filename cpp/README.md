@@ -830,6 +830,41 @@ Kept here so they are not re-attempted:
   not a small perturbation. The guards are in place (a stale `S` may never decide
   an inertia rejection, and a refinement residual that stops converging latches a
   rebuild), so the failure is the algorithm's, not the plumbing's.
+- **A second Haynsworth level on the interface (`--nested`) is a pessimization.**
+  The identity composes exactly — that part worked. Partition the border into 4
+  quadrant groups plus a separator and
+
+      In(S) = Σ_j In(S_j) + In(S'),    S' = C' − Σ_j E_j S_j⁻¹ E_jᵀ
+
+  reproduces `In(S)` with **0 inertia mismatches** against monolithic MA57 over a
+  whole run, same iteration count, same α, same PSNR. The geometric separator is
+  small, as predicted: 17.8% of p at 6×6 tiles, 12.8–13.2% at 8×8.
+
+  It is still **8× slower**, and the gap widens with size:
+
+  | N | k | p | flat `S-fact` | `--nested` |
+  |---|---|---|---|---|
+  | 32 | 6 | 696 | 0.00186 s | 0.00725 s |
+  | 48 | 8 | 1464 | 0.00551 s | 0.03921 s |
+  | 64 | 8 | 1912 | 0.01095 s | 0.09078 s |
+
+  Fitted exponents in p: flat **2.57**, nested **3.14**. Parallelism does not
+  rescue it — over the 4 groups at T=4 it goes 0.091 → 0.048 s, against flat's
+  0.013 s.
+
+  The reason is worth stating, because the estimate that motivated the work was
+  wrong in an instructive way. That estimate priced the level-2 serial core at
+  `sep^1.5`. But `S'` is a **Schur complement, so it is dense** — factorizing it
+  costs `O(sep³)`, and with `sep ≈ 0.13p` that is `O(p³)`, asymptotically worse
+  than the `O(p^1.5)` MA57 already achieves on the sparse `S`. Forming it is not
+  free either: `n_s` back-solves per group is another `~O(p^2.25)`.
+
+  The deeper point: **MA57 already does nested dissection when it factorizes S.**
+  An explicit second level replaces an implicit, fill-optimizing elimination with
+  a manual, dense one. On a single node that can only lose — the same character as
+  this package's headline result, now confirmed one level down. An explicit level
+  earns its keep for *distributed memory*, where no rank can hold `S` at all, not
+  for serial time. Kept flag-gated and default-off as the evidence.
 - **MUMPS partial-factorization Schur is a wash** here (4.95 s vs 5.01 s).
 - **CG / MINRES interface**: neutral to worse at these sizes; `--cg-apply matfree`
   is ~3× worse, as its comment already says.

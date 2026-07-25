@@ -186,6 +186,36 @@ static std::vector<int> kkt_owner(const Mpcc2DTNLP& p, const Partition2D& part,
    return owner;
 }
 
+// ---- level-2 (nested) owner map: quadrants of the tile grid -----------------
+// The nested interface needs the border split into groups whose removal of a
+// small separator DISCONNECTS them in S. S's graph is a union of cliques, one
+// per subdomain's border set N_k, so the condition is simply: every fine tile
+// must lie wholly inside one group. Grouping fine tiles into the four quadrants
+// of the k x k grid satisfies that, and the entities on the two middle cut lines
+// — the ones that span quadrants — fall out as the separator automatically.
+//
+// Built by reusing kkt_owner itself against a coarsened partition, so the
+// "spans >= 2 owners => complicating" rule is the SAME validated code that
+// produces the outer map (alpha included: it is global, hence separator).
+// NestedInterface::analyze re-checks the disconnection property and refuses if
+// this geometry ever fails to deliver it.
+static std::vector<int> kkt_owner2(const Mpcc2DTNLP &p, const Partition2D &part,
+                                   int *ngroups) {
+  const int k = part.k;
+  if (k < 2) { *ngroups = 0; return {}; }
+  Partition2D q = part;                     // copy: same bounds, coarser owners
+  const int half = k / 2;
+  std::vector<int> quad(part.n_sub, 0);
+  for (int a = 0; a < k; ++a)
+    for (int c = 0; c < k; ++c)
+      quad[a * k + c] = (a >= half ? 2 : 0) + (c >= half ? 1 : 0);
+  for (auto &o : q.cell_owner) o = quad[o];
+  for (auto &o : q.node_owner) o = quad[o];
+  q.n_sub = 4;
+  *ngroups = 4;
+  return kkt_owner(p, q, /*promote_corners=*/false);
+}
+
 // The solution file is SELF-CONTAINED: header, per-level history, the reported
 // iterate, and then the instance itself (N, stencil, sigma, u_clean, f). Carrying
 // the data costs a few KB and means plot_2d.py needs nothing else — which matters
@@ -275,6 +305,7 @@ int main(int argc, char** argv) {
    int minres_lag = 1;
    int schur_lag = 1;
    std::string schur_mode = "forward";
+   bool nested = false;
    std::string hessian = "limited-memory";
    std::string ma57_scaling = "off";
    // μ-coupled is the DEFAULT since 2026-07-23 (measured 7–60× fewer iterations
@@ -344,6 +375,7 @@ int main(int argc, char** argv) {
       else if (a == "--minres-lag") minres_lag = std::stoi(next());
       else if (a == "--schur-lag")  schur_lag = std::stoi(next());
       else if (a == "--schur")      schur_mode = next();
+      else if (a == "--nested")     nested = true;
       else if (a == "--hessian")   hessian = next();
       else if (a == "--ma57-scaling") ma57_scaling = next();
       else if (a == "--t-update")   t_update = next();
@@ -408,6 +440,11 @@ int main(int argc, char** argv) {
       std::cerr << "--interface " << interface_solver
                 << " needs --solver dd (it replaces the arrowhead's "
                    "interface solve)\n";
+      return 2;
+   }
+   if (nested && solver != "dd") {
+      std::cerr << "--nested needs --solver dd (it adds a second level to the "
+                   "arrowhead's interface)\n";
       return 2;
    }
    if (hessian != "exact" && hessian != "limited-memory") {
@@ -602,6 +639,11 @@ int main(int argc, char** argv) {
 
    if (solver == "dd") {
       DDArrowheadSolver::config_owner(owner, part.n_sub);
+      if (nested) {
+        int ng2 = 0;
+        std::vector<int> owner2 = kkt_owner2(*mpcc, part, &ng2);
+        DDArrowheadSolver::config_owner2(std::move(owner2), ng2);
+      }
       DDArrowheadSolver::config_dump_arrow(save_dd);
       DDArrowheadSolver::config_interface(
          interface_solver == "cg"     ? DDArrowheadSolver::IFACE_CG
