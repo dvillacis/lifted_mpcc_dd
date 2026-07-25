@@ -1,13 +1,13 @@
-# Python reference + reproduction helpers for lifted-mpcc-dd.
+# Reproduction helpers for lifted-mpcc-dd (data generation + plotting).
 # Python 3.11 (the reference was developed and validated on 3.11.x).
 #
 #   python -m venv .venv && source .venv/bin/activate
 #   pip install -r requirements.txt
 #
-# cyipopt needs an IPOPT install to build/link against (Homebrew `ipopt` on
-# macOS, conda-forge `ipopt` on Linux). See ../README.md.
+# Pure numpy/scipy/PIL/matplotlib — no IPOPT/cyipopt needed here (the solving is
+# done by the C++ driver in ../cpp; these scripts only build its input and plot
+# its output).
 numpy>=1.26
 scipy>=1.11
-cyipopt>=1.4
-pillow>=10.0
-matplotlib>=3.8
+pillow>=10.0        # load_image (mpcc_utils) reads PNG/JPEG via PIL.Image
+matplotlib>=3.8     # plot_slurm.py figures

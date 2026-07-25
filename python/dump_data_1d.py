@@ -1,7 +1,8 @@
 """Export the staggered-1D instance C++ needs: data, warm start, and the owner map.
 
-``../lifted_mpcc_1d.py`` is the reference implementation; ``dd_solve_1d.cpp`` is the
-same formulation solved by real IPOPT with the arrowhead DD as its linear solver.
+``mpcc_utils`` carries the reference formulation (extracted from the project's
+Python solver); ``dd_solve_1d.cpp`` is the same formulation solved by real IPOPT
+with the arrowhead DD as its linear solver.
 For the two to be comparable at all, three things must be identical, and none of
 them can be recomputed in C++:
 
@@ -34,8 +35,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from lifted_mpcc_1d import (  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpcc_utils import (  # noqa: E402
     Lifted1DMPCC, Partition1D, initial_point, kkt_owner, make_signal,
 )
 

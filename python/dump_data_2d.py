@@ -29,11 +29,11 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from lifted_mpcc_2d import (  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mpcc_utils import (  # noqa: E402
     Lifted2DMPCC, Partition2D, initial_point, kkt_owner,
+    load_image, make_phantom,
 )
-from lifted_mpcc_unitball_v2 import load_image, make_phantom  # noqa: E402
 
 DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "..", "images", "cameraman.png")

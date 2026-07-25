@@ -8,7 +8,7 @@ so nothing else is needed), this writes SEVEN stand-alone single-panel PNGs:
   ``<tag>_recon.png``         the reconstruction u
   ``<tag>_diff.png``          the difference (error u−u† by default, or u−f)
   ``<tag>_delta.png``         the dual radius δ = |q|
-  ``<tag>_indexsets.png``     the MPCC index sets (inactive/active/biactive)
+  ``<tag>_indexsets.png``     the MPCC index sets (active/inactive/biactive)
   ``<tag>_residual.png``      the complementarity residual r(1−δ)
   ``<tag>_continuation.png``  the continuation path, wide and polished
 
@@ -41,7 +41,7 @@ def psnr(clean, recon, data_range=1.0):
 
 
 def index_sets(r, w, eps):
-    """0 inactive (r≈0), 1 active (jump: r>0, δ pinned at 1), 2 biactive corner.
+    """0 active (r≈0), 1 inactive (jump: r>0, δ pinned at 1), 2 biactive corner.
 
     Exhaustive once ``eps ≥ √t`` (``r>eps`` and ``w>eps`` ⇒ ``rw>t``, violating
     the Scholtes row) — the corner is resolved at the O(√t) scale, never at
@@ -230,7 +230,7 @@ def panel_indexsets(sol, path, dpi):
     eps_w = min(3.0 * np.sqrt(max(t_last, 0.0)), 0.5)
     iset = index_sets(r, w, eps_w)
     iso = ListedColormap(["#2c7fb8", "#f0c419", "#d7191c"])
-    n_in, n_ac, n_bi = (int((iset == v).sum()) for v in (0, 1, 2))
+    n_ac, n_in, n_bi = (int((iset == v).sum()) for v in (0, 1, 2))
 
     def draw(ax):
         ax.imshow(iset, cmap=iso, norm=BoundaryNorm([-.5, .5, 1.5, 2.5], 3),
@@ -238,8 +238,8 @@ def panel_indexsets(sol, path, dpi):
         handles = [plt.Line2D([], [], marker="s", ls="", ms=9, mfc=c, mec="none",
                               label=l)
                    for c, l in zip(iso.colors,
-                                   (f"inactive  $w>\\epsilon_w$   ({n_in})",
-                                    f"active  $r>\\epsilon_w\\geq w$   ({n_ac})",
+                                   (f"active  $r\\leq\\epsilon_w<w$   ({n_ac})",
+                                    f"inactive  $r>\\epsilon_w\\geq w$   ({n_in})",
                                     f"biactive  both $\\leq\\epsilon_w$   ({n_bi})"))]
         ax.legend(handles=handles, fontsize=8, loc="upper right", framealpha=0.92)
         ax.set_title(f"MPCC index sets   ($\\epsilon_w$ = {eps_w:.1e})\n"

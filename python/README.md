@@ -1,28 +1,23 @@
-# Python reference & reproduction helpers
+# Reproduction helpers (data generation + plotting)
 
-This directory holds the **numerical reference** for the lifted TV-denoising MPCC
-and the small scripts that feed / visualize the C++ domain-decomposition solver
-in [`../cpp`](../cpp). Everything the C++ side is validated against lives here.
+Small Python scripts that (1) build **byte-identical input instances** for the
+C++ domain-decomposition solver in [`../cpp`](../cpp), and (2) render figures from
+its output. The solving itself is done in C++; these scripts need no IPOPT.
 
 ## Contents
 
-**Reference implementations** (the monolithic IPOPT/`cyipopt` solvers — the
-ground truth the C++ DD plugin reproduces):
-
 | file | what it is |
 |------|------------|
-| `lifted_mpcc_unitball_v2.py`        | numerics-hardened square-grid solver (the base reference; defines `load_image`, `HSLLIB`, `psnr`) |
-| `lifted_mpcc_unitball_staggered.py` | staggered (cell-centred) discretization |
-| `lifted_mpcc_1d.py`                 | staggered **1D** grid + domain-decomposition probe |
-| `lifted_mpcc_2d.py`                 | staggered **2D** grid + domain-decomposition probe |
+| `mpcc_utils.py`   | the generic utility module — the data-generation core extracted from the project's Python reference solver: synthetic/real instance builders (`make_signal`, `make_phantom`, `load_image`), the staggered 1D/2D lifted-MPCC problem objects (`Lifted1DMPCC`, `Lifted2DMPCC`), the Chambolle–Pock warm start (`initial_point`), and the domain-decomposition partition + KKT owner-map rule (`Partition1D/2D`, `kkt_owner`). |
+| `dump_data.py`    | write the plain `N + clean + noisy` instance for the **uniform 2D** driver (`dd_solve`) |
+| `dump_data_1d.py` | write the **staggered 1D** instance (data + CP warm start + owner map) for `dd_solve_1d` |
+| `dump_data_2d.py` | write the **staggered 2D** instance for `dd_solve_2d` |
+| `plot_slurm.py`   | publication figures from a SLURM result directory of `dd_solve_2d --save-solution` files (self-contained: only numpy + matplotlib) |
 
-**Helpers** (glue between Python and the C++ solver):
-
-| file | what it does |
-|------|--------------|
-| `dump_data.py`, `dump_data_1d.py`, `dump_data_2d.py` | write a solver instance (clean + noisy image, CP warm start, owner map) to a `.txt` the C++ drivers load — the only route where Python and C++ solve a **byte-identical** instance |
-| `plot_1d.py`, `plot_2d.py` | draw the solution + arrowhead figures from the C++ solver's `--save-solution` / `--save-dd` dumps |
-| `plot_slurm.py`            | publication figures from a SLURM result directory |
+`mpcc_utils.py` is a self-contained extraction; the full reference solvers
+(IPOPT continuation driver, certificate, and the multi-panel probe/arrowhead
+plotters) are **not** part of this archival package — they live in the project's
+development repository.
 
 ## Setup
 
@@ -31,45 +26,42 @@ python -m venv .venv && source .venv/bin/activate   # Python 3.11
 pip install -r requirements.txt
 ```
 
-`cyipopt` links against a system IPOPT (Homebrew `ipopt` / conda-forge `ipopt`);
-see [`../README.md`](../README.md) for the toolchain.
+## Generate an instance, solve it in C++, plot the result
 
-## Two ways to use it
-
-**1 — Run the reference solver directly** (no C++ needed):
-
-```bash
-python lifted_mpcc_unitball_v2.py                 # cameraman N=32 σ=0.1
-python lifted_mpcc_2d.py --nsub 4                 # staggered 2D + DD probe
-```
-
-The bundled test image is `images/cameraman.png` beside these scripts (the
-scripts' `--data` default resolves there). Pass `--data <path>` for another
-image.
-
-**2 — Dump an instance for the C++ DD solver, then plot its output:**
+The dump scripts are the **only** route where Python and C++ solve a
+byte-identical problem (NumPy's RNG has no C++ equivalent, so an independently
+generated instance would differ). Example, 1D:
 
 ```bash
-# generate a byte-identical instance for cpp/dd_solve_1d
+# 1) build the instance (data + Chambolle–Pock warm start + DD owner map)
 python dump_data_1d.py --n 64 --nsub 4 -o ../cpp/data/data_1d_64.txt
 
-# ... solve it in C++ (see ../cpp/README.md) with --save-solution / --save-dd,
-#     then render the figures:
-python plot_1d.py --data ../cpp/data/data_1d_64.txt \
-    --solution sol_1d_64.txt --dd-dump dd_1d_64.txt \
-    --save-plot s.png --save-dd-plot dd.png
+# 2) solve it in C++ (see ../cpp/README.md)
+(cd ../cpp && ./dd_solve_1d --data data/data_1d_64.txt --nsub 4 --solver dd)
 ```
 
-## HSL MA57 (`HSLLIB`)
-
-`lifted_mpcc_unitball_v2.py` picks the linear solver from `--linear-solver`
-(default `ma57`). If HSL MA57 is present it is used, otherwise the code prints a
-warning and falls back to MUMPS. Point `HSLLIB` at your MA57 shared library:
+2D, from the bundled image or a phantom:
 
 ```bash
-export HSLLIB=/path/to/libhsl_ma57.{dylib,so}
+python dump_data_2d.py --N 16 --nsub 2 -o ../cpp/data/data_2d_16.txt              # cameraman
+python dump_data_2d.py --phantom --N 16 --nsub 2 -o ../cpp/data/phantom_16.txt    # synthetic
 ```
 
-(The file ships with a developer's default path baked in; the `HSLLIB` env var
-overrides it. MA57 is proprietary — see the top-level README for how to obtain
-it. MUMPS, bundled with IPOPT, works without it.)
+(The uniform 2D driver `dd_solve` and both staggered drivers can also take a PNG
+directly — `--data image.png --size N` — using the C++ side's own warm start; the
+dump route is for exact Python↔C++ comparison.)
+
+## Plotting
+
+`plot_slurm.py` renders the 2D result figures (noisy / reconstruction / dual
+radius δ / MPCC index sets / complementarity residual / continuation path) from
+the self-contained `dd_solve_2d --save-solution` files a batch run produces:
+
+```bash
+python plot_slurm.py ../cpp/results/slurm_<id>        # one PNG set per solution in the dir
+```
+
+## The bundled test image
+
+The dump scripts default `--data` to `../images/cameraman.png` (package root).
+Pass `--data <path>` for another image.
