@@ -46,7 +46,10 @@ python/*.png
 .DS_Store
 *.swp
 
-# Keep the vendored sample image and bundled data despite the *.png / .txt rules above
-!images/cameraman.png
-!python/images/cameraman.png
+# Keep the bundled test images and data despite the *.png / .txt rules above.
+# images/ is the package's image directory — everything in it is deliberate, so
+# negate the whole thing rather than naming files one at a time (naming them is
+# how mariposa.png silently failed to be added the first time).
+!images/*.png
+!python/images/*.png
 !cpp/data/*.txt

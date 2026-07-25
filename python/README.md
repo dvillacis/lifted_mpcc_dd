@@ -104,7 +104,14 @@ the self-contained `dd_solve_2d --save-solution` files a batch run produces:
 uv run python plot_slurm.py ../results/slurm_<id>      # one PNG set per solution in the dir
 ```
 
-## The bundled test image
+## The bundled test images
+
+| image | size | use |
+|---|---|---|
+| `images/cameraman.png` | 512×512 | the default; native at `--size 512` |
+| `images/mariposa.png`  | 1184×1184 | large-N runs — area-downsamples cleanly to 1024 |
 
 The dump scripts default `--data` to `../images/cameraman.png` (package root).
-Pass `--data <path>` for another image.
+Pass `--data <path>` for another image. The 2D batch scripts prefer
+`mariposa.png` when present, since it is the only bundled source big enough for
+`--size 1024` without upsampling.

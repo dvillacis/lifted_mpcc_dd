@@ -86,7 +86,7 @@ lifted-mpcc-dd/
 │   ├── requirements.txt      generated pip fallback
 │   └── README.md
 ├── slurm/                 ← example HPC batch scripts
-└── images/                ← the bundled test image (cameraman)
+└── images/                ← bundled test images (cameraman 512², mariposa 1184²)
 ```
 
 ## Requirements
