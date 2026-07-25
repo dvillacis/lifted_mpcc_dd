@@ -51,6 +51,17 @@
 #include <vector>
 
 namespace ma97 {
+// The documented HSL_MA97 C-interface layout, PLUS a trailing abi_margin_* pad
+// on both structs. HSL's own compatibility mechanism absorbs additions into
+// the documented spare slots (size stays constant across 2.x), so the margin
+// should never be reached — it exists because these structs are passed to an
+// arbitrary user-supplied libhsl_ma97.so, the library WRITES them (info from
+// analyse/factor/solve, control from ma97_default_control), and info_ is a
+// data member of Ma97Block: a non-conforming build writing past the documented
+// end would corrupt the adjacent heap silently. 128 spare bytes turns that
+// into corrupt-but-contained padding. An ILP64 library shifts every field
+// instead — that is what the ma97_smoke ABI canary catches; run it first on
+// any new machine.
 struct control {
    int    f_arrays;          // ≠0: 1-based (Fortran) array indexing
    int    action;            // ≠0: continue on singularity, report rank
@@ -71,6 +82,8 @@ struct control {
    double consist_tol;
    int    ispare[5];
    double rspare[10];
+   int    abi_margin_i[8];   // defensive margin — not part of the HSL ABI
+   double abi_margin_r[8];
 };
 struct info {
    int    flag;              // 0 ok, <0 error, >0 warning
@@ -93,7 +106,16 @@ struct info {
    int    maxsupernode;      // spare slot in pre-2.6 libraries — never read here
    int    ispare[4];
    double rspare[10];
+   int    abi_margin_i[8];   // defensive margin — not part of the HSL ABI
+   double abi_margin_r[8];
 };
+// Freeze the compiled layout (LP64, natural alignment): the documented HSL
+// portion is 216/176 bytes, the margin adds 96 to each. A failure here means
+// the declarations above were edited (or an unsupported data model) — fix the
+// struct, do not silence the assert; the runtime ABI canary in ma97_smoke
+// checks the LIBRARY side of the same contract.
+static_assert(sizeof(control) == 312, "ma97::control layout drifted");
+static_assert(sizeof(info) == 272, "ma97::info layout drifted");
 }  // namespace ma97
 
 extern "C" {
@@ -113,14 +135,23 @@ void ma97_free_fkeep_d(void** fkeep);
 void ma97_finalise_d(void** akeep, void** fkeep);
 }
 
+// Process-wide default for HSL's MC64 scaling on every block this wrapper
+// creates. OFF since 2026-07-25 (see the constructor for the measurements);
+// the drivers flip it back on with --ma57-scaling on.
+inline bool& hsl_block_scaling_default() { static bool v = false; return v; }
+
 class Ma97Block {
 public:
    Ma97Block() {
       ma97_default_control_d(&control_);
       control_.f_arrays = 1;   // the triplets stay 1-based, as for MA57
       control_.action = 1;     // continue on rank deficiency; singular() reads rank
-      control_.scaling = 1;    // MC64, mirroring Ma57Block's ICNTL(15)=1 default
+      // MC64 scaling, mirroring Ma57Block's ICNTL(15) — DEFAULT OFF since
+      // 2026-07-25 (same rationale and the same --ma57-scaling switch; see the
+      // measurements in ma57_block.hpp's constructor).
+      control_.scaling = hsl_block_scaling_default() ? 1 : 0;
       silence();
+      if (std::getenv("DD_MA97_SCALING")) control_.scaling = 1;
       if (std::getenv("DD_MA97_NO_SCALING")) control_.scaling = 0;
    }
    ~Ma97Block() { free_keeps(); }
@@ -146,6 +177,18 @@ public:
       ma97_analyse_coord_d(n_, ne_, irn_.data(), jcn_.data(), nullptr, &akeep_,
                            &control_, &info_, nullptr);
       if (info_.flag < 0) return false;
+      // Out-of-range indices are only a WARNING: MA97 drops the entries and
+      // factorizes the wrong matrix. Unlike MA57's sign test, the exact count
+      // is exposed — any nonzero means an index-mapping bug upstream; fail
+      // loudly. (matrix_dup stays legitimate: the appended diagonal and
+      // IPOPT's own triplets both rely on duplicates being summed.)
+      if (info_.matrix_outrange > 0) {
+         std::cerr << "[ma97] analyse: " << info_.matrix_outrange
+                   << " triplet(s) out of range (n=" << n_
+                   << ") — index-mapping bug, refusing to factorize the "
+                      "reduced matrix\n";
+         return false;
+      }
       scale_.assign(std::max(n_, 1), 0.0);
       return true;
    }
@@ -160,28 +203,46 @@ public:
    // when MA97 computes a scaling (with control.scaling = 0 a non-NULL scale
    // would be READ as user-supplied scaling).
    bool factorize() {
+      resource_failure_ = false;
+      solve_failed_ = false;   // new factorization = new solve epoch
       ma97_factor_d(4, nullptr, nullptr, a_.data(), &akeep_, &fkeep_, &control_,
                     &info_, control_.scaling != 0 ? scale_.data() : nullptr);
-      return info_.flag >= 0;
+      if (info_.flag < 0) {
+         // An allocation failure sets the Fortran STAT value in info.stat —
+         // classify it so the caller doesn't treat OOM as a singularity
+         // (IPOPT's δ_w bump would re-run the same OOM in a loop).
+         if (info_.stat != 0) {
+            resource_failure_ = true;
+            std::cerr << "[ma97] factor allocation failure: flag=" << info_.flag
+                      << " stat=" << info_.stat << " (n=" << n_ << ")\n";
+         }
+         return false;
+      }
+      return true;
    }
 
    // In-place solve A x = b for nrhs columns (column-major, leading dim n).
-   void solve(double* rhs, int nrhs = 1) { solve_job(1, rhs, nrhs); }
+   bool solve(double* rhs, int nrhs = 1) { return solve_job(1, rhs, nrhs); }
 
    // Partial solves, in MA57's JOB numbering (see the header comment): 1 full,
    // 2 forward (PL), 3 diagonal (D), 4 back ((PL)ᵀ). Composing 2→3→4
    // reproduces 1 ONLY with scaling off — same contract as Ma57Block.
-   void solve_job(int job, double* rhs, int nrhs = 1) {
+   bool solve_job(int job, double* rhs, int nrhs = 1) {
       static const int ma97_job[5] = {-1, 0, 1, 2, 3};
       ma97_solve_d(ma97_job[job], nrhs, rhs, n_, &akeep_, &fkeep_, &control_,
                    &info_);
+      // Warn once, LATCH per factorization epoch — same contract as Ma57Block
+      // (callers batching backsolves poll solve_failed() afterwards).
       if (info_.flag < 0) {
+         solve_failed_ = true;
          static bool warned = false;
          if (!warned) {
             std::cerr << "[ma97] solve failed: info.flag=" << info_.flag << "\n";
             warned = true;
          }
+         return false;
       }
+      return true;
    }
 
    // Disable MC64 scaling for THIS instance — required for meaningful
@@ -192,8 +253,15 @@ public:
    int rank() const { return info_.matrix_rank; }
    bool singular() const { return info_.matrix_rank < n_; }
    int status() const { return info_.flag; }
+   // Same contract as Ma57Block: resource_failure() = the last factorize()
+   // failure was allocation, not the matrix; solve_failed() = some back-solve
+   // since the last factorize() reported flag < 0.
+   bool resource_failure() const { return resource_failure_; }
+   bool solve_failed() const { return solve_failed_; }
 
 private:
+   bool resource_failure_ = false;
+   bool solve_failed_ = false;
    void free_keeps() {
       if (akeep_ && fkeep_) ma97_finalise_d(&akeep_, &fkeep_);
       else if (akeep_) ma97_free_akeep_d(&akeep_);

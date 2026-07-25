@@ -131,6 +131,16 @@ using SymBlock = Ma97Block;
 using SymBlock = Ma57Block;
 #endif
 
+// Optional MUMPS W_k backend (--wk-backend mumps): the partial-factorization
+// Schur — each subdomain factorization returns S_k as a byproduct instead of
+// paying p_k dense backsolves (the measured 97.5% of the S_k phase). Compiled
+// in only when the build found COIN ThirdParty-Mumps (build.sh adds
+// -DDD_HAVE_MUMPS); the runtime flag errors cleanly otherwise. Run
+// ./mumps_smoke once on any new machine/library build before trusting it.
+#ifdef DD_HAVE_MUMPS
+#include "mumps_block.hpp"
+#endif
+
 #include "IpAlgBuilder.hpp"
 #include "IpSparseSymLinearSolverInterface.hpp"
 #include "IpTSymLinearSolver.hpp"
@@ -160,6 +170,20 @@ public:
       cfgK() = nsub;
    }
    static std::vector<int>& cfgOwner() { static std::vector<int> v; return v; }
+
+   // W_k backend. MA57/MA97 (SymBlock) is the validated reference: factorize,
+   // then p_k backsolves form S_k. MUMPS is the partial-factorization-Schur
+   // alternative: one JOB=2 yields the factors AND S_k — but its per-call
+   // solve overhead was measured ~6× MA57CD, so the pure mode loses the
+   // backsolve-heavy solve phase. HYBRID takes each side's strength: MUMPS
+   // forms S_k (the measured 97.5%-backsolve phase disappears), MA57 factors
+   // the SAME W_k for the solve path and the inertia — at the price of two
+   // factorizations per block per Newton step. Runtime-selected so a single
+   // binary A/Bs all three; snapshotted into the frozen structure like the
+   // partition config (a backend change forces a full rebuild).
+   enum { WK_MA57 = 0, WK_MUMPS = 1, WK_HYBRID = 2 };
+   static void config_wk_backend(int b) { cfgWkBackend() = b; }
+   static int& cfgWkBackend() { static int v = WK_MA57; return v; }
 
    // Dump the arrowhead (matrix + owner map + assembled S) after every successful
    // factorization, overwriting, so the file ends up holding the LAST Newton step
@@ -219,6 +243,30 @@ public:
    // step and In(S) stays exact.
    static void config_minres(int lag) { cfgMinresLag() = lag < 1 ? 1 : lag; }
    static int& cfgMinresLag() { static int v = 1; return v; }
+   // LAGGED SCHUR (--schur-lag L, L>1 is an APPROXIMATION). Profiling (2026-07-25,
+   // N=32 6×6 tiles, exact Hessian) put the S_k formation at 72% of the run: it is
+   // Σ_k p_k dense back-solves through W_k, redone from scratch at EVERY
+   // factorization. Across an interior-point step W_k moves only through its
+   // barrier diagonal, so S_k is nearly unchanged — at L>1 the cached S_k blocks
+   // are reused for L−1 factorizations and only C is refreshed. The resulting S is
+   // inexact, which makes the arrowhead solve an inexact solve; solve_refined's
+   // iterative refinement against the TRUE triplets recovers the step, so the
+   // stale S acts as a preconditioner rather than a wrong answer.
+   //
+   // Two guards keep this honest, both non-negotiable for the inertia contract:
+   //   * a stale S may not decide an inertia rejection — MultiSolve rebuilds and
+   //     re-factorizes before ever returning WRONG_INERTIA (see there), so IPOPT's
+   //     δ_w loop is never driven by cached data;
+   //   * refinement failing to reach tolerance latches schur_force_, so a step the
+   //     stale S could not precondition rebuilds on the next factorization.
+   static void config_schur_lag(int lag) { cfgSchurLag() = lag < 1 ? 1 : lag; }
+   static int& cfgSchurLag() { static int v = 1; return v; }
+   // FORWARD-ONLY SCHUR (--schur forward). Exact, not an approximation: it drops
+   // the backward substitution from the S_k formation by algebra, not by
+   // truncation — see the derivation at the S_k loop. Forces MC64 scaling off on
+   // the W_k blocks (the JOB=2/3 partials only compose without it).
+   static void config_schur_forward(bool on) { cfgSchurFwd() = on; }
+   static bool& cfgSchurFwd() { static bool v = false; return v; }
    static int& cfgIface() { static int v = IFACE_DIRECT; return v; }
    static int& cfgPrecond() { static int v = PRECOND_ASD; return v; }
    static bool& cfgAlphaPeel() { static bool v = true; return v; }
@@ -275,9 +323,17 @@ public:
       // the per-level snapshot below runs. The guard is a FULL comparison
       // (dims, ia/ja, N/K, the injected owner vector), so a genuinely new
       // structure can never silently reuse a stale layout.
+#ifndef DD_HAVE_MUMPS
+      if (cfgWkBackend() != WK_MA57) {
+         std::cerr << "[dd] --wk-backend mumps/hybrid requested but this "
+                      "binary was built without MUMPS support (DD_HAVE_MUMPS)\n";
+         return SYMSOLVER_FATAL_ERROR;
+      }
+#endif
       const bool same_structure =
          frozen_ && dim == dim_ && nnz == nnz_ &&
          cfgN() == frzN_ && cfgK() == frzK_ && cfgOwner() == frzOwnerCfg_ &&
+         cfgWkBackend() == frzWk_ &&
          [&] {
             for (Index k = 0; k < nnz; ++k)
                if (ia[k] - 1 != irow_[k] || ja[k] - 1 != jcol_[k]) return false;
@@ -287,6 +343,11 @@ public:
       dim_ = dim; nnz_ = nnz;
       N_ = cfgN(); K_ = cfgK();
       m_ = N_ * N_;
+      // wk_mumps_: SOLVES (and inertia) come from MUMPS — pure mode only.
+      // wk_schur_: S_k comes from the MUMPS partial factorization (mumps or
+      // hybrid). Hybrid = wk_schur_ && !wk_mumps_: MA57 keeps the solve path.
+      wk_mumps_ = (cfgWkBackend() == WK_MUMPS);
+      wk_schur_ = (cfgWkBackend() != WK_MA57);
       frozen_ = false;
       const bool injected = !cfgOwner().empty();
       if (injected) {
@@ -312,6 +373,7 @@ public:
       }
       if (!route_triplets()) return SYMSOLVER_FATAL_ERROR;
       frzN_ = cfgN(); frzK_ = cfgK(); frzOwnerCfg_ = cfgOwner();
+      frzWk_ = cfgWkBackend();
       frozen_ = true;
       }                        // end !same_structure — per-level snapshot below
       vals_.assign(nnz_, 0.0);
@@ -325,6 +387,11 @@ public:
       minres_lag_ = cfgMinresLag();
       sgn_valid_ = false;      // new level ⇒ force a fresh snapshot (age 0)
       sgn_age_ = 0;
+      schur_fwd_ = cfgSchurFwd();   // read before route_triplets() builds the blocks
+      schur_lag_ = cfgSchurLag();
+      schur_valid_ = false;    // new level ⇒ the cached S_k blocks are void
+      schur_age_ = 0;
+      schur_force_ = false;
       peel_.clear();
       n_peel_dual_ = 0;
       if (iface_ == IFACE_CG) {
@@ -363,7 +430,21 @@ public:
          ESymSolverStatus st = factorize();
          if (st != SYMSOLVER_SUCCESS) return st;
       }
-      if (check_NegEVals && nneg_ != numberOfNegEVals) return SYMSOLVER_WRONG_INERTIA;
+      if (check_NegEVals && nneg_ != numberOfNegEVals) {
+         // A CACHED S may not decide this. In(A) = Σ_k In(W_k) + In(S) is exact
+         // only for the S that belongs to these values; with --schur-lag the
+         // scattered S carries stale S_k blocks, so a mismatch here could be an
+         // artefact of the cache rather than a genuine wrong inertia — and
+         // answering WRONG_INERTIA on an artefact sends IPOPT's δ_w loop chasing
+         // a curvature defect that is not there. Rebuild once and re-decide on
+         // exact data; if it still disagrees the answer is honest.
+         if (schur_age_ > 0) {
+            schur_force_ = true;
+            ESymSolverStatus st = factorize();
+            if (st != SYMSOLVER_SUCCESS) return st;
+         }
+         if (nneg_ != numberOfNegEVals) return SYMSOLVER_WRONG_INERTIA;
+      }
       // #7 (perf audit): one env lookup per process, not two per RHS.
       static const bool dd_check = std::getenv("DD_CHECK") != nullptr;
       for (Index c = 0; c < nrhs; ++c) {
@@ -375,7 +456,10 @@ public:
          // pivots (e.g. IPOPT's own δ_c = 1e-8·μ^¼ on the corner-dual
          // directions) lose ~10 digits through the local Schur assembly —
          // measured rel-res ~0.1 on unrefined solves, ~1e-12 refined.
-         solve_refined(b);
+         // A false return means the residual never came back finite (a W_k
+         // back-solve overflowed) — b holds no usable step, so report
+         // SINGULAR and let IPOPT bump δ_w rather than accept garbage.
+         if (!solve_refined(b)) return SYMSOLVER_SINGULAR;
          if (dd_check) check_solve(saved, b);
       }
       return SYMSOLVER_SUCCESS;
@@ -398,7 +482,15 @@ private:
    // factorization's answer, let IPOPT's globalization cope). Refinement here
    // only ever improves on the raw arrowhead solve; at well-conditioned
    // iterates it reaches ~1e-12 in one or two sweeps.
-   void solve_refined(Number* b) {
+   //
+   // Returns false when the residual NEVER evaluated finite (a W_k back-solve
+   // overflowed on the very first sweep, e.g. a near-zero threshold pivot at
+   // the deep Scholtes tail). Before this guard (2026-07-24) that path left
+   // `best` unassigned — NaN < inf is false — so all 5 sweeps spun on NaN and
+   // the final copy handed back sr_best_'s STALE previous solution (or the raw
+   // RHS on the first-ever call) as a successful solve. On false, b is left
+   // as the RHS and the caller reports SINGULAR.
+   bool solve_refined(Number* b) {
       const auto tic = std::chrono::steady_clock::now();
       // Member scratch (#4, perf audit): five dim-sized buffers per RHS, times
       // up to 6 solve_one calls, times thousands of RHS per run — allocator
@@ -421,7 +513,11 @@ private:
          double rn = 0.0;
          for (Index i = 0; i < dim_; ++i) { r[i] = b0[i] - Ax[i]; rn += r[i] * r[i]; }
          const double relres = std::sqrt(rn) / bn;
-         if (relres < best_res) { best_res = relres; best = x; }
+         // Seed on the first sweep so `best` can never be the stale previous
+         // RHS's solution; a non-finite residual buys no digits and would spin
+         // the NaN through every comparison below, so stop immediately.
+         if (it == 0 || relres < best_res) { best_res = relres; best = x; }
+         if (!std::isfinite(relres)) break;
          if (relres <= 1e-11 || relres > 1e3 * best_res) break;
          // CG mode only: a refinement sweep costs a FULL interface CG solve
          // (~p/3 apply_S matvecs), and with cg_tol ~1e-10 the 1e-11 target above
@@ -437,9 +533,18 @@ private:
       }
       if (best_res > 1e-6 && std::getenv("DD_DEBUG"))
          std::cerr << "[dd] refinement best-effort rel-res " << best_res << "\n";
-      std::copy(best.begin(), best.end(), b);
+      // Lagged-Schur feedback: a stale S is only admissible while refinement can
+      // still recover the step from it. Once it cannot, the cache has drifted too
+      // far to precondition — latch a rebuild for the next factorization. This is
+      // what keeps the lag adaptive: on the easy stretches it runs at the full
+      // lag, and it collapses to exact behaviour wherever the iterates get hard.
+      if (schur_lag_ > 1 && schur_age_ > 0 && !(best_res <= 1e-8))
+         schur_force_ = true;
+      const bool ok = std::isfinite(best_res);
+      if (ok) std::copy(best.begin(), best.end(), b);   // on failure keep b = RHS
       t_solve_ += std::chrono::duration<double>(
          std::chrono::steady_clock::now() - tic).count();
+      return ok;
    }
 
    // DD_CHECK=1: verify the arrowhead solve against a reference solve of the SAME
@@ -612,21 +717,29 @@ private:
 
       // MA57 wants ONE triangle in 1-based coordinate form. IPOPT already hands
       // us the lower triangle, so the routed triplets go through unchanged.
+      // (MUMPS mode: the per-block analysis is the AUGMENTED one and needs the
+      // B̄_k routing built below, so it happens at the end of this function.)
       ma57_.clear();
-      ma57_.resize(nsub_);
-      for (int k = 0; k < nsub_; ++k) {
-         std::vector<int> irn, jcn;
-         irn.reserve(wtrip_[k].size());
-         jcn.reserve(wtrip_[k].size());
-         for (int t : wtrip_[k]) {
-            irn.push_back(lpos_[irow_[t]] + 1);
-            jcn.push_back(lpos_[jcol_[t]] + 1);
-         }
-         ma57_[k].reset(new SymBlock());
-         if (!ma57_[k]->analyze(dimk_[k], irn, jcn)) {
-            std::cerr << "[dd] block analysis failed for W_" << k
-                      << " (status=" << ma57_[k]->status() << ")\n";
-            return false;
+      if (!wk_mumps_) {
+         ma57_.resize(nsub_);
+         for (int k = 0; k < nsub_; ++k) {
+            std::vector<int> irn, jcn;
+            irn.reserve(wtrip_[k].size());
+            jcn.reserve(wtrip_[k].size());
+            for (int t : wtrip_[k]) {
+               irn.push_back(lpos_[irow_[t]] + 1);
+               jcn.push_back(lpos_[jcol_[t]] + 1);
+            }
+            ma57_[k].reset(new SymBlock());
+            // The forward-only S_k path composes the JOB=2/3 partial solves,
+            // which only reproduce the JOB=1 factors when MC64 scaling is off
+            // (see Ma57Block::solve_job). Must precede analyze().
+            if (schur_fwd_) ma57_[k]->scaling_off();
+            if (!ma57_[k]->analyze(dimk_[k], irn, jcn)) {
+               std::cerr << "[dd] block analysis failed for W_" << k
+                         << " (status=" << ma57_[k]->status() << ")\n";
+               return false;
+            }
          }
       }
 
@@ -682,6 +795,70 @@ private:
                btrip_t_[k].push_back(e[2]);
             }
          }
+         // DD_STATS=1: the sparsity budget of the S_k formation. B_k is
+         // p_k × dim_k (column-major, so its outer index runs over the INTERIOR
+         // unknowns): `touch` counts the interior rows the interface reaches at
+         // all — the only rows of W_k⁻¹B̄_kᵀ that can be nonzero on input, and
+         // the only ones B_k reads back out. The gap between `touch` and dim_k
+         // is what a sparse-RHS back-solve would skip and what MA57CD's
+         // dense-RHS kernel currently traverses in full, p_k times over.
+         if (std::getenv("DD_STATS")) {
+            std::cerr << "[dd-stats] K=" << nsub_ << " p=" << p_ << "\n";
+            long tot_nnz = 0, tot_touch = 0, tot_dim = 0, tot_pk = 0;
+            for (int k = 0; k < nsub_; ++k) {
+               const int pk = (int)Nk_[k].size();
+               const int* outer = B_[k].outerIndexPtr();
+               int touch = 0;
+               for (int c = 0; c < dimk_[k]; ++c)
+                  if (outer[c + 1] > outer[c]) ++touch;
+               const long nnz = B_[k].nonZeros();
+               tot_nnz += nnz; tot_touch += touch;
+               tot_dim += dimk_[k]; tot_pk += pk;
+               if (k < 4 || std::getenv("DD_STATS_ALL"))
+                  std::cerr << "  k=" << k << " dim=" << dimk_[k] << " p_k=" << pk
+                            << " nnz(B_k)=" << nnz << " touched rows=" << touch
+                            << " (" << (100.0 * touch / std::max(1, dimk_[k]))
+                            << "% of dim)  nnz/col=" << (pk ? (double)nnz / pk : 0.0)
+                            << "\n";
+            }
+            std::cerr << "  TOTAL Σdim=" << tot_dim << " Σp_k=" << tot_pk
+                      << " Σnnz(B)=" << tot_nnz << " Σtouched=" << tot_touch
+                      << "  dense-RHS entries solved/fact = " << tot_dim * tot_pk / std::max(1, nsub_)
+                      << "\n";
+         }
+#ifdef DD_HAVE_MUMPS
+         if (wk_schur_) {
+            // Augmented per-block MUMPS analysis: interior W_k triplets in
+            // wtrip_ order, then the B̄_k couplings in ents order — which is
+            // exactly btrip_t_'s order, the order factorize()'s value refresh
+            // replays. Border (Schur) rows are appended after the interior at
+            // dimk_[k] + ykrow, so every triplet stays in ONE triangle
+            // (border index > interior index always), and the returned Schur
+            // is indexed by N_k position — the layout Sk_/sk_slot_ and the
+            // BJ/ASd blocks already consume.
+            mumps_.clear();
+            mumps_.resize(nsub_);
+            for (int k = 0; k < nsub_; ++k) {
+               std::vector<int> irn, jcn;
+               irn.reserve(wtrip_[k].size() + ents[k].size());
+               jcn.reserve(wtrip_[k].size() + ents[k].size());
+               for (int t : wtrip_[k]) {
+                  irn.push_back(lpos_[irow_[t]] + 1);
+                  jcn.push_back(lpos_[jcol_[t]] + 1);
+               }
+               for (const auto& e : ents[k]) {
+                  irn.push_back(dimk_[k] + e[0] + 1);
+                  jcn.push_back(e[1] + 1);
+               }
+               mumps_[k].reset(new MumpsSchurBlock());
+               if (!mumps_[k]->analyze(dimk_[k], (int)Nk_[k].size(), irn, jcn)) {
+                  std::cerr << "[dd] MUMPS block analysis failed for W_" << k
+                            << " (status=" << mumps_[k]->status() << ")\n";
+                  return false;
+               }
+            }
+         }
+#endif
       }
 
       // The interface matrix S is SPARSE by subdomain adjacency (the vault's
@@ -814,6 +991,39 @@ private:
       return true;
    }
 
+   // ---- W_k backend dispatch ---------------------------------------------
+   // MA57/MA97 (SymBlock) is the validated reference; MUMPS the opt-in
+   // partial-factorization-Schur backend. Tiny inline branches — wk_solve sits
+   // in front of a Fortran backsolve, so the branch cost is noise.
+#ifdef DD_HAVE_MUMPS
+   bool wk_solve(int k, double* rhs, int nrhs = 1) {
+      return wk_mumps_ ? mumps_[k]->solve(rhs, nrhs)
+                       : ma57_[k]->solve(rhs, nrhs);
+   }
+   int wk_neg(int k) const {
+      return wk_mumps_ ? mumps_[k]->negative_eigenvalues()
+                       : ma57_[k]->negative_eigenvalues();
+   }
+   int wk_status(int k) const {
+      return wk_mumps_ ? mumps_[k]->status() : ma57_[k]->status();
+   }
+   int wk_rank(int k) const {
+      return wk_mumps_ ? mumps_[k]->rank() : ma57_[k]->rank();
+   }
+   bool wk_resource_failure(int k) const {
+      return wk_mumps_ ? mumps_[k]->resource_failure()
+                       : ma57_[k]->resource_failure();
+   }
+#else
+   bool wk_solve(int k, double* rhs, int nrhs = 1) {
+      return ma57_[k]->solve(rhs, nrhs);
+   }
+   int wk_neg(int k) const { return ma57_[k]->negative_eigenvalues(); }
+   int wk_status(int k) const { return ma57_[k]->status(); }
+   int wk_rank(int k) const { return ma57_[k]->rank(); }
+   bool wk_resource_failure(int k) const { return ma57_[k]->resource_failure(); }
+#endif
+
    // ---- assemble + factorize --------------------------------------------
    ESymSolverStatus factorize() {
       const int K = nsub_;
@@ -827,6 +1037,22 @@ private:
       // couplings and (below) the S_k blocks accumulate straight into
       // Ssp_.valuePtr() in the same order as the dense path did, so every
       // downstream value is bit-identical while the O(p²) zero+copy is gone.
+#ifdef DD_HAVE_MUMPS
+      if (wk_schur_) {
+         // The augmented MUMPS values replay the analyze-time order exactly:
+         // the W_k triplets (wtrip_ order), then the B̄_k couplings (btrip_t_
+         // order — the same ents order the structure was built from).
+         for (int k = 0; k < K; ++k) {
+            double* a = mumps_[k]->values();
+            const auto& iw = wtrip_[k];
+            for (size_t e = 0; e < iw.size(); ++e) a[e] = vals_[iw[e]];
+            double* ab = a + iw.size();
+            const auto& ib = btrip_t_[k];
+            for (size_t e = 0; e < ib.size(); ++e) ab[e] = vals_[ib[e]];
+         }
+      }
+#endif
+      if (!wk_mumps_)
       for (int k = 0; k < K; ++k) {
          double* a = ma57_[k]->values();
          const auto& idx = wtrip_[k];
@@ -842,6 +1068,7 @@ private:
          }
       }
       nneg_ = 0;
+      if (schur_fwd_ && (int)sfw_Z_.size() != K) sfw_Z_.resize(K);
       if ((int)okbuf_.size() != K) okbuf_.assign(K, 1);
       std::vector<char>& ok = okbuf_;
 
@@ -853,31 +1080,75 @@ private:
       // deficiency (corner dual pairs) is prevented above by border promotion;
       // what remains (θ-gauge columns at r=δ=0) is singular in the FULL matrix
       // too, so SINGULAR is the truthful answer and IPOPT's δ_w cures it.
+      if (!wk_mumps_) {
 // FACTORIZATION loop: serial under MA97 — concurrent ma97_factor heap-corrupts
 // (gdb 2026-07-23: free() in rfact_block; see the SymBlock threading note).
 #if defined(_OPENMP) && !defined(DD_USE_MA97)
 #pragma omp parallel for schedule(dynamic)
 #endif
-      for (int k = 0; k < K; ++k) {
-         double* bv = B_[k].valuePtr();
-         std::fill(bv, bv + B_[k].nonZeros(), 0.0);
-         const auto& tt = btrip_t_[k];
-         const auto& ss = btrip_slot_[k];
-         for (size_t e = 0; e < tt.size(); ++e) bv[ss[e]] += vals_[tt[e]];
-         ok[k] = (ma57_[k]->factorize() && !ma57_[k]->singular()) ? 1 : 0;
+         for (int k = 0; k < K; ++k) {
+            double* bv = B_[k].valuePtr();
+            std::fill(bv, bv + B_[k].nonZeros(), 0.0);
+            const auto& tt = btrip_t_[k];
+            const auto& ss = btrip_slot_[k];
+            for (size_t e = 0; e < tt.size(); ++e) bv[ss[e]] += vals_[tt[e]];
+            ok[k] = (ma57_[k]->factorize() && !ma57_[k]->singular()) ? 1 : 0;
+         }
       }
+#ifdef DD_HAVE_MUMPS
+      if (wk_schur_) {
+         // SERIAL by design: MumpsSchurBlock has not been through a
+         // mumps_smoke_par-style concurrency audit (the MA97 lesson —
+         // concurrent factorization heap-corrupted there; do not parallelize
+         // untested). JOB=2 computes the factors AND the Schur block S_k, so
+         // here t_factor_ absorbs what the MA57 path books under t_schur_ —
+         // compare factor+schur SUMS across backends. In HYBRID mode this is
+         // the SECOND factorization of the same W_k (MA57 keeps the solve
+         // path); both must succeed for the step to stand.
+         for (int k = 0; k < K; ++k) {
+            if (wk_mumps_) {            // pure mode: B_ refresh happens here
+               double* bv = B_[k].valuePtr();
+               std::fill(bv, bv + B_[k].nonZeros(), 0.0);
+               const auto& tt = btrip_t_[k];
+               const auto& ss = btrip_slot_[k];
+               for (size_t e = 0; e < tt.size(); ++e) bv[ss[e]] += vals_[tt[e]];
+            } else if (!ok[k]) {
+               continue;                // MA57 already rejected this step
+            }
+            const bool mok = mumps_[k]->factorize() && !mumps_[k]->singular();
+            ok[k] = (ok[k] || wk_mumps_) && mok ? 1 : 0;
+            if (!mok && mumps_[k]->resource_failure()) {
+               std::cerr << "[dd] W_" << k << " MUMPS factorization ran out "
+                            "of memory (dim=" << dimk_[k]
+                         << ", status=" << mumps_[k]->status()
+                         << ") — fatal, not a singularity\n";
+               return SYMSOLVER_FATAL_ERROR;
+            }
+         }
+      }
+#endif
       const auto tic1 = std::chrono::steady_clock::now();
       t_factor_ += std::chrono::duration<double>(tic1 - tic0).count();
 
       for (int k = 0; k < K; ++k) {
          if (!ok[k]) {
+            // OOM/workspace exhaustion is NOT a singularity: reporting it as
+            // SINGULAR sends IPOPT into a δ_w loop that re-runs the same OOM
+            // with no diagnostic. Abort honestly instead.
+            if (wk_resource_failure(k)) {
+               std::cerr << "[dd] W_" << k << " factorization ran out of "
+                            "memory/workspace (dim=" << dimk_[k]
+                         << ", status=" << wk_status(k)
+                         << ") — fatal, not a singularity\n";
+               return SYMSOLVER_FATAL_ERROR;
+            }
             if (std::getenv("DD_DEBUG"))
-               std::cerr << "[dd] W_" << k << " block status=" << ma57_[k]->status()
-                         << " rank=" << ma57_[k]->rank() << "/" << dimk_[k]
+               std::cerr << "[dd] W_" << k << " block status=" << wk_status(k)
+                         << " rank=" << wk_rank(k) << "/" << dimk_[k]
                          << " → SINGULAR\n";
             return SYMSOLVER_SINGULAR;       // IPOPT responds by bumping δ_w
          }
-         nneg_ += ma57_[k]->negative_eigenvalues();
+         nneg_ += wk_neg(k);
       }
 
       // S = C − Σ_k B̄_k W_k⁻¹ B̄_kᵀ, scattered by the selection lists N_k.
@@ -887,6 +1158,35 @@ private:
       // densify/alloc 0.16%; the scatter below is 0.2%. So the p_k backsolves
       // ARE the S_k phase; the only lever that could move it is a sparse-RHS
       // block solver (the RHS columns are 0.3–1% dense; MA57CD is dense-RHS).
+      // ---- lagged Schur (--schur-lag L): reuse the cached S_k blocks -------
+      // Everything above (the W_k factorizations, the B_k value refresh, the C
+      // couplings already scattered into Ssp_) stayed fresh; only the Σ_k p_k
+      // back-solves below are skipped. schur_force_ is the refinement latch and
+      // MultiSolve's inertia guard — either one makes this rebuild regardless.
+      const bool reuse_schur = schur_lag_ > 1 && schur_valid_ && !schur_force_
+                            && schur_age_ + 1 < schur_lag_;
+      if (reuse_schur) {
+         ++schur_age_;
+      } else {
+         schur_age_ = 0;
+         schur_force_ = false;
+      }
+      if (!reuse_schur) {
+#ifdef DD_HAVE_MUMPS
+      if (wk_schur_) {
+         // The whole point of the MUMPS backend: S_k came out of the
+         // factorization itself. Copy the symmetrized Schur into Sk_ — same
+         // sign (MUMPS returns 0 − B̄ W⁻¹ B̄ᵀ), same N_k-order layout the
+         // sk_slot_ scatter and the BJ/ASd preconditioner blocks consume.
+         // No backsolves happened, so there is no solve_failed latch to poll.
+         for (int k = 0; k < K; ++k) {
+            const int pk = (int)Nk_[k].size();
+            if (pk == 0) { Sk_[k].resize(0, 0); continue; }
+            Sk_[k] =
+               Eigen::Map<const Eigen::MatrixXd>(mumps_[k]->schur(), pk, pk);
+         }
+      } else {
+#endif
 // BACKSOLVE loop: parallel under BOTH backends — concurrent ma97_solve is
 // validated (ma97_smoke_par phase B, 2026-07-23; only concurrent FACTOR crashes).
 #ifdef _OPENMP
@@ -896,9 +1196,84 @@ private:
          const int pk = (int)Nk_[k].size();
          if (pk == 0) { Sk_[k].resize(0, 0); continue; }
          Eigen::MatrixXd Bt = Eigen::MatrixXd(B_[k].transpose());   // dim_k × p_k
-         ma57_[k]->solve(Bt.data(), pk);                            // p_k backsolves
-         Sk_[k] = -(B_[k] * Bt);
+         if (schur_fwd_) {
+            // FORWARD-ONLY S_k. With W_k = P L D Lᵀ Pᵀ (MC64 scaling off, so
+            // the JOB=2/3/4 partials compose exactly),
+            //     S_k = −B̄_k W_k⁻¹ B̄_kᵀ = −Yᵀ D⁻¹ Y,    Y = L⁻¹Pᵀ B̄_kᵀ,
+            // since the Lᵀ half of the solve cancels against the B̄_k that
+            // multiplies it back on the left. The BACKWARD substitution is
+            // therefore never performed — and it is precisely the half that
+            // sparse-RHS pruning cannot touch, since a back-substituted solution
+            // is dense however sparse the RHS was. Exact, not an approximation:
+            // measured against the JOB=1 route block-by-block (DD_SCHUR_CHECK),
+            // max rel-err ~1e-13 over a whole run.
+            //
+            // MEASURED 7–17% on total wall clock (never a loss; N=32 6×6 exact
+            // 2.58s→2.19s, N=48 13.8s→12.2s, 1D n2048 0.253s→0.234s), NOT the 2×
+            // the flop bookkeeping suggests. What is dropped is a BLAS3-blocked
+            // triangular solve; what replaces it is a dim_k×p_k² GEMM of
+            // comparable cost. The win grows as p_k shrinks against nnz(L)/dim_k,
+            // i.e. for large subdomains with small interfaces — the distributed
+            // regime, not this one.
+            //
+            // The remaining forward solve is where sparse-RHS pruning would pay:
+            // its RHS columns carry ~4–6 nonzeros in dim_k ~440 (DD_STATS), but
+            // the union of rows the interface touches is ~24% of dim_k, so the
+            // reachable ceiling is a few×, not orders. MA57 exposes no sparse-RHS
+            // entry point; MUMPS ICNTL(20)/ICNTL(30) would be the route.
+            // DD_SCHUR_CHECK=1: the same S_k by both routes, per block per
+            // factorization. Isolates the forward path's ACCURACY from its
+            // effect on the IPOPT trajectory (which DD_CHECK conflates with
+            // refinement's ability to recover a bad step).
+            Eigen::MatrixXd Sref;
+            if (std::getenv("DD_SCHUR_CHECK")) {
+               Eigen::MatrixXd Bt2 = Bt;
+               ma57_[k]->solve(Bt2.data(), pk);
+               Sref = -(B_[k] * Bt2);
+            }
+            ma57_[k]->solve_job(2, Bt.data(), pk);                  // Y
+            sfw_Z_[k] = Bt;
+            ma57_[k]->solve_job(3, sfw_Z_[k].data(), pk);           // D⁻¹Y
+            Sk_[k].noalias() = -(Bt.transpose() * sfw_Z_[k]);
+            if (Sref.size()) {
+               const double den = Sref.cwiseAbs().maxCoeff();
+               const double num = (Sk_[k] - Sref).cwiseAbs().maxCoeff();
+               std::cerr << "[schur-check] k=" << k << " |S|max=" << den
+                         << " relerr=" << (den > 0 ? num / den : num) << "\n";
+            }
+            // Exactly symmetric in exact arithmetic; D⁻¹'s 2×2 pivot blocks make
+            // the computed product differ in the last bits. The inertia of S and
+            // the sk_slot_ scatter both assume symmetry, so enforce it in place
+            // (O(p_k²), no temporary — Sk_ is reused across factorizations).
+            for (int j = 0; j < pk; ++j)
+               for (int i = 0; i < j; ++i) {
+                  const double m = 0.5 * (Sk_[k](i, j) + Sk_[k](j, i));
+                  Sk_[k](i, j) = m;
+                  Sk_[k](j, i) = m;
+               }
+         } else {
+            ma57_[k]->solve(Bt.data(), pk);                         // p_k backsolves
+            Sk_[k] = -(B_[k] * Bt);
+         }
       }
+      // A failed backsolve above (latched per block since its factorize) means
+      // the S_k just assembled is garbage — S, its inertia, and every step
+      // solved through it would be silently wrong. There is no residual gate
+      // on this path (solve_refined guards only the full-KKT solves), so poll
+      // the latch and report SINGULAR: the δ_w re-factorization retries with a
+      // better-conditioned matrix, the monolithic-equivalent response.
+      for (int k = 0; k < K; ++k) {
+         if (ma57_[k]->solve_failed()) {
+            std::cerr << "[dd] W_" << k << " backsolve failed during S_k "
+                         "formation — discarding this factorization\n";
+            return SYMSOLVER_SINGULAR;
+         }
+      }
+#ifdef DD_HAVE_MUMPS
+      }
+#endif
+      schur_valid_ = true;
+      }   // end !reuse_schur
       const auto tic1b = std::chrono::steady_clock::now();
       {
          double* sv = Ssp_.valuePtr();
@@ -934,6 +1309,13 @@ private:
                    << "s (scatter " << t_scatter_ << "s)  S-fact " << t_sfact_
                    << "s  solve " << t_solve_ << "s\n";
       if (!okS) {
+         if (s_ma57_->resource_failure()) {
+            std::cerr << "[dd] interface-matrix factorization ran out of "
+                         "memory/workspace (p=" << p_
+                      << ", status=" << s_ma57_->status()
+                      << ") — fatal, not a singularity\n";
+            return SYMSOLVER_FATAL_ERROR;
+         }
          if (std::getenv("DD_DEBUG"))
             std::cerr << "[dd] S block status=" << s_ma57_->status()
                       << " rank=" << s_ma57_->rank() << "/" << p_
@@ -1043,7 +1425,7 @@ private:
          Eigen::VectorXd& t = tk_[k];
          t.resize(dimk_[k]);
          t.noalias() = B_[k].transpose() * yk;                          // dim_k
-         ma57_[k]->solve(t.data(), 1);                                  // W_k⁻¹ t
+         wk_solve(k, t.data(), 1);                                      // W_k⁻¹ t
          contrib_[k].resize(pk);
          contrib_[k].noalias() = B_[k] * t;                             // pk
       }
@@ -1684,10 +2066,10 @@ private:
          if (owner_[i] >= 0) rk[owner_[i]][lpos_[i]] = rhs[i];
          else ry[ypos_[i]] = rhs[i];
       }
-      // r_S = r_y − Σ_k B̄_k W_k⁻¹ r_k   (MA57CD solves in place)
+      // r_S = r_y − Σ_k B̄_k W_k⁻¹ r_k   (in-place backsolves)
       for (int k = 0; k < K; ++k) {
          wk[k] = rk[k];
-         ma57_[k]->solve(wk[k].data(), 1);
+         wk_solve(k, wk[k].data(), 1);
          if (Nk_[k].empty()) continue;
          Eigen::VectorXd contrib = B_[k] * wk[k];
          for (size_t a = 0; a < Nk_[k].size(); ++a) ry[Nk_[k][a]] -= contrib[(int)a];
@@ -1712,7 +2094,7 @@ private:
             rk[k] -= so_bd_;
          }
          wk[k] = rk[k];
-         ma57_[k]->solve(wk[k].data(), 1);
+         wk_solve(k, wk[k].data(), 1);
       }
       for (Index i = 0; i < dim_; ++i)
          rhs[i] = (owner_[i] >= 0) ? wk[owner_[i]][lpos_[i]] : dy[ypos_[i]];
@@ -1728,6 +2110,14 @@ private:
    int s_neg_ = 0;              // In(S)_neg of the current factorization (CG gate)
    int n_peel_dual_ = 0;        // peeled DUAL entries (the admissible In(S)_neg)
    // ---- signed-MA57 MINRES state (--interface minres) ----
+   // ---- forward-only Schur state (--schur forward) ----
+   bool schur_fwd_ = false;              // S_k = −Yᵀ D⁻¹ Y, no back-substitution
+   std::vector<Eigen::MatrixXd> sfw_Z_;  // per-block D⁻¹Y scratch (dim_k × p_k)
+   // ---- lagged-Schur state (--schur-lag) ----
+   int schur_lag_ = 1;          // rebuild the S_k cache every this-many facts
+   int schur_age_ = 0;          // factorizations since the last rebuild
+   bool schur_valid_ = false;   // Sk_ holds blocks from a completed rebuild
+   bool schur_force_ = false;   // next factorize MUST rebuild (refinement/inertia)
    int minres_lag_ = 1;         // rebuild the snapshot every this-many facts
    int sgn_age_ = 0;            // factorizations since the snapshot (0 = fresh)
    bool sgn_valid_ = false;     // snapshot factorized + |D⁻¹| recovered + checked
@@ -1798,6 +2188,18 @@ private:
    // large and the object is not cheaply copyable). Symbolic analysis is done
    // once in route_triplets(); only factorize() runs per Newton step.
    std::vector<std::unique_ptr<SymBlock>> ma57_;
+   // --wk-backend snapshot for the current structure (guarded by frzWk_).
+   // wk_mumps_ = solves/inertia from MUMPS (pure mode); wk_schur_ = S_k from
+   // the MUMPS partial factorization (pure or hybrid).
+   bool wk_mumps_ = false;
+   bool wk_schur_ = false;
+   int frzWk_ = WK_MA57;
+#ifdef DD_HAVE_MUMPS
+   // One MUMPS partial factorization per subdomain (--wk-backend mumps): one
+   // JOB=2 yields the W_k factors AND the Schur block S_k; solve() is the
+   // interior W_k⁻¹. Populated instead of ma57_ (never both).
+   std::vector<std::unique_ptr<MumpsSchurBlock>> mumps_;
+#endif
    std::vector<Eigen::MatrixXd> Sk_;   // local Schur blocks (feed the BJ/ASd blocks)
    std::unique_ptr<SymBlock> s_ma57_;
    std::vector<std::pair<int, int>> spat_;   // sparse lower-tri pattern of S

@@ -267,18 +267,26 @@ static void self_check(Mpcc2DTNLP& p, const std::vector<int>& owner,
 int main(int argc, char** argv) {
    std::string data, solver = "ma57", init = "file", save_sol, save_dd, save_data;
    std::string interface_solver = "direct", precond = "asd";
+   std::string wk_backend = "ma57";
    double t0 = 1.0, tmin = 1e-4, factor = 0.85, tol = 1e-8, c_theta = 1.0;
    std::string cg_apply = "assembled";
    double wmax = 2e19, reg_alpha = 1e-4, sigma = 0.1, cg_tol = 1e-10;
    int nsub = 2, maxiter = 3000, printlevel = 0, size = 0, seed = 0, cg_maxit = 500;
    int minres_lag = 1;
+   int schur_lag = 1;
+   std::string schur_mode = "forward";
+   std::string hessian = "limited-memory";
+   std::string ma57_scaling = "off";
    // μ-coupled is the DEFAULT since 2026-07-23 (measured 7–60× fewer iterations
    // at identical solutions on cameraman N=16/32 and mariposa N=128 k=8;
    // see README). `--t-update geometric` restores the per-level continuation —
-   // needed to reproduce every table recorded before the flip, and the safer
-   // mode on suspect instances: the single μ-coupled solve has NO
-   // best-completed-level fallback on failure, and a bad α₀ can stall the
-   // barrier with t pinned (the documented mariposa --alpha0 -2 mode).
+   // needed to reproduce every table recorded before the flip, and still the
+   // safer mode on suspect instances: a bad α₀ can stall the barrier with t
+   // pinned (the documented mariposa --alpha0 -2 mode). Since 2026-07-24 a
+   // failed μ-coupled solve falls back to the deepest BANKED level (one banked
+   // per monotone μ drop, smallest max r(1−δ) kept — see mpcc_base.hpp), so a
+   // tail failure reports/saves the tightest converged level instead of
+   // nothing; a stall before the FIRST μ drop still reports nothing.
    std::string t_update = "mu";
    double t_mu_scale = 10.0;
    std::string weight = "linear", stencil = "onesided", normalize = "255";
@@ -329,10 +337,15 @@ int main(int argc, char** argv) {
       else if (a == "--partition") partition = next();
       else if (a == "--interface") interface_solver = next();
       else if (a == "--precond")  precond = next();
+      else if (a == "--wk-backend") wk_backend = next();
       else if (a == "--cg-tol")   cg_tol = std::stod(next());
       else if (a == "--cg-max-iter") cg_maxit = std::stoi(next());
       else if (a == "--cg-apply") cg_apply = next();
       else if (a == "--minres-lag") minres_lag = std::stoi(next());
+      else if (a == "--schur-lag")  schur_lag = std::stoi(next());
+      else if (a == "--schur")      schur_mode = next();
+      else if (a == "--hessian")   hessian = next();
+      else if (a == "--ma57-scaling") ma57_scaling = next();
       else if (a == "--t-update")   t_update = next();
       else if (a == "--t-mu-scale") t_mu_scale = std::stod(next());
       else if (a == "--no-alpha-peel") alpha_peel = false;
@@ -340,12 +353,20 @@ int main(int argc, char** argv) {
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
    if (data.empty()) {
-      std::cerr << "usage: dd_solve_2d --data <data/data_2d_N.txt|image.png> "
+      std::cerr << "usage: dd_solve_2d --data <cpp2/data_2d_N.txt|image.png> "
                    "[--size N] [--solver mumps|ma57|ma97|dd] [--nsub k]\n"
                    "                   [--self-check] [--save-solution FILE] "
                    "[--save-dd FILE] [--partition tile|strip]\n"
                    "                   [--interface direct|cg|minres] "
-                   "[--precond jacobi|bj|asd] [--no-alpha-peel] ...\n"
+                   "[--precond jacobi|bj|asd] [--no-alpha-peel]\n"
+                   "                   [--wk-backend ma57|mumps] ...\n"
+                   "  --wk-backend mumps (needs --solver dd, a MUMPS-enabled "
+                   "build): each W_k is\n"
+                   "    factorized by MUMPS with the partial-factorization "
+                   "Schur — S_k comes out\n"
+                   "    of the factorization instead of p_k backsolves. "
+                   "Validate with ./mumps_smoke\n"
+                   "    and DD_CHECK=1 on any new machine.\n"
                    "  --interface cg (needs --solver dd): preconditioned CG on the\n"
                    "    interface. On tile partitions the promoted corner duals make\n"
                    "    S indefinite; the DUAL PEEL (on by default) eliminates them as\n"
@@ -363,10 +384,10 @@ int main(int argc, char** argv) {
                    "    on suspect instances — it keeps a best-converged-level\n"
                    "    fallback that the single mu solve does not have).\n"
                    "  generate the data file first:\n"
-                   "    python ../python/dump_data_2d.py --N 16 --nsub 2 "
-                   "-o data/data_2d_16.txt\n"
+                   "    uv run python cpp2/dump_data_2d.py --N 16 --nsub 2 "
+                   "-o cpp2/data_2d_16.txt\n"
                    "  and plot the result with:\n"
-                   "    python ../python/plot_2d.py --solution sol.txt "
+                   "    uv run python cpp2/plot_2d.py --solution sol.txt "
                    "--save-plot sol.png\n";
       return 2;
    }
@@ -389,16 +410,67 @@ int main(int argc, char** argv) {
                    "interface solve)\n";
       return 2;
    }
+   if (hessian != "exact" && hessian != "limited-memory") {
+      std::cerr << "--hessian must be exact|limited-memory\n";
+      return 2;
+   }
+   if (ma57_scaling != "on" && ma57_scaling != "off") {
+      std::cerr << "--ma57-scaling must be on|off\n";
+      return 2;
+   }
+   hsl_block_scaling_default() = (ma57_scaling == "on");
+   if (schur_mode != "backsolve" && schur_mode != "forward") {
+      std::cerr << "--schur must be backsolve|forward\n";
+      return 2;
+   }
+   if (schur_lag < 1) {
+      std::cerr << "--schur-lag must be >= 1\n";
+      return 2;
+   }
+   if (schur_lag > 1 && solver != "dd") {
+      std::cerr << "--schur-lag needs --solver dd (it caches the arrowhead's "
+                   "local Schur blocks)\n";
+      return 2;
+   }
    if (minres_lag < 1) {
       std::cerr << "--minres-lag must be >= 1\n";
       return 2;
    }
+   if (wk_backend != "ma57" && wk_backend != "mumps" &&
+       wk_backend != "hybrid") {
+      std::cerr << "--wk-backend must be ma57|mumps|hybrid\n";
+      return 2;
+   }
+   if (wk_backend != "ma57" && solver != "dd") {
+      std::cerr << "--wk-backend " << wk_backend
+                << " needs --solver dd (it selects the "
+                   "arrowhead's W_k block backend)\n";
+      return 2;
+   }
+#ifndef DD_HAVE_MUMPS
+   if (wk_backend != "ma57") {
+      std::cerr << "--wk-backend " << wk_backend
+                << ": this binary was built without MUMPS "
+                   "support (build with COIN ThirdParty-Mumps visible to "
+                   "pkg-config as coinmumps)\n";
+      return 2;
+   }
+#endif
    if (t_update != "geometric" && t_update != "mu") {
       std::cerr << "--t-update must be geometric|mu\n";
       return 2;
    }
    if (t_mu_scale <= 0) {
       std::cerr << "--t-mu-scale must be > 0\n";
+      return 2;
+   }
+   // The geometric schedule must terminate (factor >= 1 or t-min <= 0 would
+   // grow the level vector until OOM); the mu-coupled single solve only uses
+   // t0 as the seed and t-min as the floor, so factor is unconstrained there.
+   if (t_update == "geometric") {
+      if (!driver::valid_schedule(t0, tmin, factor)) return 2;
+   } else if (!(tmin > 0) || !(t0 >= tmin)) {
+      std::cerr << "--t-min must be > 0 and --t0 >= --t-min\n";
       return 2;
    }
    if (precond != "jacobi" && precond != "bj" && precond != "asd") {
@@ -481,6 +553,7 @@ int main(int argc, char** argv) {
       else std::cout << "  nsub=" << nsub << "x" << nsub << " tiles";
       if (n_promoted) std::cout << "  +" << n_promoted << " promoted corner duals";
       else if (!promote) std::cout << "  (corner promotion OFF)";
+      if (wk_backend == "mumps") std::cout << "  wk-backend=mumps(schur)";
    }
    if (solver == "dd" && interface_solver == "cg")
       std::cout << "  interface=cg(" << precond
@@ -525,7 +598,7 @@ int main(int argc, char** argv) {
    }
 
    SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
-   if (!driver::init_app(app, printlevel, maxiter, solver)) return 1;
+   if (!driver::init_app(app, printlevel, maxiter, solver, hessian)) return 1;
 
    if (solver == "dd") {
       DDArrowheadSolver::config_owner(owner, part.n_sub);
@@ -539,11 +612,17 @@ int main(int argc, char** argv) {
                              : DDArrowheadSolver::PRECOND_ASD,
          alpha_peel, cg_tol, cg_maxit);
       DDArrowheadSolver::config_minres(minres_lag);
+      DDArrowheadSolver::config_schur_lag(schur_lag);
+      DDArrowheadSolver::config_schur_forward(schur_mode == "forward");
       DDArrowheadSolver::config_cg_apply(
          cg_apply == "matfree" ? DDArrowheadSolver::APPLY_MATFREE
                                : DDArrowheadSolver::APPLY_ASSEMBLED);
       DDArrowheadSolver::config_alpha(mpcc->oa);
       DDArrowheadSolver::config_peel(dual_peel ? mpcc->n : (1 << 30));
+      DDArrowheadSolver::config_wk_backend(
+         wk_backend == "mumps"    ? DDArrowheadSolver::WK_MUMPS
+         : wk_backend == "hybrid" ? DDArrowheadSolver::WK_HYBRID
+                                  : DDArrowheadSolver::WK_MA57);
       DDArrowheadSolver::reset_interface_stats();
    }
    auto optimize = [&]() -> ApplicationReturnStatus {

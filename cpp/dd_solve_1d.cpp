@@ -181,8 +181,13 @@ static void self_check(Mpcc1DTNLP& p, const std::vector<int>& owner,
 int main(int argc, char** argv) {
    std::string data, solver = "ma57", init = "file", save_sol, save_dd;
    std::string interface_solver = "direct", precond = "asd";
+   std::string wk_backend = "ma57";
    double t0 = 1.0, tmin = 1e-4, factor = 0.3, tol = 1e-8, c_theta = 0.0;
    std::string cg_apply = "assembled";
+   int schur_lag = 1;
+   std::string schur_mode = "forward";
+   std::string hessian = "limited-memory";
+   std::string ma57_scaling = "off";
    double wmax = 2e19, reg_alpha = 1e-4, cg_tol = 1e-10;
    int nsub = 2, maxiter = 1000, printlevel = 0, cg_maxit = 500;
    bool check = false, nsub_set = false, dual_warm = false, alpha_peel = true;
@@ -215,9 +220,14 @@ int main(int argc, char** argv) {
       else if (a == "--dual-warmstart") dual_warm = true;
       else if (a == "--interface") interface_solver = next();
       else if (a == "--precond")  precond = next();
+      else if (a == "--wk-backend") wk_backend = next();
       else if (a == "--cg-tol")   cg_tol = std::stod(next());
       else if (a == "--cg-max-iter") cg_maxit = std::stoi(next());
       else if (a == "--cg-apply") cg_apply = next();
+      else if (a == "--schur-lag") schur_lag = std::stoi(next());
+      else if (a == "--schur")     schur_mode = next();
+      else if (a == "--hessian")   hessian = next();
+      else if (a == "--ma57-scaling") ma57_scaling = next();
       else if (a == "--no-alpha-peel") alpha_peel = false;
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
@@ -234,10 +244,7 @@ int main(int argc, char** argv) {
                    "    alpha row peeled as a scalar Schur step (dd_kkt.py's route).\n"
                    "  generate the data file first:\n"
                    "    python ../python/dump_data_1d.py --n 64 --nsub 4 "
-                   "-o data/data_1d_64.txt\n"
-                   "  and plot the result with:\n"
-                   "    python ../python/plot_1d.py --data data/data_1d_64.txt "
-                   "--solution sol.txt --save-plot sol.png\n";
+                   "-o data/data_1d_64.txt\n";
       return 2;
    }
    if (solver != "mumps" && solver != "ma57" && solver != "ma97" && solver != "dd") {
@@ -261,6 +268,44 @@ int main(int argc, char** argv) {
       std::cerr << "--cg-apply must be assembled|matfree\n";
       return 2;
    }
+   if (hessian != "exact" && hessian != "limited-memory") {
+      std::cerr << "--hessian must be exact|limited-memory\n";
+      return 2;
+   }
+   if (ma57_scaling != "on" && ma57_scaling != "off") {
+      std::cerr << "--ma57-scaling must be on|off\n";
+      return 2;
+   }
+   hsl_block_scaling_default() = (ma57_scaling == "on");
+   if (schur_mode != "backsolve" && schur_mode != "forward") {
+      std::cerr << "--schur must be backsolve|forward\n";
+      return 2;
+   }
+   if (schur_lag < 1 || (schur_lag > 1 && solver != "dd")) {
+      std::cerr << "--schur-lag must be >= 1 and needs --solver dd\n";
+      return 2;
+   }
+   if (wk_backend != "ma57" && wk_backend != "mumps" &&
+       wk_backend != "hybrid") {
+      std::cerr << "--wk-backend must be ma57|mumps|hybrid\n";
+      return 2;
+   }
+   if (wk_backend != "ma57" && solver != "dd") {
+      std::cerr << "--wk-backend " << wk_backend
+                << " needs --solver dd (it selects the "
+                   "arrowhead's W_k block backend)\n";
+      return 2;
+   }
+#ifndef DD_HAVE_MUMPS
+   if (wk_backend != "ma57") {
+      std::cerr << "--wk-backend " << wk_backend
+                << ": this binary was built without MUMPS "
+                   "support (build with COIN ThirdParty-Mumps visible to "
+                   "pkg-config as coinmumps)\n";
+      return 2;
+   }
+#endif
+   if (!driver::valid_schedule(t0, tmin, factor)) return 2;
 
    SmartPtr<Mpcc1DTNLP> mpcc = new Mpcc1DTNLP(data);
    mpcc->w_max_ = wmax;
@@ -290,6 +335,10 @@ int main(int argc, char** argv) {
              << (mpcc->has_ha ? "  (+ explicit row ha: a >= 0)" : "  (a boxed)")
              << "   init=" << init << "   solver=" << solver;
    if (solver == "dd") std::cout << "  nsub=" << nsub;
+   if (solver == "dd" && wk_backend != "ma57")
+      std::cout << "  wk-backend=" << wk_backend
+                << (wk_backend == "hybrid" ? "(ma57-solves+mumps-schur)"
+                                           : "(schur)");
    if (solver == "dd" && interface_solver == "cg")
       std::cout << "  interface=cg(" << precond
                 << (alpha_peel ? ",alpha-peel" : ",no-peel")
@@ -303,7 +352,7 @@ int main(int argc, char** argv) {
    }
 
    SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
-   if (!driver::init_app(app, printlevel, maxiter, solver)) return 1;
+   if (!driver::init_app(app, printlevel, maxiter, solver, hessian)) return 1;
 
    if (solver == "dd") {
       DDArrowheadSolver::config_owner(owner, nsub);
@@ -318,6 +367,12 @@ int main(int argc, char** argv) {
       DDArrowheadSolver::config_cg_apply(
          cg_apply == "matfree" ? DDArrowheadSolver::APPLY_MATFREE
                                : DDArrowheadSolver::APPLY_ASSEMBLED);
+      DDArrowheadSolver::config_wk_backend(
+         wk_backend == "mumps"    ? DDArrowheadSolver::WK_MUMPS
+         : wk_backend == "hybrid" ? DDArrowheadSolver::WK_HYBRID
+                                  : DDArrowheadSolver::WK_MA57);
+      DDArrowheadSolver::config_schur_lag(schur_lag);
+      DDArrowheadSolver::config_schur_forward(schur_mode == "forward");
       DDArrowheadSolver::config_alpha(mpcc->oa);
       DDArrowheadSolver::reset_interface_stats();
    }
@@ -343,9 +398,7 @@ int main(int argc, char** argv) {
    if (!res.best_x.empty()) {
       if (!save_sol.empty()) {
          save_solution(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
-         std::cout << "  wrote " << save_sol << "  (plot it with "
-                      "`python ../python/plot_1d.py --data " << data
-                   << " --solution " << save_sol << " --save-plot sol.png`)\n";
+         std::cout << "  wrote " << save_sol << "\n";
       }
       if (!save_dd.empty())
          std::cout << "  wrote " << save_dd << "  (the arrowhead of the LAST Newton "

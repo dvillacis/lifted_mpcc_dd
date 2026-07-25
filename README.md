@@ -8,8 +8,8 @@ complementarity constraints* (MPCC) in the unit-ball dual formulation.
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
 
 This is the companion code for the paper *(see [Citation](#citation))*. It packages
-the C++ solver, the Python reference implementations it is validated against, and
-the scripts that reproduce every figure.
+the C++ solver together with Python helpers that generate byte-identical solver
+inputs (from the extracted reference formulation) and render the result figures.
 
 ## What it does
 
@@ -42,6 +42,17 @@ staggered (cell-centred) 1D and 2D solvers.
 > address space), and the path to **distributed memory**. See
 > [`cpp/README.md`](cpp/README.md) for the full measured story, including the
 > no-crossover benchmarks.
+>
+> A 2026-07-25 profiling pass cut wall clock **1.5–2.2×** with new defaults that
+> leave every iteration trajectory byte-identical (MA57 BLAS3 multi-RHS, MC64
+> scaling off, and a forward-only Schur formation), and `--hessian exact` — the
+> analytic `eval_h` the drivers previously never used — is worth another 1.4–3.9×
+> up to about N=48. That narrows the gap to monolithic MA57 from 7.0× to 3.1× at
+> N=32, but does not change the conclusion above. The same section records the
+> negative results — including the OpenMP finding, where the subdomain loops do
+> scale **3.8× on 8 threads** but total wall clock still regresses, because the
+> serial remainder grows faster on this 4P+4E laptop. That one needs re-measuring
+> on the homogeneous Linux/MA97 target.
 
 ## Repository layout
 
@@ -65,10 +76,10 @@ lifted-mpcc-dd/
 │   ├── build*.sh             build helpers (macOS / Linux / MA97+OpenMP)
 │   ├── data/                 sample 1D instances (.txt)
 │   └── README.md             detailed technical notes & measurements
-├── python/                ← reference implementations + reproduction helpers
-│   ├── lifted_mpcc_*.py      the monolithic cyipopt reference solvers
+├── python/                ← reproduction helpers (data generation + plotting)
+│   ├── mpcc_utils.py         data-gen core extracted from the Python reference
 │   ├── dump_data*.py         write byte-identical instances for the C++ solver
-│   ├── plot_*.py             render the solution / arrowhead figures
+│   ├── plot_slurm.py         render 2D result figures from --save-solution dumps
 │   ├── requirements.txt
 │   └── README.md
 ├── slurm/                 ← example HPC batch scripts
@@ -91,8 +102,9 @@ lifted-mpcc-dd/
   IPOPT's bundled MUMPS (`--solver mumps`), but the DD route (`--solver dd`)
   requires MA57/MA97.
 
-**Python reference** — Python 3.11 and `pip install -r python/requirements.txt`
-(numpy, scipy, cyipopt, pillow, matplotlib). See [`python/README.md`](python/README.md).
+**Python helpers** (data generation + plotting only — no IPOPT needed) — Python
+3.11 and `pip install -r python/requirements.txt` (numpy, scipy, pillow,
+matplotlib). See [`python/README.md`](python/README.md).
 
 ## Build
 

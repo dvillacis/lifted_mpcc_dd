@@ -8,8 +8,12 @@
 > that development repository. In **this** standalone package the Python
 > reference implementations live in [`../python`](../python); the pruned
 > experimental history (`../cpp`) is not included. Treat those paths as
-> historical citations, not files you will find here. For a clean orientation
-> start from the [top-level README](../README.md).
+> historical citations, not files you will find here. In particular, prose below
+> mentioning the multi-panel plotters `plot_1d.py` / `plot_2d.py` /
+> `lifted_mpcc_*.plot_solution` refers to the reference repository — this package
+> ships only the lightweight `../python/plot_slurm.py` (2D result figures) and the
+> `../python/dump_data*.py` instance generators (backed by `../python/mpcc_utils.py`).
+> For a clean orientation start from the [top-level README](../README.md).
 
 A cleaned-up rewrite of `../cpp`: the same three validated solvers (uniform 2D,
 staggered 1D, staggered 2D), the same arrowhead domain decomposition as IPOPT's
@@ -421,11 +425,101 @@ certified. Geometric runs keep the classic per-level weight/comp panel.
 ./dd_solve_2d ... --t-mu-scale 1         # the c=1 A/B (Python: c≈1 ≈ c=10)
 ```
 
+## The MUMPS W_k backend (`--wk-backend mumps|hybrid`, 2026-07-25)
+
+An opt-in second backend for the subdomain blocks, attacking the measured
+direct-mode bottleneck head-on: the S_k phase forms `S_k = −B̄_k W_k⁻¹ B̄_kᵀ`
+by p_k dense MA57 backsolves per block (97.5% of the phase; the sparse-RHS
+lever this README flags as "a solver-replacement project"). COIN
+ThirdParty-Mumps computes exactly that Schur complement natively during a
+**partial factorization** of the augmented local matrix
+`[[W_k, B̄_kᵀ],[B̄_k, 0]]` (ICNTL(19)=1, Schur list = the appended border
+indices), with BLAS-3 fronts instead of naive dense-RHS backsolves, and
+reports the negative pivots of the factored interior (INFOG(12)), so the
+Haynsworth inertia contract is untouched. Three runtime modes in one binary:
+
+- `--wk-backend ma57` (default) — the validated reference, byte-identical to
+  before this change;
+- `--wk-backend mumps` — factors, S_k, solves and inertia all from MUMPS;
+- `--wk-backend hybrid` — MUMPS forms S_k, MA57 factors the SAME W_k for the
+  solve path and the inertia (two factorizations per block per step).
+
+Implementation: `mumps_block.hpp` (`MumpsSchurBlock`, duck-typed to the
+`SymBlock` call sites), guarded by `-DDD_HAVE_MUMPS` (build.sh auto-detects
+`pkg-config coinmumps`; without it the build is unchanged and the flag errors
+cleanly). **`mumps_smoke.cpp` is the gate — run it on any new machine/library
+build before trusting the backend.** It validated every piece of API fine
+print against Eigen dense references (MUMPS 5.5.0 arm64): Schur values exact
+(1.8e-13), sign convention matches `Sk_` directly, INFOG(12) == In(W)_neg,
+`JOB=3 + ICNTL(26)=0` == the interior solve `W⁻¹b` (single and multi RHS),
+duplicates summed, honest singular reporting (null-pivot detection,
+ICNTL(24)=1). One empirical finding is baked in: for SYM=2 the centralized
+Schur comes back as the **lower triangle of the full p×p array with the upper
+triangle zeroed** (established by a NaN-sentinel probe — the manual is vaguer
+than the library), so `factorize()` mirrors it.
+
+Correctness gates (this machine, 2026-07-25): 1D n=256 k=4 `DD_CHECK` —
+579/579 inertia MATCH for both backends, **iteration-identical per-level
+trajectories** (max step rel-err 3.2e-13 ma57 / 2.9e-10 mumps); 2D cameraman
+N=16 k=2 — 674/674 MATCH, 0 mismatches, all three backends land on the
+recorded reference (0.070831 / 24.97 dB); hybrid max step rel-err 9.7e-10.
+
+**Measured (serial, cameraman, this arm64 laptop; DD_TIME phase sums in s —
+in mumps/hybrid modes JOB=2 does factor+Schur at once, so compare the
+factor+schur SUM, not the split):**
+
+| run | backend | n_fact | factor+schur | per fact | solve | wall |
+|---|---|---|---|---|---|---|
+| N=32 k=4 μ-coupled | ma57 | 150 | 3.69 | 24.6 ms | 1.84 | 5.9 |
+| | mumps | 150 | 1.72 | 11.4 ms | 10.35 | 13.9 |
+| | hybrid | 150 | 2.81 | 18.7 ms | 2.12 | **5.7** |
+| N=64 k=8 μ-coupled | ma57 | 150 | 17.15 | 114.3 ms | 8.39 | 31.4 |
+| | mumps | 200 | 9.50 | 47.5 ms | 49.10 | 81.9 |
+| | hybrid | 200 | 16.17 | **80.8 ms** | 9.33 | 35.2 |
+| N=32 k=4 geometric | ma57 | 6725 | 177.2 | 26.3 ms | 54.5 | 245.8 |
+| | hybrid | 7100 | 146.0 | 20.6 ms | 71.3 | **231.6** |
+
+Readings, in the order they were learned:
+
+1. **The partial-factorization Schur genuinely kills the S_k phase**: 12.27 s
+   → 0.05 s at N=64, 119.6 s → 0.32 s on the geometric schedule. Isolating
+   the Schur-formation cost at N=64 (mumps factor 47.5 ms/fact minus an
+   MA57-like factorization 32.5 ms/fact ≈ 15 ms vs 81.8 ms of backsolves):
+   **~5.4× cheaper Schur formation.**
+2. **Pure `mumps` mode is measured DOWN for this architecture**: dmumps
+   JOB=3 costs ~6× MA57CD per single-RHS backsolve (per-call workspace setup
+   + scaling application vs MA57's persistent scratch), and the DD solve path
+   lives on ~10⁵–10⁶ such backsolves (solve_one, refinement, matfree
+   applies). Net wall loses at every tested size (5.9→13.9, 31.4→81.9). Its
+   geometric-schedule leg was skipped as strictly dominated.
+3. **`hybrid` wins per factorization everywhere** — 1.31× (N=32 μ), 1.41×
+   (N=64 μ), 1.28× (N=32 geometric) — and the gap GROWS with N as the schur
+   share grows. Wall wins where trajectories match (5.9→5.7, 245.8→231.6).
+   At N=64 μ-coupled the wall regressed (31.4→35.2) for a benign reason: the
+   MUMPS-computed S differs at roundoff, the barrier path diverges (the
+   standing MINRES-mode precedent), and the ma57 leg stopped at
+   status 1/155 its where both MUMPS-Schur legs ran to **status 0**/218 its —
+   same solution either way (0.070977–8 / 27.02 dB). Load-independent
+   per-factorization cost is the honest comparator, and there hybrid wins.
+4. 1D is not the target regime (p_k ≤ 2 border columns per block — nothing
+   for the Schur feature to amortize); it is correctness-gated but slower
+   under mumps, as expected.
+
+Standing recommendation: `ma57` stays the default (every recorded table
+reproduces bit-identically). For large-N 2D direct-mode runs, `--wk-backend
+hybrid` is the measured lever — its advantage scales with exactly the phase
+that dominates at scale. The open follow-ups: the MUMPS factorize loop is
+SERIAL by design (no mumps_smoke_par-style concurrency audit yet — the MA97
+lesson), so an OMP A/B needs that audit first; and the pure-mumps solve tax
+would need a persistent-workspace solve path that dmumps_c does not expose.
+
 ## Layout
 
 | file | role |
 |---|---|
 | `ma57_block.hpp` | RAII wrapper around HSL MA57 for one symmetric-indefinite block |
+| `mumps_block.hpp` | RAII wrapper around COIN Mumps: partial-factorization Schur for one W_k (`--wk-backend mumps\|hybrid`) |
+| `mumps_smoke.cpp` | MUMPS API validation gate vs Eigen dense — run on every new machine/library build |
 | `dd_solver.hpp` | `DDArrowheadSolver` (the custom `SparseSymLinearSolverInterface`, direct + CG interface) + `CustomSolverBuilder` |
 | `mpcc_base.hpp` | shared TNLP base: objective, bounds, Q(α), warm start, `finalize_solution` |
 | `mpcc_tnlp.hpp` | uniform-grid formulation (port of `../lifted_mpcc_unitball_v2.py`) |
@@ -435,8 +529,8 @@ certified. Geometric runs keep the classic per-level weight/comp panel.
 | `dd_solve.cpp` | uniform driver (`--solver mumps\|ma57\|dd`) |
 | `dd_solve_1d.cpp` | staggered 1D driver (partition + injected owner map) |
 | `dd_solve_2d.cpp` | staggered 2D driver (tile/strip partition, corner promotion, image route) |
-| `dump_data*.py` | export Python's exact instance + CP warm start + owner map |
-| `plot_1d.py`, `plot_2d.py` | draw C++ results with the Python's own validated figures |
+| `../python/dump_data*.py` | export the exact instance + CP warm start + owner map (via `mpcc_utils`) |
+| `../python/plot_slurm.py` | render 2D result figures from a directory of `--save-solution` dumps |
 
 Two 2D-figure improvements (2026-07-22): the solution figure overlays the DD
 cuts on every image panel (the 2D analogue of the 1D subdomain bands), and the
@@ -458,6 +552,9 @@ boilerplate around them moved into `mpcc_base.hpp` / `driver_common.hpp`.
 Prerequisites: IPOPT 3.14 (Homebrew, `pkg-config ipopt`), Eigen
 (`brew --prefix eigen`), HSL MA57 at `$HSLDIR` (default `~/.local/hsl-ma57`).
 `image_io.hpp` and `third_party/stb_image.h` are vendored next to the sources.
+Optional: COIN ThirdParty-Mumps visible as `pkg-config coinmumps` — build.sh
+then adds `-DDD_HAVE_MUMPS` and the `--wk-backend mumps|hybrid` modes light
+up (run `./mumps_smoke` once first; without coinmumps the build is unchanged).
 
 ```bash
 cd cpp
@@ -507,6 +604,11 @@ auto — MA57 if `libhsl_ma57.so` is found, else MA97):
   path (different pivot orders), not in solution.** `ma97_smoke.cpp` stays in
   the tree as the first thing to run on any new machine/library build:
   `HSL_SOLVER=ma97 ./build_linux.sh ma97_smoke.cpp -o ma97_smoke`.
+  Hardened 2026-07-24: the struct layouts are compile-gated
+  (`static_assert` in `ma97_block.hpp`, which also carries a 96-byte
+  defensive margin after the documented ABI on both structs), and the smoke
+  adds a rank-deficient 3×3 exercising the `action=1` singular path the DD
+  solver's SINGULAR routing relies on.
 
 The link line bakes in `-rpath`/`-rpath-link` to `$CONDA_PREFIX/lib` (so ld can
 resolve the transitive MKL/metis/gfortran closure of the conda libs) and
@@ -564,31 +666,225 @@ python ../python/dump_data.py --N 16 -o data/data_16.txt
 ./dd_solve --data data/data_16.txt --solver dd --nsub 2            # uniform grid, cold start
 ```
 
-Figures are drawn by the **Python** plotters (the C++ solution is numerically the
-same vector; re-implementing the panels would just create a second thing to keep
-in sync):
+Performance flags (see [Performance defaults](#performance-defaults-2026-07-25-profiling-pass)):
 
 ```bash
-./dd_solve_1d --data data/data_1d_64.txt --nsub 4 --solver dd \
-    --save-solution sol_1d.txt --save-dd dd_1d.txt
-python ../python/plot_1d.py --data data/data_1d_64.txt --solution sol_1d.txt \
-    --dd-dump dd_1d.txt --save-plot sol.png --save-dd-plot dd.png
+./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 6 --solver dd \
+    --hessian exact                          # analytic eval_h — 1.9x here, but see the N=48 crossover
+./dd_solve_1d --data data/data_1d_n1024_k16.txt --solver dd --hessian exact   # 2.9x in 1D
 
-./dd_solve_2d --data data/data_2d_16.txt --nsub 2 --solver dd \
-    --save-solution sol_2d.txt --save-dd dd_2d.txt
-python ../python/plot_2d.py --solution sol_2d.txt --dd-dump dd_2d.txt \
-    --save-plot s.png --save-domains d.png --save-dd-plot a.png   # solution file is self-contained
+# restoring the pre-2026-07-25 behaviour, knob by knob
+./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 6 --solver dd \
+    --schur backsolve --ma57-scaling on      # old S_k route + MC64 scaling
+DD_MA57_ICNTL13=10 ./dd_solve_2d ...         # old BLAS2 multi-RHS threshold
+
+DD_SCHUR_CHECK=1 ./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 6 \
+    --solver dd                              # forward S_k vs the JOB=1 route, per block
+DD_STATS=1 ./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 6 \
+    --solver dd --max-iter 1                 # the B_k sparsity budget
 ```
+
+`--schur forward` always forces MC64 scaling off on the `W_k` blocks regardless of
+`--ma57-scaling`, since its JOB=2/3 partial solves only compose without it.
+
+The drivers write reusable data dumps: `--save-solution` (the reported iterate +
+per-level history + the embedded instance) and `--save-dd` (the arrowhead). The
+2D result figures are rendered by the self-contained `../python/plot_slurm.py`,
+which walks a directory of `--save-solution` files (`<dir>/sols/sol_*.txt`):
+
+```bash
+mkdir -p results/run/sols
+./dd_solve_2d --data data/data_2d_16.txt --nsub 2 --solver dd \
+    --save-solution results/run/sols/sol_16.txt
+python ../python/plot_slurm.py results/run     # one PNG set per sol_*.txt
+```
+
+The full multi-panel probe / arrowhead / domain figures (and single-file 1D
+plotting) are produced by the reference implementation's plotters, which are not
+part of this archival package.
 
 ## Environment switches
 
 | var | effect |
 |---|---|
 | `DD_CHECK=1` | verify every solve + inertia against MA57 on the full matrix (small N only) |
+| `DD_SCHUR_CHECK=1` | verify each `S_k` from `--schur forward` against the JOB=1 route, per block |
 | `DD_TIME=1` | print the phase timers (factor / schur / S-fact / solve) every 25 factorizations |
+| `DD_STATS=1` | one-shot `B̄_k` sparsity budget (dim, `p_k`, nnz, interface-touched rows) |
 | `DD_DEBUG=1` | partition summary, singular-block reports, refinement warnings |
+| `DD_HESSIAN=` | overrides `--hessian` (`exact` / `limited-memory`) |
+| `DD_MA57_SCALING=1` | re-enable MC64 scaling (same as `--ma57-scaling on`) |
+| `DD_MA57_ICNTL13=n` | override MA57's BLAS2/BLAS3 multi-RHS threshold |
+| `DD_MA57_ICNTL6=n` | MA57 pivot ordering (2=AMD, 4=METIS, default 5=auto) — see the METIS note |
 | `HSLLIB` | path of the MA57 dylib IPOPT's own `--solver ma57` should load |
 | `HSLDIR` | (build) install prefix of HSL MA57, default `~/.local/hsl-ma57` |
+
+## Performance defaults (2026-07-25 profiling pass)
+
+A sampling profile of a small instance (N=32, 6×6 tiles, KKT dim 16466) found
+most of the run outside the DD algebra. Three findings became **new defaults**;
+all three are *trajectory-preserving* — iteration count, exit status and PSNR are
+byte-for-byte what the previous defaults produced on every instance below, so
+these are pure wall-clock wins, not a change of algorithm.
+
+1. **MA57 was back-solving the Schur RHS block one column at a time.** The `S_k`
+   formation solves `W_k X = B̄_kᵀ` with `p_k ≈ 20–40` columns at once, but at
+   HSL's default `ICNTL(13)` the profile caught MA57CD on its BLAS2 kernels
+   (`ma57qd/rd` 14% self, against `ma57xd/yd` 3%). Raising the threshold past
+   `p_k` moves the block onto the BLAS3 path. → **`ICNTL(13)` now set high.**
+2. **MC64 scaling was recomputed at every factorization** (`mc64wd/dd/ed` ≈ 10%
+   of the run) — MA57 re-derives it per call, and the DD solver refactorizes every
+   `W_k` at every Newton step. Turning it off is also *more* accurate here: over
+   an N=32 6×6 run `DD_CHECK`'s max per-step rel-err is 3.5e-9 unscaled vs 4.4e0
+   scaled. → **scaling off; `--ma57-scaling on` restores it.**
+3. **The backward substitution in the `S_k` formation is redundant.** With
+   `W_k = P L D Lᵀ Pᵀ`, `S_k = −B̄_k W_k⁻¹ B̄_kᵀ = −Yᵀ D⁻¹ Y` for
+   `Y = L⁻¹Pᵀ B̄_kᵀ`: the `Lᵀ` half cancels against the `B̄_k` on the left. Exact
+   (`DD_SCHUR_CHECK` max rel-err ~1e-13), worth a consistent 7–17%.
+   → **`--schur forward` is the default; `--schur backsolve` restores JOB=1.**
+
+| instance | old defaults | new defaults | speedup |
+|---|---|---|---|
+| 2D N=32, 6×6 tiles | 9.19 s (147 it) | **4.22 s** (147 it) | 2.18× |
+| 2D N=32, 4×4 tiles | 9.47 s (147 it) | **4.52 s** (147 it) | 2.10× |
+| 2D N=48, 4×4 tiles | 30.6 s (132 it) | **17.7 s** (132 it) | 1.73× |
+| 2D N=64, 4×4 tiles | 73.9 s (155 it) | **48.6 s** (155 it) | 1.52× |
+| 1D n=256 k=4 | 0.109 s (122 it) | **0.072 s** (122 it) | 1.51× |
+| 1D n=512 k=8 | 0.254 s (177 it) | **0.163 s** (177 it) | 1.55× |
+| 1D n=1024 k=16 | 0.490 s (165 it) | **0.301 s** (165 it) | 1.63× |
+
+### `--hessian exact` — a big win, but only up to about N=48
+
+All three TNLPs implement a full analytic `eval_h`, which the drivers never used:
+`hessian_approximation` was pinned to `limited-memory`. That is expensive in a way
+the profile made obvious — IPOPT's `LowRankAugSystemSolver::UpdateFactorization`
+was **44%** of the N=32 run, because under L-BFGS every Newton step re-solves the
+augmented system with the correction vectors as extra right-hand sides.
+
+Exact roughly halves the iteration count, but its Hessian block is denser so each
+remaining iteration costs more, and the two effects cross over:
+
+| instance | limited-memory | `--hessian exact` | |
+|---|---|---|---|
+| 1D n=1024 k=16 | 0.301 s (165 it) | **0.103 s** (90 it) | 2.9× |
+| 1D n=2048 k=32 | 0.919 s (181 it) | **0.233 s** (83 it) | 3.9× |
+| 2D N=32, 6×6 | 4.22 s (147 it) | **2.18 s** (72 it) | 1.94× |
+| 2D N=48, 4×4 | 17.7 s (132 it) | **12.3 s** (78 it) | 1.44× |
+| 2D N=64, 4×4 | **48.6 s** (155 it) | 77.2 s (135 it) | 0.63× ✗ |
+
+So it stays **opt-in**, defaulting to `limited-memory` to keep every previously
+recorded trajectory reproducible. Use `--hessian exact` in 1D and in 2D up to
+about N=48.
+
+Together with the new defaults, DD's gap to monolithic MA57 on the same instance
+narrows from 7.0× to 3.1× at N=32 (2.8× when both use the exact Hessian) and from
+5.1× to 2.9× at N=48. The Amdahl story of `cpp/README.md` is unchanged — this
+pass removed overhead, not the interface floor.
+
+### Measured negative results
+
+Kept here so they are not re-attempted:
+
+- **OpenMP across subdomains: the decomposition parallelizes, the run does not.**
+  This one was diagnosed twice, and the first diagnosis was wrong — recorded here
+  because the correction is the useful part.
+
+  *First pass:* at 8 threads the run took 14.5 s against 5.0 s serial, and the
+  profile blamed OpenBLAS — `blas_memory_alloc` 21%, `__psynch_cvwait` 32%, its
+  global buffer allocator serializing MA57's many tiny BLAS calls under a lock.
+
+  *Second pass, after the BLAS3 + scaling defaults landed:* most of that
+  disappeared (2.62 s vs 2.19 s), so the allocator was mostly a symptom of the
+  BLAS2 call storm, not the cause. To settle it, MA57 was **rebuilt against Apple
+  Accelerate** (no OpenBLAS in the link at all — see the recipe below). Serial
+  performance is *identical*, 1.372 s vs 1.350 s, and the OpenBLAS symbols vanish
+  from the profile — but the threaded regression is unchanged. The BLAS was not
+  the cause.
+
+  What the phase timers actually show (N=32, 6×6 tiles, 36 subdomains, Accelerate,
+  interleaved repeats):
+
+  | threads | total | `factor`+`schur` (the OMP loops) | everything else |
+  |---|---|---|---|
+  | 1 | 1.368 s | 0.830 s | 0.538 s |
+  | 4 | 1.509 s | **0.263 s** (3.2×) | 1.246 s |
+  | 8 | 1.938 s | **0.221 s** (3.8×) | 1.717 s |
+
+  **The DD-parallel work scales 3.8× on 8 threads, exactly as the design claims.**
+  What kills the run is the *serial remainder*, which grows by more than the
+  parallel phases save — and it grows already at 4 threads, where all workers fit
+  on this laptop's 4 performance cores (it has 4 P + 4 E). `KMP_BLOCKTIME=0` and
+  `OMP_WAIT_POLICY=passive` change nothing, so it is not idle-spin. The remaining
+  suspect is macOS scheduling on a hybrid-core consumer chip — thread migration
+  and QoS demotion of the main thread once a worker pool is live — i.e. an
+  artefact of the measurement platform, not of the algorithm. **The parallel-DD
+  scaling claim should be re-measured on the homogeneous Linux/MA97 HPC target
+  before anything is concluded from it**; on this box the per-phase numbers above
+  are the meaningful result, not the wall clock.
+- **Lagging the Schur complement does not work** (`--schur-lag L`, kept as an
+  opt-in experiment). Reusing the cached `S_k` for `L−1` factorizations does cut
+  the phase cost (19 ms → 9.4 ms per factorization), but IPOPT then needs **525
+  factorizations instead of 125** and lands on *acceptable* rather than *optimal*,
+  and the result is insensitive to `L`. μ falls geometrically, so `W_k`'s barrier
+  diagonal — and hence `S_k` — changes by orders of magnitude between steps; it is
+  not a small perturbation. The guards are in place (a stale `S` may never decide
+  an inertia rejection, and a refinement residual that stops converging latches a
+  rebuild), so the failure is the algorithm's, not the plumbing's.
+- **MUMPS partial-factorization Schur is a wash** here (4.95 s vs 5.01 s).
+- **CG / MINRES interface**: neutral to worse at these sizes; `--cg-apply matfree`
+  is ~3× worse, as its comment already says.
+
+### Rebuilding MA57 against Accelerate (and the METIS trap)
+
+The Accelerate build above is reproducible in a couple of minutes and installs
+beside the stock one — nothing existing is overwritten, and the in-tree
+`src/.libs` that IPOPT's own `--solver ma57` loads via `HSLLIB` is untouched:
+
+```bash
+cp -R ~/src/hsl/hsl_ma57-5.3.2 /tmp/ma57acc && cd /tmp/ma57acc
+make distclean
+# cp's timestamp skew otherwise triggers a maintainer-mode autotools rebuild
+touch configure.ac aclocal.m4
+sleep 1 && touch configure $(find . -name "Makefile.in") $(find . -name "*.h.in")
+./configure --prefix=$HOME/.local/hsl-ma57-accelerate FC=gfortran CC=clang \
+    --with-blas="-framework Accelerate"
+sleep 1 && touch config.status $(find . -name Makefile)
+make -j8 && make install
+
+cd <repo>/cpp
+HSLDIR=$HOME/.local/hsl-ma57-accelerate ./build.sh dd_solve_2d.cpp -o dd_solve_2d
+```
+
+MA57 needs only BLAS — `dgemm/dgemv/dtpmv/dtpsv/idamax/isamax` and their single
+precision twins, no LAPACK — and none of the single-precision `*dot*` functions
+whose f2c return-value convention is the usual Accelerate hazard, so the swap is
+clean. **Verdict: correct (`DD_CHECK` clean, 0 inertia mismatches) and
+performance-neutral.** Worth having as a diagnostic — it removes OpenBLAS from
+the profile entirely — but it is not a speedup.
+
+**Real METIS does not work with MA57 5.3.2 here.** Both METIS libraries on this
+machine (Homebrew and `/usr/local`) are **5.1.0**, and MA57 calls
+`metis_nodend_` with the **METIS 4** argument list. METIS 5 exports a symbol of
+that name, so `configure` accepts it and the link succeeds — but the call passes
+a mismatched argument list, so the ordering is garbage: forcing it with
+`DD_MA57_ICNTL6=4` produces a factorization that exhausts its workspace
+(`W_0 ... status=-3` at N=48). With the default `ICNTL(6)=5` (automatic) MA57
+never selects METIS at these block sizes, which is why a real-METIS build is
+bit-for-bit identical to the stock `fakemetis` one. Using METIS for real needs
+either METIS **4.0.3** (what COIN-OR `ThirdParty-Metis` ships) or a shim
+translating the 4.x call to `METIS_NodeND`. `DD_MA57_ICNTL6` is provided to test
+this; `4` is a no-op error (`-18`) against the `fakemetis` stub.
+
+### Where the remaining time goes
+
+After all of the above, the `S_k` formation is still the largest single phase.
+`DD_STATS=1` prints its sparsity budget: at N=32 6×6 each `B̄_kᵀ` column carries
+only **4–6 nonzeros in dim_k ≈ 440** (~1.2% dense), which is what makes
+sparse-RHS pruning attractive — but the *union* of interior rows the interface
+touches is **24% of dim_k**, and that union bounds what the solve can skip. So the
+reachable gain is a few×, not orders of magnitude. MA57 exposes no sparse-RHS
+entry point; MUMPS `ICNTL(20)`/`ICNTL(30)` (sparse RHS / selected entries of the
+inverse) is the route if this is pursued.
 
 ## Validation record (2026-07-22, this refactor vs `../cpp` on identical data)
 
@@ -621,4 +917,12 @@ adjacency pattern and also factorized by MA57, and the inertia is answered by
 Haynsworth additivity `In(A) = Σ_k In(W_k) + In(S)` — the full KKT is never
 factorized. Solves run through best-effort iterative refinement against the true
 triplets. A rank-deficient block reports `SYMSOLVER_SINGULAR` honestly (no
-artificial shifts) and IPOPT's δ_w loop cures it.
+artificial shifts) and IPOPT's δ_w loop cures it. Failure classification is
+explicit (2026-07-24): out-of-memory/workspace exhaustion in a block or the
+interface factorization reports `SYMSOLVER_FATAL_ERROR` with a message instead
+of masquerading as SINGULAR (a δ_w bump cannot fix OOM and would loop); a
+failed backsolve during S_k formation is latched per factorization epoch and
+discards that factorization as SINGULAR (the assembled S would be garbage);
+and both HSL wrappers refuse to factorize after `analyze` reports out-of-range
+triplets (MA57 INFO(3) / MA97 `matrix_outrange` — a warning the libraries
+otherwise absorb by silently solving the wrong matrix).
