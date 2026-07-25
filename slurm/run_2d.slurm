@@ -26,7 +26,7 @@
 #SBATCH --error=%x_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=44
 #SBATCH --mem=32G
 #SBATCH --partition=normal
 #SBATCH --time=12:00:00
@@ -57,7 +57,27 @@ KS=( 8  8  8  8  8   8)                         # nsub per size (edit per-entry)
 # --- 1. Environment ----------------------------------------------------------
 source /opt/ohpc/pub/apps/conda/etc/profile.d/conda.sh
 conda activate mkl_imaging
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+# THREADS: how many OpenMP threads the DD loops get. Defaults to the whole
+# allocation, but note the parallel loops run ONE TASK PER SUBDOMAIN, so the
+# thread count wants to divide nsub^2. At nsub=8 that is 64 tasks:
+#     T=16 -> 4 waves, 100%      T=32 -> 2 waves, 100%
+#     T=44 -> 2 waves,  73%      (the second wave leaves 24 cores idle)
+# So 44 threads can be SLOWER than 32 on the same node. Amdahl bites too: the
+# measured serial share is ~10-26%, capping speedup near 4-5x however many cores
+# are thrown at it, and under MA97 the W_k FACTORIZE loop is serial by necessity
+# (concurrent ma97_factor heap-corrupts), which shrinks the parallel part
+# further. The full allocation is still worth requesting: the monolithic
+# --solver ma97 reference run uses MA97's own internal parallelism across all of
+# it, and owning the node keeps the timings clean.
+#
+# MEASURE BEFORE COMMITTING A SWEEP — one size, a few thread counts:
+#   for T in 8 16 32 44; do
+#     OMP_NUM_THREADS=$T DD_TIME=1 ./dd_solve_2d --data ../images/cameraman.png \
+#         --size 96 --nsub 8 --solver dd --print-level 0 --max-iter 40
+#   done
+# The per-phase DD_TIME line (factor/schur are the parallel ones) is the signal.
+THREADS="${THREADS:-$SLURM_CPUS_PER_TASK}"
+export OMP_NUM_THREADS=$THREADS
 export MKL_THREADING_LAYER=SEQUENTIAL          # keep MKL off libiomp5 under our libgomp threads
 export OMP_PROC_BIND=close                     # pin threads to cores (no migration)
 export OMP_PLACES=cores
