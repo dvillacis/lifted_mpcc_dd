@@ -93,7 +93,27 @@ public:
    std::vector<double> mu_hist_;
    std::vector<double> cb_x_;     // ResortX scratch (n primal entries)
 
-   bool intermediate_callback(AlgorithmMode, Index iter, Number obj_value,
+   // Banked deepest-converged-level fallback (2026-07-24). The μ-coupled run is
+   // ONE IPOPT solve, so on a tail failure finalize_solution hands back only the
+   // failed final iterate and every converged intermediate level is lost. In
+   // monotone mode a μ DECREASE means the μ_prev barrier subproblem met its
+   // tolerance — i.e. a converged Scholtes level — and the iterate that
+   // satisfied it is the one recorded at the callback BEFORE the drop. So keep
+   // a one-callback lag (prev_*) and, at each regular-mode μ drop, bank the
+   // lagged point, keeping the smallest max r(1−δ) — the same tightest-
+   // converged-level rule run_scholtes reports by. Restoration callbacks are
+   // excluded twice over (mode check + comp_now = NaN there), so restoration's
+   // own μ never fakes a level. run_mu_coupled resets this state and falls back
+   // to banked_x_ when IPOPT's final status is a failure.
+   bool have_banked_ = false;
+   double banked_comp_ = 1e300, banked_t_ = 0.0;
+   std::vector<double> banked_x_;
+   double mu_prev_ = 1e300;
+   bool prev_valid_ = false;
+   double prev_comp_ = 1e300, prev_t_ = 0.0;
+   std::vector<double> prev_x_;
+
+   bool intermediate_callback(AlgorithmMode mode, Index iter, Number obj_value,
                               Number inf_pr, Number inf_du, Number mu, Number,
                               Number, Number, Number, Index,
                               const IpoptData* ip_data,
@@ -125,6 +145,25 @@ public:
                c = std::max(c, cb_x_[oR + e] * (1.0 - cb_x_[oD + e]));
             comp_now = c;
          }
+      }
+      // Bank the lagged iterate at each regular-mode μ drop (see the member
+      // comment). std::isfinite(comp_now) is false during restoration (the
+      // dynamic_casts above fail → NaN), so both prev_* and mu_prev_ freeze
+      // across restoration phases and a restoration μ can neither bank nor
+      // register as a drop.
+      if (mode == RegularMode && std::isfinite(comp_now)) {
+         if (prev_valid_ && mu < mu_prev_ * (1.0 - 1e-12) &&
+             prev_comp_ < banked_comp_) {
+            banked_x_ = prev_x_;
+            banked_comp_ = prev_comp_;
+            banked_t_ = prev_t_;
+            have_banked_ = true;
+         }
+         prev_x_ = cb_x_;
+         prev_comp_ = comp_now;
+         prev_t_ = t_;
+         prev_valid_ = true;
+         mu_prev_ = mu;
       }
       mu_hist_.push_back((double)iter);
       mu_hist_.push_back(mu);
