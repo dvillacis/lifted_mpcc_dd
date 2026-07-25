@@ -42,6 +42,17 @@ if [ "${OMP:-0}" = "1" ]; then
   OMPFLAGS=(-Xpreprocessor -fopenmp -I"$LIBOMP/include" -L"$LIBOMP/lib" -lomp)
 fi
 
+# COIN ThirdParty-Mumps (optional): enables the --wk-backend mumps W_k backend
+# (partial-factorization Schur, mumps_block.hpp). Detected via pkg-config;
+# without it the build is byte-identical to before and the flag errors cleanly
+# at runtime.
+MUMPSFLAGS=()
+MUMPSLIBS=()
+if pkg-config --exists coinmumps 2>/dev/null; then
+  MUMPSFLAGS=($(pkg-config --cflags coinmumps) -DDD_HAVE_MUMPS)
+  MUMPSLIBS=($(pkg-config --libs coinmumps) -Wl,-rpath,"$(pkg-config --variable=libdir coinmumps)")
+fi
+
 # HSL MA57 — the DD solver factorizes each subdomain block W_k with it. Override
 # the prefix with HSLDIR if the library lives elsewhere. The dylib pulls in
 # openblas / libfakemetis / libgfortran through its own absolute-path load
@@ -56,7 +67,8 @@ fi
 exec clang++ -std=c++17 -O2 \
   -nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK" \
   -I"$EIGEN" -I"$ROOT" -I"$ROOT/third_party" $(pkg-config --cflags ipopt) \
-  "${OMPFLAGS[@]}" \
+  "${OMPFLAGS[@]}" "${MUMPSFLAGS[@]}" \
   "$@" \
   -L"$HSLDIR/lib" -lhsl_ma57 -Wl,-rpath,"$HSLDIR/lib" \
+  "${MUMPSLIBS[@]}" \
   $(pkg-config --libs ipopt)

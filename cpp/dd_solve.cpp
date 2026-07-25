@@ -23,6 +23,7 @@ using namespace Ipopt;
 int main(int argc, char** argv) {
    std::string data, solver = "ma57";
    std::string interface_solver = "direct", precond = "asd", cg_apply = "assembled";
+   std::string wk_backend = "ma57";
    double t0 = 1.0, tmin = 1e-4, factor = 0.3, tol = 1e-6, sigma = 0.1;
    double alpha0 = 0.0, c_theta = 0.0, cg_tol = 1e-10;
    bool alpha0_set = false, alpha_peel = true, dual_peel = true;
@@ -53,6 +54,7 @@ int main(int argc, char** argv) {
       else if (a == "--print-level") printlevel = std::stoi(next());
       else if (a == "--interface") interface_solver = next();
       else if (a == "--precond")  precond = next();
+      else if (a == "--wk-backend") wk_backend = next();
       else if (a == "--cg-tol")   cg_tol = std::stod(next());
       else if (a == "--cg-max-iter") cg_maxit = std::stoi(next());
       else if (a == "--cg-apply") cg_apply = next();
@@ -86,9 +88,42 @@ int main(int argc, char** argv) {
       std::cerr << "--cg-apply must be assembled|matfree\n";
       return 2;
    }
+   if (wk_backend != "ma57" && wk_backend != "mumps" &&
+       wk_backend != "hybrid") {
+      std::cerr << "--wk-backend must be ma57|mumps|hybrid\n";
+      return 2;
+   }
+   if (wk_backend != "ma57" && solver != "dd") {
+      std::cerr << "--wk-backend " << wk_backend
+                << " needs --solver dd (it selects the "
+                   "arrowhead's W_k block backend)\n";
+      return 2;
+   }
+#ifndef DD_HAVE_MUMPS
+   if (wk_backend != "ma57") {
+      std::cerr << "--wk-backend " << wk_backend
+                << ": this binary was built without MUMPS "
+                   "support (build with COIN ThirdParty-Mumps visible to "
+                   "pkg-config as coinmumps)\n";
+      return 2;
+   }
+#endif
+   if (!driver::valid_schedule(t0, tmin, factor)) return 2;
+   if (sigma <= 0) {
+      std::cerr << "--sigma must be > 0 (the default alpha0 is log(0.7*sigma))\n";
+      return 2;
+   }
+   if (!image_io::ends_with(data, ".txt") && size <= 0) {
+      std::cerr << "image input requires --size N (target side length)\n";
+      return 2;
+   }
 
    SmartPtr<MpccTNLP> mpcc =
       new MpccTNLP(data, image_io::Opts{size, sigma, (unsigned)seed});
+   if (solver == "dd" && (nsub < 1 || nsub > mpcc->N)) {
+      std::cerr << "--nsub must be in [1, N] (N=" << mpcc->N << ")\n";
+      return 2;
+   }
    // Noise-aware default α₀ = log(0.7σ), calibrated to the cameraman TV optimum.
    mpcc->alpha0_ = alpha0_set ? alpha0 : std::log(0.7 * sigma);
    mpcc->x_start_.resize(mpcc->n);
@@ -101,6 +136,10 @@ int main(int argc, char** argv) {
              << "  KKT dim=" << mpcc->kkt_dim
              << "  solver=" << solver;
    if (solver == "dd") std::cout << "  nsub=" << nsub << "×" << nsub;
+   if (solver == "dd" && wk_backend != "ma57")
+      std::cout << "  wk-backend=" << wk_backend
+                << (wk_backend == "hybrid" ? "(ma57-solves+mumps-schur)"
+                                           : "(schur)");
    if (c_theta > 0) std::cout << "  c_theta=" << c_theta;
    std::cout << "  α₀=" << mpcc->alpha0_ << "\n";
 
@@ -119,6 +158,10 @@ int main(int argc, char** argv) {
       DDArrowheadSolver::config_cg_apply(
          cg_apply == "matfree" ? DDArrowheadSolver::APPLY_MATFREE
                                : DDArrowheadSolver::APPLY_ASSEMBLED);
+      DDArrowheadSolver::config_wk_backend(
+         wk_backend == "mumps"    ? DDArrowheadSolver::WK_MUMPS
+         : wk_backend == "hybrid" ? DDArrowheadSolver::WK_HYBRID
+                                  : DDArrowheadSolver::WK_MA57);
       DDArrowheadSolver::config_alpha(mpcc->oa);
       // The built-in tile partition promotes the cut-corner dual pairs too, so
       // the dual peel applies here exactly as in the staggered 2D driver.

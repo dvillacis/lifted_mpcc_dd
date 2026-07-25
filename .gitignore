@@ -6,6 +6,7 @@ cpp/dd_solve*_omp
 cpp/dd_solve*_prof
 cpp/ma97_smoke
 cpp/ma97_smoke_par
+cpp/mumps_smoke
 *.o
 *.dSYM/
 *.dwarf
