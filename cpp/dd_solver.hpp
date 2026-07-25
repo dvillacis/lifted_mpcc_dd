@@ -309,7 +309,13 @@ public:
 
    bool InitializeImpl(const OptionsList&, const std::string&) override { return true; }
    EMatrixFormat MatrixFormat() const override { return Triplet_Format; }
-   bool ProvidesInertia() const override { return true; }
+   // DD_NO_INERTIA=1 (EXPERIMENT, pairs with DD_NEG_CURV): claim no inertia so
+   // IPOPT must fall back on its inertia-free curvature test. Proves whether the
+   // serial S factorization can be dropped before any work is done to drop it.
+   bool ProvidesInertia() const override {
+      static const bool off = std::getenv("DD_NO_INERTIA") != nullptr;
+      return !off;
+   }
    bool IncreaseQuality() override { return false; }
    Index NumberOfNegEVals() const override { return nneg_; }
 
@@ -2054,26 +2060,56 @@ private:
       if ((int)so_rk_.size() != K) {
          so_rk_.resize(K);
          so_wk_.resize(K);
+         // PER-BLOCK scratch (2026-07-25): the two subdomain loops below are
+         // OpenMP-parallel, so the contribution vector and the Δy gather/product
+         // buffers cannot be the single shared so_dyk_/so_bd_ they used to be —
+         // that was a data race the moment the loop was threaded.
+         so_ct_.resize(K);
+         so_dyk_v_.resize(K);
+         so_bd_v_.resize(K);
          for (int k = 0; k < K; ++k) {
             so_rk_[k].resize(dimk_[k]);
             so_wk_[k].resize(dimk_[k]);
+            so_ct_[k].resize((int)Nk_[k].size());
+            so_dyk_v_[k].resize((int)Nk_[k].size());
+            so_bd_v_[k].resize(dimk_[k]);
          }
          so_ry_.resize(p_);
       }
       std::vector<Eigen::VectorXd>&rk = so_rk_, &wk = so_wk_;
       Eigen::VectorXd& ry = so_ry_;
+      // The two O(dim) permutation passes (here and the gather at the end) are
+      // NOT negligible at scale: at N=96 they walk 153810 indirect entries per
+      // solve_one, comparable to the back-solves' own traffic, and solve_one runs
+      // several times per Newton step. Each index is written exactly once — the
+      // owner map is a partition — so both parallelize without a reduction.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
       for (Index i = 0; i < dim_; ++i) {
          if (owner_[i] >= 0) rk[owner_[i]][lpos_[i]] = rhs[i];
          else ry[ypos_[i]] = rhs[i];
       }
       // r_S = r_y − Σ_k B̄_k W_k⁻¹ r_k   (in-place backsolves)
+      //
+      // The K back-solves are independent — the same embarrassingly-parallel
+      // phase as the S_k formation, and concurrent solves on distinct blocks are
+      // validated for both backends (ma97_smoke_par phase B; only concurrent
+      // FACTOR crashes). The ACCUMULATION is not: neighbouring subdomains share
+      // border positions, so several k write the same ry entry. Hence the split
+      // — parallel solve + local product into per-block so_ct_, then a serial
+      // reduce over Σp_k entries, which is negligible beside the back-solves.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
       for (int k = 0; k < K; ++k) {
          wk[k] = rk[k];
          wk_solve(k, wk[k].data(), 1);
-         if (Nk_[k].empty()) continue;
-         Eigen::VectorXd contrib = B_[k] * wk[k];
-         for (size_t a = 0; a < Nk_[k].size(); ++a) ry[Nk_[k][a]] -= contrib[(int)a];
+         if (!Nk_[k].empty()) so_ct_[k].noalias() = B_[k] * wk[k];
       }
+      for (int k = 0; k < K; ++k)
+         for (size_t a = 0; a < Nk_[k].size(); ++a)
+            ry[Nk_[k][a]] -= so_ct_[k][(int)a];
       // Interface: opt-in preconditioned CG (with the direct factorization as
       // its safety net), or the direct MA57 back-solve of the assembled S.
       Eigen::VectorXd dy;
@@ -2085,17 +2121,25 @@ private:
          s_ma57_->solve(dy.data(), 1);
       }
       // Δx_k = W_k⁻¹(r_k − B̄_kᵀ N_kᵀ Δy)
+      //
+      // Fully independent per k — dy is read-only here and every write lands in
+      // block-k storage, so unlike the loop above this one needs no reduction.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
       for (int k = 0; k < K; ++k) {
          if (!Nk_[k].empty()) {
-            so_dyk_.resize((int)Nk_[k].size());
-            for (size_t a = 0; a < Nk_[k].size(); ++a) so_dyk_[(int)a] = dy[Nk_[k][a]];
-            so_bd_.resize(dimk_[k]);
-            so_bd_.noalias() = B_[k].transpose() * so_dyk_;
-            rk[k] -= so_bd_;
+            for (size_t a = 0; a < Nk_[k].size(); ++a)
+               so_dyk_v_[k][(int)a] = dy[Nk_[k][a]];
+            so_bd_v_[k].noalias() = B_[k].transpose() * so_dyk_v_[k];
+            rk[k] -= so_bd_v_[k];
          }
          wk[k] = rk[k];
          wk_solve(k, wk[k].data(), 1);
       }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
       for (Index i = 0; i < dim_; ++i)
          rhs[i] = (owner_[i] >= 0) ? wk[owner_[i]][lpos_[i]] : dy[ypos_[i]];
    }
@@ -2178,8 +2222,13 @@ private:
    std::vector<int> frzOwnerCfg_;
    // #4: solve-path scratch (serial use only)
    std::vector<double> sr_b0_, sr_x_, sr_r_, sr_Ax_, sr_best_;
-   std::vector<Eigen::VectorXd> so_rk_, so_wk_;
-   Eigen::VectorXd so_ry_, so_dyk_, so_bd_;
+   // solve_one scratch. Everything indexed by k is written concurrently by the
+   // two OpenMP loops there, so it is per-block by necessity, not just to dodge
+   // the allocator: so_ct_ is B̄_k W_k⁻¹r_k, so_dyk_/so_bd_ the Δy gather and its
+   // B̄_kᵀ product. Only so_ry_ (the interface RHS) is shared, and it is written
+   // in the serial reduce.
+   std::vector<Eigen::VectorXd> so_rk_, so_wk_, so_ct_, so_dyk_v_, so_bd_v_;
+   Eigen::VectorXd so_ry_;
    std::vector<std::vector<char>> seen_;
    std::vector<SpMat> B_;
    // Which input triplets belong to each W_k, in the order MA57 analyzed them.
