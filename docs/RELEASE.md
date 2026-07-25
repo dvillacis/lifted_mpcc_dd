@@ -38,8 +38,7 @@ Placeholders that MUST be filled or they will appear verbatim on the public DOI 
 - [ ] **Sanity-build** — from a clean checkout, `cd cpp && ./build.sh
       dd_solve_1d.cpp -o dd_solve_1d && ./dd_solve_1d --data
       data/data_1d_n256_k4.txt --nsub 4 --self-check` should pass; the Python
-      reference should `import` (`cd python && python -c "import
-      lifted_mpcc_unitball_v2"`).
+      helpers should `import` (`cd python && python -c "import mpcc_utils"`).
 
 ## One-time setup
 

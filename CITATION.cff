@@ -13,9 +13,9 @@ abstract: >-
   custom SparseSymLinearSolverInterface that produces every interior-point Newton
   step by domain decomposition (local HSL MA57/MA97 factorizations plus a direct
   or preconditioned-CG interface solve), answering IPOPT's inertia query via the
-  Haynsworth identity without ever factorizing the full KKT. Ships with the Python
-  reference implementations it is validated against and the scripts that reproduce
-  every figure.
+  Haynsworth identity without ever factorizing the full KKT. Ships with Python
+  helpers that generate byte-identical solver inputs from the extracted reference
+  formulation and render the result figures.
 type: software
 version: 1.0.0
 date-released: "2026-07-24"

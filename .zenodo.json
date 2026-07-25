@@ -1,7 +1,7 @@
 {
   "upload_type": "software",
   "title": "lifted-mpcc-dd: a domain-decomposition IPOPT linear solver for the lifted TV-denoising MPCC",
-  "description": "<p>Companion code for the domain-decomposition (arrowhead / Schur-complement) linear solver used inside IPOPT to solve the bilevel total-variation image denoising problem written as a lifted mathematical program with complementarity constraints (MPCC), in the unit-ball dual formulation.</p><p>The C++ plugin injects a custom <code>SparseSymLinearSolverInterface</code> that produces every interior-point Newton step by domain decomposition: local HSL MA57/MA97 factorizations of the subdomain blocks plus a direct or preconditioned-CG solve of the interface (Schur) system, answering IPOPT's inertia query through the Haynsworth identity without ever factorizing the full KKT. Three validated drivers are included (uniform 2D, staggered 1D, staggered 2D), together with the Python reference implementations the plugin is validated against and the scripts that reproduce every figure. External dependencies (IPOPT, HSL MA57/MA97) are not distributed and must be obtained separately under their own licences.</p>",
+  "description": "<p>Companion code for the domain-decomposition (arrowhead / Schur-complement) linear solver used inside IPOPT to solve the bilevel total-variation image denoising problem written as a lifted mathematical program with complementarity constraints (MPCC), in the unit-ball dual formulation.</p><p>The C++ plugin injects a custom <code>SparseSymLinearSolverInterface</code> that produces every interior-point Newton step by domain decomposition: local HSL MA57/MA97 factorizations of the subdomain blocks plus a direct or preconditioned-CG solve of the interface (Schur) system, answering IPOPT's inertia query through the Haynsworth identity without ever factorizing the full KKT. Three validated drivers are included (uniform 2D, staggered 1D, staggered 2D), together with Python helpers that generate byte-identical solver inputs from the extracted reference formulation and render the result figures. External dependencies (IPOPT, HSL MA57/MA97) are not distributed and must be obtained separately under their own licences.</p>",
   "creators": [
     {
       "name": "Villacís, David",
@@ -14,7 +14,7 @@
     },
     {
       "name": "Riera, Daniela",
-      "affiliation": "TODO — confirm affiliation"
+      "affiliation": "Research Center on Mathematical Modelling (MODEMAT), Escuela Politécnica Nacional, Quito, Ecuador"
     }
   ],
   "access_right": "open",
