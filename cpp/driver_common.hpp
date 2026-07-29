@@ -72,7 +72,26 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
   app->Options()->SetIntegerValue("print_level", print_level);
   app->Options()->SetIntegerValue("max_iter", max_iter);
   app->Options()->SetIntegerValue("acceptable_iter", 1);
-  app->Options()->SetStringValue("mu_strategy", "monotone");
+  // BARRIER ADVANCE. In monotone mode IPOPT only cuts mu once
+  // E_mu <= barrier_tol_factor * mu (default 10). Measured at N=1024: inf_du
+  // plateaued at 9.5e-2 with mu=1.5e-4, i.e. 62x above the gate, for 200+
+  // iterations with inf_pr at 4e-7 and the objective static — 4 hours of a 48h
+  // job spent not advancing, and the same pattern cost 850 and 1575 iterations
+  // at the two earlier levels. Neither knob touches the t-schedule (t = c*mu is
+  // unchanged), so they are the levers available when --t-update geometric is
+  // not wanted:
+  //   DD_MU_STRATEGY=adaptive     no fixed gate at all; mu is chosen per
+  //                               iteration by an oracle. The standard answer
+  //                               to "monotone will not advance".
+  //   DD_BARRIER_TOL=<f>          raise the gate. At f=1000 the N=1024 stall
+  //                               above clears immediately (gate 0.15 > 0.095).
+  // Both default to the validated behaviour.
+  {
+    const char *ms = std::getenv("DD_MU_STRATEGY");
+    app->Options()->SetStringValue("mu_strategy", ms ? ms : "monotone");
+    if (const char *bt = std::getenv("DD_BARRIER_TOL"))
+      app->Options()->SetNumericValue("barrier_tol_factor", std::atof(bt));
+  }
   // HESSIAN (--hessian exact|limited-memory, default limited-memory).
   //
   // All three TNLPs implement a full analytic eval_h, so "exact" is available
