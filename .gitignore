@@ -2,6 +2,7 @@
 cpp/dd_solve
 cpp/dd_solve_1d
 cpp/dd_solve_2d
+cpp/dd_solve_dataset
 cpp/dd_solve*_omp
 cpp/dd_solve*_prof
 cpp/ma97_smoke

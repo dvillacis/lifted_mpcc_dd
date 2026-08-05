@@ -45,7 +45,7 @@ else
   export HSL_SOLVER=ma57
 fi
 
-for src in dd_solve dd_solve_1d dd_solve_2d; do
+for src in dd_solve dd_solve_1d dd_solve_2d dd_solve_dataset; do
   echo "building $src (MA57 + OpenMP)"
   OMP=1 $BUILDER $src.cpp -o $src
 done
@@ -62,7 +62,7 @@ else
 fi
 
 echo
-echo "built: dd_solve dd_solve_1d dd_solve_2d $MUMPS_NOTE"
+echo "built: dd_solve dd_solve_1d dd_solve_2d dd_solve_dataset $MUMPS_NOTE"
 echo "       (MA57: every parallel region live, factorization included)"
 echo
 echo "validate before real runs:"

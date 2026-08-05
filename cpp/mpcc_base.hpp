@@ -54,6 +54,17 @@ public:
    double alpha_lo_ = -15.0, alpha_hi_ = 15.0;   // α box (exp weight only)
    double w_max_ = 2e19;                         // optional cap on the linear weight
    double reg_alpha_ = 1e-4;
+   // Scale on the DATA term (and, with it, the θ ridge below). 1.0 for the
+   // single-instance drivers — they must stay bit-identical, and the
+   // --self-check checksums are the gate on that. The dataset driver sets 1/S
+   // so the upper level is the MEAN over training pairs rather than the sum:
+   // then the data term stays O(1) as the training set grows and --reg-alpha
+   // keeps the meaning it has in the single-image tables. The ridge is scaled
+   // ALONGSIDE the data term, not independently — what matters is their ratio,
+   // and holding it fixed is what makes S=1 reproduce dd_solve_2d exactly.
+   // reg_alpha_ is deliberately NOT scaled: α is one scalar for the whole
+   // dataset, so its penalty is not a per-sample quantity.
+   double loss_scale_ = 1.0;
    double t_ = 1.0;                              // current Scholtes level
    // TR (Tikhonov) gauge ridge ½·ε_θ·‖θ − θ_ref‖², the D1 fix for the angle gauge:
    // where r = δ = 0 the angle θ is undetermined, the (θ,θ) Hessian entry vanishes
@@ -261,25 +272,26 @@ public:
          const double d = x[ou + i] - uclean_[i];
          s += d * d;
       }
-      obj = 0.5 * s + 0.5 * reg_alpha_ * x[oa] * x[oa];
+      obj = 0.5 * loss_scale_ * s + 0.5 * reg_alpha_ * x[oa] * x[oa];
       if (eps_theta_ != 0.0) {
          double g = 0.0;
          for (int e = 0; e < n_lift; ++e) {
             const double d = x[oTh + e] - theta_ref_[e];
             g += d * d;
          }
-         obj += 0.5 * eps_theta_ * g;
+         obj += 0.5 * loss_scale_ * eps_theta_ * g;
       }
       return true;
    }
 
    bool eval_grad_f(Index, const Number* x, bool, Number* g) override {
       for (int i = 0; i < n; ++i) g[i] = 0.0;
-      for (int i = 0; i < n_state; ++i) g[ou + i] = x[ou + i] - uclean_[i];
+      for (int i = 0; i < n_state; ++i)
+         g[ou + i] = loss_scale_ * (x[ou + i] - uclean_[i]);
       g[oa] = reg_alpha_ * x[oa];
       if (eps_theta_ != 0.0)
          for (int e = 0; e < n_lift; ++e)
-            g[oTh + e] = eps_theta_ * (x[oTh + e] - theta_ref_[e]);
+            g[oTh + e] = loss_scale_ * eps_theta_ * (x[oTh + e] - theta_ref_[e]);
       return true;
    }
 

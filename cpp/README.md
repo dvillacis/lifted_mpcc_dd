@@ -513,6 +513,108 @@ SERIAL by design (no mumps_smoke_par-style concurrency audit yet — the MA97
 lesson), so an OMP A/B needs that audit first; and the pure-mumps solve tax
 would need a persistent-workspace solve path that dmumps_c does not expose.
 
+## The dataset driver — DD by training pair (`dd_solve_dataset`, 2026-08-05)
+
+Every other driver here learns α from ONE image. `dd_solve_dataset` learns one
+scalar α across a training SET,
+
+```
+min_α  (1/S)·Σ_s ½‖u_s − u_clean,s‖² + ½·reg_α·α²
+s.t.   every sample s satisfies its own lifted lower-level system
+```
+
+and decomposes it **by training pair**. That is the point: the samples share
+nothing but α, so the "a primal column is complicating iff its rows span ≥2
+subdomains" rule — the same one `dd_solve_2d` reads off the Jacobian sparsity —
+selects **exactly {α}**, and one block per pair gives an arrowhead with
+
+```
+p = 1        S is 1×1        In(A) = Σ_s In(W_s) + one sign
+```
+
+with every `W_s` a well-posed single-image KKT: no cut cells, no cut-corner rank
+deficiency, no promoted duals, no dual peel. It is the cleanest decomposition
+this package can express, and the only one whose blocks need no halo exchange at
+all — the distributed-memory case in its most favourable form.
+
+`--nsub k > 1` composes the two decompositions: each pair is additionally cut
+into k×k tiles by the same `Partition2D` geometry and anchor rule, giving `S·k²`
+subdomains and the corner promotion back again. `k = 1` is not a special case in
+the code — it falls out of the general path with an empty spatial cut.
+
+Layout is **field-major**, `x = [u_0 … u_{S−1} | qx_all | … | θ_all | α]`, i.e.
+exactly `Mpcc2DTNLP`'s layout with `m_u → S·m_u`, `m_q → S·m_q`. Because the
+fields stay contiguous, `MpccTNLPBase` needed no structural change: `eval_f`,
+the bounds, the μ-coupled callback's `max r(1−δ)` and `set_theta_ref` all work
+off `n_state`/`n_lift` unmodified. The only base change is `loss_scale_`
+(default 1.0), which carries `1/S` for `--loss mean` on the data term and the
+θ ridge together — their ratio stays S-independent and `reg_alpha` keeps the
+meaning it has in the single-image tables.
+
+**The gate that pins the port**: at `S = 1` the structure and value sequences are
+bit-identical to `Mpcc2DTNLP`'s, because each of the 21 Jacobian pieces and 8
+Hessian blocks wraps its own `for s` rather than the samples wrapping the
+pieces. So
+
+```bash
+./dd_solve_2d      --data ../images/cameraman.png --size 32 --nsub 4 --init cp --self-check
+./dd_solve_dataset --data ../images/cameraman.png --size 32 --nsub 4 --limit 1 --self-check
+```
+
+print the same five checksums and the same partition (measured: `f(x0) =
+1.193058828895e+00`, `sum|J| = 1.370743068548e+04` over 23191 nnz, `p=400`,
+`u=177 qx=93 qy=93 alpha=1 + 36` promoted duals), and the full solves land on
+the same α\*, iteration count and PSNR.
+
+`--val-limit V` evaluates the learned weight on held-out images by running the
+same Chambolle–Pock ROF solver at `lam = Q(α*)` — that ROF problem IS the MPCC's
+lower level, so held-out evaluation costs no extra MPCC. The per-pair table also
+prints the training reconstruction BOTH from the MPCC's own `u_s` and from that
+ROF solve: they must agree to lower-level tolerance, and a gap means the
+complementarity is not tight, which a single objective value hides completely.
+
+### Measured (Kodak, N=32, σ=0.1, 8 threads on a 4P+4E-core laptop, 2026-08-05)
+
+| S | solver | `DD_BARRIER_TOL` | its | α\* | train PSNR | wall |
+|---|---|---|---|---|---|---|
+| 6 | ma57 (monolithic) | — | 1222 | 0.064627 | 25.96 dB | |
+| 6 | dd, `--nsub 1` (p=1) | — | 830 | 0.064603 | 25.96 dB | |
+| 8 | ma57 (monolithic) | — | **3000** | 0.070000 | 25.40 dB | 177.3 s |
+| 8 | dd, `--nsub 1` (p=1) | — | **3000** | 0.050928 | 25.15 dB | 212.4 s |
+| 8 | ma57 (monolithic) | 1000 | 73 | 0.0664883 | 25.42 dB | 14.09 s |
+| 8 | dd, `--nsub 1` (p=1) | 1000 | 73 | 0.0664883 | 25.42 dB | 14.50 s |
+
+**DD reproduces the monolithic answer.** On the converged S=8 pair the two agree
+to 6 significant figures in α\* and to 0.01 dB on every image, in the *same 73
+iterations*. `DD_CHECK=1` reports inertia MATCH on every solve with rel-err
+~1e-13. At S=6 they agree to 4 digits (0.04% apart), DD taking fewer iterations.
+
+**The default μ-coupled settings stall at S=8** — the bold rows hit `max_iter`,
+the monolithic one with α pinned at its starting value w₀ = 0.7σ for all 3000
+iterations. That is the documented barrier-advance stall, not a DD defect, and
+the knob the last commit added clears it outright: `DD_BARRIER_TOL=1000` turns
+3000 stalled iterations into 73 converged ones, a **41× reduction**. Treat that
+knob as effectively required once S grows.
+
+**Speed, honestly.** At S=8 converged the two are at parity (14.50 s vs 14.09 s,
+DD 1.03× slower); on the stalled 3000-iteration pair, which divides cleanly,
+DD costs 70.8 vs 59.1 ms per Newton step, 1.20× slower. So the same verdict as
+the spatial decomposition: **correct, not faster on a single node.** The p=1
+interface does remove the serial-interface Amdahl floor that the spatial
+partition has — S is 1×1, there is nothing to factorize — but the per-block
+overheads are not yet repaid at N=32 on this chip. The value here is the
+fill/memory split and blocks that are genuinely independent; the distributed
+case is what this decomposition is for, and it is untested.
+
+**Generalization.** Held-out over unseen Kodak images at the learned α\*: S=6 →
+24.69 dB vs 25.95 train (gap 1.26 dB, 4 held out); S=8 → 25.28 dB vs 25.42 train
+(gap **0.14 dB**, 6 held out). More training pairs, less overfitting — which is
+the whole reason for learning α on a set rather than one picture.
+
+`--save-solution PREFIX` writes ONE file per pair, `PREFIX_s000.txt` …, each in
+`dd_solve_2d`'s exact format, so `../python/plot_slurm.py` renders them with no
+changes at all (drop them in a `sols/` dir named `sol_<tag>_s%03d.txt`).
+
 ## Layout
 
 | file | role |
@@ -525,10 +627,14 @@ would need a persistent-workspace solve path that dmumps_c does not expose.
 | `mpcc_tnlp.hpp` | uniform-grid formulation (port of `../lifted_mpcc_unitball_v2.py`) |
 | `mpcc_1d_tnlp.hpp` | staggered 1D formulation (port of `../lifted_mpcc_1d.py`) |
 | `mpcc_2d_tnlp.hpp` | staggered 2D formulation (port of `../lifted_mpcc_2d.py`), incl. the C++ Chambolle–Pock warm start for the image route |
+| `mpcc_dataset_tnlp.hpp` | MULTI-SAMPLE staggered 2D formulation: one α across S training pairs, field-major |
+| `dataset.hpp` | dataset manager: folder/manifest listing, selection, per-pair noise seeding, upsample guard |
+| `partition_2d.hpp` | `Partition2D` — tile/strip cell ownership + the anchor rule, shared by the 2D and dataset drivers |
 | `driver_common.hpp` | PSNR, t-schedule, IPOPT options, the Scholtes continuation loop, `--self-check` checksums |
 | `dd_solve.cpp` | uniform driver (`--solver mumps\|ma57\|dd`) |
 | `dd_solve_1d.cpp` | staggered 1D driver (partition + injected owner map) |
 | `dd_solve_2d.cpp` | staggered 2D driver (tile/strip partition, corner promotion, image route) |
+| `dd_solve_dataset.cpp` | dataset driver: one α learned across S training pairs, DD **per pair** |
 | `../python/dump_data*.py` | export the exact instance + CP warm start + owner map (via `mpcc_utils`) |
 | `../python/plot_slurm.py` | render 2D result figures from a directory of `--save-solution` dumps |
 
@@ -652,6 +758,15 @@ DD_CHECK=1 ./dd_solve_1d --data data/data_1d_64.txt --nsub 4 --solver dd   # vs 
 python ../python/dump_data_2d.py --N 16 --nsub 2 -o data/data_2d_16.txt
 ./dd_solve_2d --data data/data_2d_16.txt --nsub 2 --solver dd      # 0.074386, 24.79 dB, 485 it
 ./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 4 --solver dd  # PNG route (C++ CP warm start)
+
+# dataset route: one alpha across a training SET, one subdomain per pair (p=1).
+# DD_BARRIER_TOL is effectively required past a handful of pairs — see the
+# dataset-driver section: at S=8 it turns 3000 stalled iterations into 73.
+DD_BARRIER_TOL=1000 ./dd_solve_dataset --data ~/data/kodak --size 32 --limit 8 \
+    --val-limit 6 --solver dd --nsub 1 --save-manifest ds.csv --save-solution sol
+./dd_solve_dataset --data ~/data/kodak --size 32 --limit 6 --nsub 2 --solver dd  # + 2x2 tiles per pair
+./dd_solve_dataset --data ../images/cameraman.png --size 32 --limit 1 --self-check  # the S=1 gate
+DD_CHECK=1 ./dd_solve_dataset --data ~/data/kodak --size 20 --limit 2 --solver dd   # vs MA57-full
 ./dd_solve_2d --data data/data_2d_16.txt --nsub 2 --solver dd --partition strip   # no cross corners ⇒ no promotion, S SPD
 ./dd_solve_1d --data data/data_1d_64.txt --nsub 4 --solver dd --interface cg      # PCG interface, ASd (Lueg) default
 ./dd_solve_2d --data data/data_2d_16.txt --nsub 2 --solver dd --interface cg     # tile + dual peel (both default)
@@ -713,6 +828,8 @@ part of this archival package.
 | `DD_STATS=1` | one-shot `B̄_k` sparsity budget (dim, `p_k`, nnz, interface-touched rows) |
 | `DD_DEBUG=1` | partition summary, singular-block reports, refinement warnings |
 | `DD_HESSIAN=` | overrides `--hessian` (`exact` / `limited-memory`) |
+| `DD_MU_STRATEGY=` | IPOPT `mu_strategy`, default `monotone`; `adaptive` drops the fixed μ-decrease gate |
+| `DD_BARRIER_TOL=f` | IPOPT `barrier_tol_factor`, default 10 — raise it when monotone μ will not advance (at N=1024 a plateau at 62× the gate cleared immediately at f=1000) |
 | `DD_MA57_SCALING=1` | re-enable MC64 scaling (same as `--ma57-scaling on`) |
 | `DD_MA57_ICNTL13=n` | override MA57's BLAS2/BLAS3 multi-RHS threshold |
 | `DD_MA57_ICNTL6=n` | MA57 pivot ordering (2=AMD, 4=METIS, default 5=auto) — see the METIS note |

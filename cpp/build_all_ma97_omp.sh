@@ -31,11 +31,12 @@ export HSL_SOLVER=ma97          # explicit (auto-detect would pick it anyway)
 OMP=1 ./build_linux.sh dd_solve.cpp    -o dd_solve
 OMP=1 ./build_linux.sh dd_solve_1d.cpp -o dd_solve_1d
 OMP=1 ./build_linux.sh dd_solve_2d.cpp -o dd_solve_2d
+OMP=1 ./build_linux.sh dd_solve_dataset.cpp -o dd_solve_dataset
 ./build_linux.sh ma97_smoke.cpp -o ma97_smoke        # gates need no OMP /
 OMP=1 ./build_linux.sh ma97_smoke_par.cpp -o ma97_smoke_par   # / stress does
 
 echo
-echo "built: dd_solve dd_solve_1d dd_solve_2d ma97_smoke ma97_smoke_par"
+echo "built: dd_solve dd_solve_1d dd_solve_2d dd_solve_dataset ma97_smoke ma97_smoke_par"
 echo "       (MA97: serial W_k factorization, parallel W_k backsolves)"
 echo "before real runs:"
 echo "  export OMP_NUM_THREADS=<cores>  MKL_THREADING_LAYER=SEQUENTIAL"
