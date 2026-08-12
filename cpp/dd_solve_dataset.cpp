@@ -32,6 +32,7 @@
 //
 // The dataset itself (folder listing, selection, per-pair noise seeding, the
 // upsample guard) lives in dataset.hpp; the formulation in mpcc_dataset_tnlp.hpp.
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -176,15 +177,15 @@ static std::vector<double> slice_sample(const MpccDatasetTNLP& p,
 // and the μ-trace are shared by the whole run — they describe the one solve —
 // so every per-pair file carries the same copy; only the iterate and the
 // instance block are that pair's own.
-static void save_solution_sample(const std::string& fn, const MpccDatasetTNLP& p,
-                                 const std::vector<driver::Level>& hist,
-                                 const std::vector<double>& x, double t_last,
-                                 int nsub, int s) {
+static void write_solution_file(const std::string& fn, const MpccDatasetTNLP& p,
+                                const std::vector<driver::Level>& hist,
+                                const std::vector<double>& xs,
+                                const double* uclean, const double* f,
+                                double t_last, int nsub) {
    std::ofstream out(fn);
    if (!out) { std::cerr << "cannot write " << fn << "\n"; return; }
    const int m_u = p.m_u, m_q = p.m_q;
    const int n1 = m_u + 5 * m_q + 1;
-   const std::vector<double> xs = slice_sample(p, x, s);
    out << std::setprecision(17);
    out << n1 << " " << hist.size() << " " << t_last << " " << nsub << " "
        << (p.weight_exp ? 1 : 0) << "\n";
@@ -194,11 +195,8 @@ static void save_solution_sample(const std::string& fn, const MpccDatasetTNLP& p
           << (l.converged ? 1 : 0) << "\n";
    for (int i = 0; i < n1; ++i) out << xs[i] << (i + 1 < n1 ? ' ' : '\n');
    out << p.N << " " << (p.averaged ? 1 : 0) << " " << p.sigma_ << "\n";
-   for (int blk = 0; blk < 2; ++blk) {
-      const std::vector<double>& v = blk ? p.f_ : p.uclean_;
-      for (int i = 0; i < m_u; ++i)
-         out << v[(size_t)s * m_u + i] << (i + 1 < m_u ? ' ' : '\n');
-   }
+   for (const double* v : {uclean, f})
+      for (int i = 0; i < m_u; ++i) out << v[i] << (i + 1 < m_u ? ' ' : '\n');
    const size_t NC = 5;
    out << p.mu_hist_.size() / NC << " " << NC << "\n";
    for (size_t i = 0; i + NC - 1 < p.mu_hist_.size(); i += NC) {
@@ -206,6 +204,134 @@ static void save_solution_sample(const std::string& fn, const MpccDatasetTNLP& p
       for (size_t j = 1; j < NC; ++j) out << " " << p.mu_hist_[i + j];
       out << "\n";
    }
+}
+
+// A TRAINING pair: slice its block out of the field-major iterate.
+static void save_solution_sample(const std::string& fn, const MpccDatasetTNLP& p,
+                                 const std::vector<driver::Level>& hist,
+                                 const std::vector<double>& x, double t_last,
+                                 int nsub, int s) {
+   write_solution_file(fn, p, hist, slice_sample(p, x, s),
+                       p.uclean_.data() + (size_t)s * p.m_u,
+                       p.f_.data() + (size_t)s * p.m_u, t_last, nsub);
+}
+
+// ---------------------------------------------------------------------------
+// The machine-readable run record.
+//
+// JSON rather than CSV because the payload is run-level scalars PLUS a per-pair
+// array, and a wide sparse CSV would misrepresent that shape. `json` is stdlib
+// on the Python side, and fields can be added without breaking a column order
+// anyone depends on. --save-manifest keeps writing its own CSV; that records
+// PROVENANCE (which file, which seed) and this records RESULTS, so they stay
+// separate.
+//
+// psnr_mpcc is null on held-out rows. A held-out pair has no MPCC iterate — it
+// was never in the optimization — and writing 0 or repeating the ROF value
+// there would be a quiet lie that a plot would faithfully render.
+// ---------------------------------------------------------------------------
+static std::string json_escape(const std::string& s) {
+   std::string o;
+   o.reserve(s.size() + 8);
+   for (char c : s) {
+      switch (c) {
+         case '"':  o += "\\\""; break;
+         case '\\': o += "\\\\"; break;
+         case '\n': o += "\\n";  break;
+         case '\r': o += "\\r";  break;
+         case '\t': o += "\\t";  break;
+         default:
+            if ((unsigned char)c < 0x20) {
+               char b[8];
+               std::snprintf(b, sizeof b, "\\u%04x", (unsigned)(unsigned char)c);
+               o += b;
+            } else {
+               o += c;
+            }
+      }
+   }
+   return o;
+}
+
+// One row of the per-pair array, filled by the caller from what it already
+// computed for the stdout table.
+struct PairRow {
+   const char* role;
+   int slot, listing_index;
+   std::string path;
+   unsigned seed;
+   double psnr_noisy, psnr_rof;
+   double psnr_mpcc;        // NaN -> null (held-out)
+};
+
+static void write_report_json(const std::string& fn, const std::string& tag,
+                              const MpccDatasetTNLP& p, const driver::RunResult& res,
+                              const std::vector<PairRow>& rows, int nsub, int n_sub,
+                              int p_border, int n_promoted, const std::string& solver,
+                              const std::string& partition, const std::string& loss,
+                              const std::string& hessian, const std::string& t_update,
+                              const std::string& interface_solver, int seed,
+                              double wall_s) {
+   std::ofstream out(fn);
+   if (!out) { std::cerr << "cannot write " << fn << "\n"; return; }
+   const driver::Level* last = res.hist.empty() ? nullptr : &res.hist.back();
+   const double alpha = res.best_x.empty() ? 0.0 : res.best_x[p.oa];
+   auto env = [](const char* k) -> std::string {
+      const char* v = std::getenv(k);
+      return v ? v : "";
+   };
+   auto num = [&out](double v) {
+      // JSON has no NaN/Infinity literal; emit null so a reader never has to
+      // guess what a bare `nan` token meant.
+      if (std::isfinite(v)) out << v; else out << "null";
+   };
+
+   out << std::setprecision(17);
+   out << "{\n";
+   out << "  \"tag\": \"" << json_escape(tag) << "\",\n";
+   out << "  \"S\": " << p.S_ << ", \"N\": " << p.N
+       << ", \"sigma\": " << p.sigma_ << ", \"seed\": " << seed << ",\n";
+   out << "  \"loss\": \"" << loss << "\", \"loss_scale\": " << p.loss_scale_
+       << ", \"weight\": \"" << (p.weight_exp ? "exp" : "linear")
+       << "\", \"stencil\": \"" << (p.averaged ? "averaged" : "onesided") << "\",\n";
+   out << "  \"reg_alpha\": " << p.reg_alpha_
+       << ", \"hessian\": \"" << hessian << "\", \"t_update\": \"" << t_update
+       << "\",\n";
+   out << "  \"solver\": \"" << solver << "\", \"interface\": \""
+       << interface_solver << "\", \"nsub\": " << nsub
+       << ", \"partition\": \"" << partition << "\",\n";
+   out << "  \"n_sub\": " << n_sub << ", \"p_border\": " << p_border
+       << ", \"n_promoted\": " << n_promoted << ",\n";
+   out << "  \"n\": " << p.n << ", \"m_con\": " << p.mcon
+       << ", \"kkt_dim\": " << p.kkt_dim << ",\n";
+   out << "  \"iters\": " << res.total_iter
+       << ", \"status\": " << (last ? last->status : -1)
+       << ", \"converged\": " << (last && last->converged ? "true" : "false")
+       << ",\n";
+   out << "  \"t_best\": "; num(res.best_t);
+   out << ", \"comp_res\": "; num(res.best_comp);
+   out << ", \"obj\": "; num(last ? last->obj : 0.0);
+   out << ",\n";
+   out << "  \"alpha\": "; num(alpha);
+   out << ", \"Q_alpha\": "; num(p.weight_of_alpha(alpha));
+   out << ",\n";
+   out << "  \"wall_s\": "; num(wall_s);
+   out << ", \"omp_threads\": \"" << json_escape(env("OMP_NUM_THREADS"))
+       << "\", \"barrier_tol\": \"" << json_escape(env("DD_BARRIER_TOL"))
+       << "\", \"mu_strategy\": \"" << json_escape(env("DD_MU_STRATEGY")) << "\",\n";
+   out << "  \"pairs\": [\n";
+   for (size_t i = 0; i < rows.size(); ++i) {
+      const PairRow& r = rows[i];
+      out << "    {\"role\": \"" << r.role << "\", \"slot\": " << r.slot
+          << ", \"listing_index\": " << r.listing_index
+          << ", \"path\": \"" << json_escape(r.path) << "\""
+          << ", \"seed\": " << r.seed
+          << ", \"psnr_noisy\": "; num(r.psnr_noisy);
+      out << ", \"psnr_mpcc\": "; num(r.psnr_mpcc);
+      out << ", \"psnr_rof\": "; num(r.psnr_rof);
+      out << "}" << (i + 1 < rows.size() ? "," : "") << "\n";
+   }
+   out << "  ]\n}\n";
 }
 
 static void self_check(MpccDatasetTNLP& p, const std::vector<int>& owner,
@@ -245,8 +371,9 @@ static void self_check(MpccDatasetTNLP& p, const std::vector<int>& owner,
 }
 
 int main(int argc, char** argv) {
+   const auto t_start = std::chrono::steady_clock::now();
    std::string data, val_data, solver = "ma57", init = "cp";
-   std::string save_sol, save_dd, save_manifest;
+   std::string save_sol, save_val_sol, save_dd, save_manifest, save_report;
    std::string interface_solver = "direct", precond = "asd";
    std::string wk_backend = "ma57";
    double t0 = 1.0, tmin = 1e-4, factor = 0.85, tol = 1e-8, c_theta = 1.0;
@@ -326,6 +453,8 @@ int main(int argc, char** argv) {
       // ---- output ----
       else if (a == "--self-check")  check = true;
       else if (a == "--save-solution") save_sol = next();
+      else if (a == "--save-val-solution") save_val_sol = next();
+      else if (a == "--save-report") save_report = next();
       else if (a == "--save-dd")  save_dd = next();
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
@@ -351,7 +480,18 @@ int main(int argc, char** argv) {
          "    --val-data <spec>   held-out source (default: the same listing, the\n"
          "                        V entries after the training slice)\n"
          "    --val-limit V       evaluate alpha* on V held-out pairs (default 0)\n"
-         "    --save-manifest F   CSV of exactly what was loaded\n"
+         "    --save-manifest F   CSV of exactly what was loaded (provenance)\n"
+         "\n"
+         "  output:\n"
+         "    --save-report F.json     machine-readable run record: run-level\n"
+         "                             scalars + one row per pair (train AND\n"
+         "                             held-out). Read by python/plot_dataset.py.\n"
+         "                             The tag is the basename minus report_/.json.\n"
+         "    --save-solution PREFIX   one file per TRAINING pair, PREFIX_s000.txt..,\n"
+         "                             each in dd_solve_2d's format (plot_slurm.py\n"
+         "                             reads them unchanged)\n"
+         "    --save-val-solution PRE  the same for HELD-OUT pairs, PRE_v000.txt..,\n"
+         "                             carrying the lower level solved at Q(alpha*)\n"
          "\n"
          "  decomposition:\n"
          "    --solver dd --nsub 1   ONE subdomain per training pair; the border is\n"
@@ -725,6 +865,8 @@ int main(int argc, char** argv) {
    std::cout << "\n  per-pair PSNR (dB):\n";
    std::cout << "                                        noisy    MPCC u_s   "
                 "ROF at Q(a*)\n";
+   std::vector<PairRow> rows;
+   rows.reserve(train.size() + val.size());
    double sn = 0, sm = 0, sr = 0;
    for (int s = 0; s < mpcc->S_; ++s) {
       const double pm = driver::psnr(train[s].uclean,
@@ -732,6 +874,8 @@ int main(int argc, char** argv) {
                                      mpcc->m_u);
       const double pr = driver::psnr(train[s].uclean, rec_tr[s].data(), mpcc->m_u);
       sn += train[s].psnr_noisy; sm += pm; sr += pr;
+      rows.push_back({"train", s, train[s].index, train[s].path, train[s].seed,
+                      train[s].psnr_noisy, pr, pm});
       std::string nm = train[s].path;
       const size_t k = nm.find_last_of('/');
       if (k != std::string::npos) nm = nm.substr(k + 1);
@@ -751,6 +895,9 @@ int main(int argc, char** argv) {
       for (size_t s = 0; s < val.size(); ++s) {
          const double pr = driver::psnr(val[s].uclean, rec_val[s].data(), mpcc->m_u);
          vn += val[s].psnr_noisy; vr += pr;
+         rows.push_back({"val", (int)s, val[s].index, val[s].path, val[s].seed,
+                         val[s].psnr_noisy, pr,
+                         std::numeric_limits<double>::quiet_NaN()});
          std::string nm = val[s].path;
          const size_t k = nm.find_last_of('/');
          if (k != std::string::npos) nm = nm.substr(k + 1);
@@ -774,6 +921,27 @@ int main(int argc, char** argv) {
    if (solver == "dd" && interface_solver == "minres")
       driver::print_minres_stats(cg_tol, minres_lag);
 
+   if (!save_report.empty()) {
+      // The tag is the report's own basename minus the "report_" prefix and
+      // ".json", so the SLURM script names the run once and the sweep tooling
+      // joins report <-> timings.csv on it without another CLI flag to keep in
+      // sync.
+      std::string tag = save_report;
+      const size_t sl = tag.find_last_of('/');
+      if (sl != std::string::npos) tag = tag.substr(sl + 1);
+      if (image_io::ends_with(tag, ".json")) tag = tag.substr(0, tag.size() - 5);
+      if (tag.rfind("report_", 0) == 0) tag = tag.substr(7);
+      int p_border = 0;
+      for (int i = 0; i < mpcc->kkt_dim; ++i) if (owner[i] < 0) ++p_border;
+      const double wall =
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start)
+            .count();
+      write_report_json(save_report, tag, *mpcc, res, rows, nsub, n_sub, p_border,
+                        n_promoted, solver, partition, loss, hessian, t_update,
+                        interface_solver, seed, wall);
+      std::cout << "  wrote " << save_report << "  (machine-readable run report)\n";
+   }
+
    if (!save_sol.empty()) {
       // One file per pair, each in dd_solve_2d's format — python/plot_slurm.py
       // reads them unchanged.
@@ -789,6 +957,28 @@ int main(int argc, char** argv) {
                 << std::setfill('0') << std::setw(3) << (mpcc->S_ - 1)
                 << std::setfill(' ') << ".txt  (" << mpcc->S_
                 << " per-pair solutions, plot_slurm.py format)\n";
+   }
+
+   if (!save_val_sol.empty() && !val.empty()) {
+      // Held-out pairs in the SAME format, with the lower level at Q(α*) in the
+      // u slot — see MpccDatasetTNLP::rof_lift. Suffixed _v%03d so they can sit
+      // in the same directory as the training _s%03d files without collision.
+      std::string pre = save_val_sol;
+      if (image_io::ends_with(pre, ".txt")) pre = pre.substr(0, pre.size() - 4);
+      for (size_t s = 0; s < val.size(); ++s) {
+         std::vector<double> xs;
+         mpcc->rof_lift(lam, alpha, val[s].f.data(), xs);
+         char suf[32];
+         std::snprintf(suf, sizeof suf, "_v%03d.txt", (int)s);
+         write_solution_file(pre + suf, *mpcc, res.hist, xs, val[s].uclean.data(),
+                             val[s].f.data(), res.best_t, nsub);
+      }
+      std::cout << "  wrote " << pre << "_v000.txt .. " << pre << "_v"
+                << std::setfill('0') << std::setw(3) << (val.size() - 1)
+                << std::setfill(' ') << ".txt  (" << val.size()
+                << " held-out pairs, lower level at Q(a*))\n";
+   } else if (!save_val_sol.empty()) {
+      std::cerr << "  --save-val-solution: nothing to write (--val-limit is 0)\n";
    }
    if (!save_dd.empty())
       std::cout << "  wrote " << save_dd

@@ -13,6 +13,9 @@ its output. The solving itself is done in C++; these scripts need no IPOPT.
 | `dump_data_1d.py` | write the **staggered 1D** instance (data + CP warm start + owner map) for `dd_solve_1d` |
 | `dump_data_2d.py` | write the **staggered 2D** instance for `dd_solve_2d` |
 | `plot_slurm.py`   | publication figures from a SLURM result directory of `dd_solve_2d --save-solution` files (self-contained: only numpy + matplotlib) |
+| `plot_dataset.py` | figures and a booktabs table for **dataset** runs (`dd_solve_dataset`): per-pair gain, contact sheet, and cross-run scaling. Reuses `plot_slurm.py`'s decoder by import |
+| `plot_style.py`   | shared figure style: `screen` (200-dpi PNG) and `paper` (two-column PDF) presets, Okabe–Ito palette, figure sizing helpers |
+| `aggregate_runs.py` | read the `timings.csv` a sweep writes into one tidy table — works for the **1D and 2D sweeps too**, not just dataset runs |
 
 `mpcc_utils.py` is a self-contained extraction; the full reference solvers
 (IPOPT continuation driver, certificate, and the multi-panel probe/arrowhead
@@ -103,6 +106,47 @@ the self-contained `dd_solve_2d --save-solution` files a batch run produces:
 ```bash
 uv run python plot_slurm.py ../results/slurm_<id>      # one PNG set per solution in the dir
 ```
+
+### Dataset runs
+
+A dataset run learns ONE α across S training pairs, so its interesting
+quantities are **across** pairs. `plot_slurm.py` still answers "what did this
+image look like", but as the primary report it is the wrong unit of analysis:
+7×S files, of which S are byte-identical continuation plots (the level history
+and μ-trace describe the one shared solve), each panel scaled per-file so a
+montage invites the wrong comparison. `plot_dataset.py` works from the run's
+`--save-report` JSON instead:
+
+```bash
+# one run: per-pair gain, contact sheet, and ONE continuation figure
+uv run python plot_dataset.py --run ../results/slurm_<id>/reports/report_<tag>.json \
+    --sols ../results/slurm_<id>/sols --format both
+
+# many runs: scaling, DD-vs-monolithic, and tab_dataset.tex
+uv run python plot_dataset.py --sweep ../results/slurm_<id> --format both
+
+# the timings.csv reader — also works on existing 1D/2D sweeps
+uv run python aggregate_runs.py ../results/slurm_<id> -o runs.csv
+uv run python aggregate_runs.py ../results            # every slurm_* under it
+```
+
+Three things worth knowing:
+
+- `<tag>_gain` is the headline. A dumbbell per pair from noisy PSNR to the PSNR
+  at the learned α, sorted by gain, training filled and held-out hollow. The
+  mean is not the story — the SPREAD is (measured on Kodak N=32: +8.21 dB on
+  one image, +2.16 dB on another, from the same α).
+- `<tag>_contact` computes its gray range and its error limit over **all**
+  displayed pairs, unlike `plot_slurm.py`'s per-file scaling, and selects from
+  both roles proportionally so `--max-pairs` never drops the entire held-out
+  half. Anything omitted is listed, never dropped silently.
+- `dd_vs_mono`'s right panel is a correctness check drawn as a figure: every
+  solver must land on the same α*, so visible separation is a bug. It prints the
+  max relative spread (measured 1.0e-09 across ma57 / DD / DD+tiles at four S).
+
+`plot_slurm.py` is deliberately **not** ported onto `plot_style.py` — its
+figures are recorded output, and restyling it would silently change every
+figure already in `results/`.
 
 ## The bundled test images
 

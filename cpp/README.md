@@ -611,9 +611,21 @@ case is what this decomposition is for, and it is untested.
 (gap **0.14 dB**, 6 held out). More training pairs, less overfitting — which is
 the whole reason for learning α on a set rather than one picture.
 
-`--save-solution PREFIX` writes ONE file per pair, `PREFIX_s000.txt` …, each in
-`dd_solve_2d`'s exact format, so `../python/plot_slurm.py` renders them with no
-changes at all (drop them in a `sols/` dir named `sol_<tag>_s%03d.txt`).
+### Reporting a dataset run
+
+Three outputs, because a run's results are read three different ways:
+
+| flag | what it writes |
+|---|---|
+| `--save-report F.json` | the machine-readable run record — run-level scalars plus one row per pair, **training and held-out**. `psnr_mpcc` is `null` on held-out rows: they were never in the optimization, and writing 0 or repeating the ROF value there would be a lie a plot would faithfully render. The tag is the basename minus `report_`/`.json`, so the sweep tooling joins report ↔ `timings.csv` without another flag to keep in sync. |
+| `--save-solution PREFIX` | one file per TRAINING pair, `PREFIX_s000.txt` …, each in `dd_solve_2d`'s exact format, so `../python/plot_slurm.py` renders them with no changes at all |
+| `--save-val-solution PRE` | the same for HELD-OUT pairs, `PRE_v000.txt` …, carrying the lower level solved at `Q(α*)` — that ROF problem *is* what the learned weight means for an unseen image, so it is the honest held-out record rather than a block of zeros. Lifted by the same rule as the warm start (θ from the dual), so the δ / index-set / residual panels stay meaningful. |
+
+`../python/plot_dataset.py` reads the report and produces the run-level figures
+(per-pair gain, a shared-scale contact sheet, ONE continuation plot) plus the
+cross-run scaling figures and a booktabs table; `../python/aggregate_runs.py`
+turns a sweep's `timings.csv` into a tidy table. `../slurm/run_dataset.slurm`
+runs the S × solver sweep. See `../python/README.md`.
 
 ## Layout
 

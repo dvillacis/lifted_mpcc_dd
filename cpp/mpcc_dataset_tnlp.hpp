@@ -409,6 +409,36 @@ public:
       }
    }
 
+   // The same lower-level solve, LIFTED into the single-sample MPCC layout
+   // [u | qx | qy | r | δ | θ | α] — the shape --save-solution writes and
+   // plot_slurm.py reads. Used to dump HELD-OUT pairs: they have no MPCC
+   // iterate of their own, but the lower level at Q(α*) is exactly what the
+   // learned weight means for an unseen image, so recording that is the honest
+   // held-out record rather than a block of zeros. The lifting rule is
+   // cp_start's (θ from the DUAL, δ = |q|, r = |∇u|), so the δ/index-set/
+   // residual panels stay meaningful.
+   //
+   // Runs CP a second time for a pair already passed through rof_reconstruct;
+   // it is opt-in and milliseconds at these sizes, and keeping the two apart is
+   // worth more than the saving.
+   void rof_lift(double lam, double alpha_val, const double* fs,
+                 std::vector<double>& xs) const {
+      std::vector<double> u, qx, qy, gx, gy;
+      chambolle_pock(lam, fs, u, qx, qy);
+      applyK(Kx_, u.data(), m_q, gx);
+      applyK(Ky_, u.data(), m_q, gy);
+      xs.assign((size_t)m_u + 5 * m_q + 1, 0.0);
+      for (int i = 0; i < m_u; ++i) xs[i] = u[i];
+      for (int e = 0; e < m_q; ++e) {
+         xs[m_u + 0 * m_q + e] = qx[e];
+         xs[m_u + 1 * m_q + e] = qy[e];
+         xs[m_u + 2 * m_q + e] = std::hypot(gx[e], gy[e]);
+         xs[m_u + 3 * m_q + e] = std::hypot(qx[e], qy[e]);
+         xs[m_u + 4 * m_q + e] = std::atan2(qy[e], qx[e]);
+      }
+      xs[m_u + 5 * m_q] = alpha_val;
+   }
+
    // ---- evaluation --------------------------------------------------------
    bool eval_g(Index, const Number* x, bool, Index, Number* g) override {
       const double Qa = Q(x[oa]);
