@@ -6,7 +6,21 @@
 #   sbatch slurm/run_2d_N512.slurm              # from anywhere in the checkout
 #   PILOT=1  sbatch slurm/run_2d_N512.slurm     # 12 Newton steps, sizing probe
 #   KS="16"  sbatch slurm/run_2d_N512.slurm     # one nsub instead of the bracket
-#   NOREF=1  sbatch slurm/run_2d_N512.slurm     # skip the monolithic baseline
+#   BARRIER_TOL=2000     sbatch ...             # raise the mu-advance gate (DD_BARRIER_TOL)
+#   MU_STRATEGY=adaptive sbatch ...             # gate-free mu oracle (DD_MU_STRATEGY)
+#
+# DD ONLY (2026-08-20): the monolithic ma57 baseline was removed from this
+# script — at this size it is a separate, memory-heavy experiment that deserves
+# its own job if ever wanted. This script measures the DD route.
+#
+# BARRIER ADVANCE. Monotone mu only cuts once E_mu <= f*mu, and the gate is a
+# max-norm over an O(N^2) degenerate set, so the stall scales with N (measured:
+# N=1024 plateaued 62x above the default f=10 gate for 200+ its; the N=128
+# A/B/C in cpp/README.md: 610 its at f=10 vs 131 at f=1000, same solution).
+# Default here is the measured fix f=1000. If a plateau still appears (inf_du
+# flat at fixed lg(mu) with inf_pr tiny), the log names the needed value:
+# f ~ 3x max(inf_du/mu) over the plateau. MU_STRATEGY=adaptive removes the
+# gate entirely (measured: same answer, rougher path).
 #
 # WHY N=512 IS THE CHEAP ONE: images/cameraman.png is natively 512x512, so this
 # runs at the source resolution with NO resampling. Every smaller size in the
@@ -29,8 +43,7 @@
 # MEMORY. The driver is the interface matrix: nnz(S) ~ 60 N^2, i.e. ~16M entries
 # here, INDEPENDENT of nsub (per-tile cliques shrink exactly as their count
 # grows). Its factor is a multiple of that. 64G is a guess with headroom —
-# CHECK IT against the node spec, and against the monolithic baseline, which
-# needs far more than the DD route by construction.
+# CHECK IT against the node spec.
 #
 #SBATCH --job-name=mpcc_dd2d_N512
 #SBATCH --output=%x_%j.out
@@ -50,7 +63,10 @@ KS="${KS:-12 16 24}"                            # nsub bracket around the modell
 BIN=./dd_solve_2d
 # (IMG/IMGTAG resolved below, after the repo root is known)
 PILOT="${PILOT:-0}"                             # 1 = short run to validate the sizing
-NOREF="${NOREF:-0}"                             # 1 = skip the monolithic ma57 baseline
+BARRIER_TOL="${BARRIER_TOL:-1000}"              # mu-advance gate f (DD_BARRIER_TOL); 10 = IPOPT default
+MU_STRATEGY="${MU_STRATEGY:-}"                  # empty = monotone (default); "adaptive" = gate-free
+export DD_BARRIER_TOL="$BARRIER_TOL"
+[ -n "$MU_STRATEGY" ] && export DD_MU_STRATEGY="$MU_STRATEGY"
 EXTRA=()
 [ "$PILOT" = "1" ] && EXTRA+=(--max-iter 12)
 
@@ -116,17 +132,6 @@ print(f"source image {p}: {w}x{h}  -> N={n} "
       f"({'native, no resampling' if min(w,h)==n else 'area-downsampled'})")
 EOF
 
-# IPOPT's own --solver ma57 dlopen()s MA57 at runtime (the DD binaries link it
-# via rpath and are unaffected). Warn, don't abort.
-if [ "$NOREF" != "1" ]; then
-  _found=""
-  for _c in "$HSLLIB" "$HSLDIR/lib/libhsl_ma57.so" "$HOME/.local/hsl-ma57/lib/libhsl_ma57.so"; do
-    [ -n "$_c" ] && [ -f "$_c" ] && { _found="$_c"; break; }
-  done
-  [ -n "$_found" ] && echo "MA57 for the monolithic baseline: $_found" \
-    || echo "warning: no libhsl_ma57.so found — the --solver ma57 baseline will fail (DD runs unaffected)"
-fi
-
 # --- timing ------------------------------------------------------------------
 # $SECONDS is integer and wall-only. At this size three numbers matter: WALL
 # (what you wait), CPU (with 44 threads this is far larger — their ratio is the
@@ -171,7 +176,7 @@ RUN="$(cd .. && pwd)/results/slurm_${SLURM_JOB_ID}"
 mkdir -p "$RUN/logs" "$RUN/sols" "$RUN/plots"
 TIMINGS="$RUN/timings.csv"
 echo "tag,solver,wall_s,cpu_s,maxrss_MB,exit" > "$TIMINGS"
-echo "🚀 N=$N  nsub in [$KS]  threads=$OMP_NUM_THREADS  pilot=$PILOT  $(date)"
+echo "🚀 N=$N  nsub in [$KS]  threads=$OMP_NUM_THREADS  pilot=$PILOT  barrier_tol=$DD_BARRIER_TOL  mu=${DD_MU_STRATEGY:-monotone}  $(date)"
 echo "   results -> $RUN"
 
 # --- 3. Runs -----------------------------------------------------------------
@@ -189,18 +194,13 @@ for k in $KS; do
       >> "$RUN/logs/plots.log" 2>&1 \
     && echo "  plot k=$k  -> $RUN/plots" \
     || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
-
-  if [ "$NOREF" != "1" ]; then
-    run_timed "$tag" ma57 "$RUN/logs/${tag}_ma57.log" -- \
-        $BIN "${common[@]}" --solver ma57
-    break   # the baseline does not depend on nsub — run it once
-  fi
 done
 
 # --- 4. Summary + plots ------------------------------------------------------
 {
   echo "job $SLURM_JOB_ID  node $(hostname)  $(date)"
   echo "N=$N  KS=$KS  threads=$OMP_NUM_THREADS  pilot=$PILOT  image=$IMG"
+  echo "barrier_tol_factor=$DD_BARRIER_TOL  mu_strategy=${DD_MU_STRATEGY:-monotone}"
   for f in "$RUN"/logs/*_N*.log; do
     echo; echo "===== $(basename "$f") ====="; tail -n 20 "$f"
   done
