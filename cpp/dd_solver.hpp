@@ -155,6 +155,11 @@ public:
    using SpMat = Eigen::SparseMatrix<double>;
    using Trip = Eigen::Triplet<double>;
 
+   // One solver instance serves the whole process (see CustomSolverBuilder), so
+   // destruction is the end of the run — the only place a whole-run singular
+   // block census can be reported from.
+   ~DDArrowheadSolver() override { report_singular_stats(); }
+
    // The driver sets the geometry before OptimizeNLP (IPOPT options cannot carry
    // it). Static because AlgorithmBuilder constructs the solver itself.
    static void config(int N, int nsub) { cfgN() = N; cfgK() = nsub; cfgOwner().clear(); }
@@ -411,6 +416,13 @@ public:
       schur_valid_ = false;    // new level ⇒ the cached S_k blocks are void
       schur_age_ = 0;
       schur_force_ = false;
+      // Singular-block census. One env lookup per structure, not per
+      // factorization; the counters themselves persist across levels because a
+      // single solver instance serves the whole run (see CustomSolverBuilder).
+      sing_stats_ = std::getenv("DD_SINGULAR_STATS") != nullptr;
+      sing_probe_ = std::getenv("DD_SINGULAR_PROBE") != nullptr;
+      if (sing_probe_) sing_stats_ = true;   // the probe is useless without the census
+      if ((int)sing_by_block_.size() < nsub_) sing_by_block_.assign(nsub_, 0);
       peel_.clear();
       n_peel_dual_ = 0;
       if (iface_ == IFACE_CG) {
@@ -462,7 +474,14 @@ public:
             ESymSolverStatus st = factorize();
             if (st != SYMSOLVER_SUCCESS) return st;
          }
-         if (nneg_ != numberOfNegEVals) return SYMSOLVER_WRONG_INERTIA;
+         if (nneg_ != numberOfNegEVals) {
+            // Genuine curvature correction: In(A) is right, it is just not the
+            // inertia IPOPT needs, so δ_w is the CORRECT cure. Counted apart
+            // from the singular returns because no block-level repair can
+            // address it — the two together are what facts/it is made of.
+            ++n_ret_wrong_inertia_;
+            return SYMSOLVER_WRONG_INERTIA;
+         }
       }
       // #7 (perf audit): one env lookup per process, not two per RHS.
       static const bool dd_check = std::getenv("DD_CHECK") != nullptr;
@@ -478,7 +497,7 @@ public:
          // A false return means the residual never came back finite (a W_k
          // back-solve overflowed) — b holds no usable step, so report
          // SINGULAR and let IPOPT bump δ_w rather than accept garbage.
-         if (!solve_refined(b)) return SYMSOLVER_SINGULAR;
+         if (!solve_refined(b)) { ++n_ret_sing_refine_; return SYMSOLVER_SINGULAR; }
          if (dd_check) check_solve(saved, b);
       }
       return SYMSOLVER_SUCCESS;
@@ -570,27 +589,98 @@ private:
    // matrix, and the distributed inertia against the reference's. Small N only —
    // this is the "does the decomposition reproduce the monolithic Newton step"
    // gate, the C++ twin of ../dd_probe.py's rel-err column.
-   void check_solve(const std::vector<double>& rhs, const Number* got) {
-      // Reference = MA57 on the WHOLE matrix. Deliberately not an Eigen dense
-      // factorization: Eigen::LDLT is a pivoted Cholesky for semi-definite
-      // matrices, not Bunch–Kaufman, and on these indefinite KKTs it reported
-      // 485–491 negative pivots where the true count was 512. A wrong reference
-      // is worse than no reference.
+   // Factorize the WHOLE KKT with MA57, as the reference both DD_CHECK and the
+   // DD_SINGULAR_PROBE census compare against. Deliberately not an Eigen dense
+   // factorization: Eigen::LDLT is a pivoted Cholesky for semi-definite
+   // matrices, not Bunch–Kaufman, and on these indefinite KKTs it reported
+   // 485–491 negative pivots where the true count was 512. A wrong reference
+   // is worse than no reference. The symbolic analysis is kept across calls;
+   // only the values change. Returns false if analysis or factorization failed,
+   // in which case ref_ma57_ must not be read.
+   bool factor_reference(const char* tag) {
       if (!ref_ma57_) {
          std::vector<int> irn(nnz_), jcn(nnz_);
          for (Index t = 0; t < nnz_; ++t) { irn[t] = irow_[t] + 1; jcn[t] = jcol_[t] + 1; }
          ref_ma57_.reset(new SymBlock());
          if (!ref_ma57_->analyze(dim_, irn, jcn)) {
-            std::cerr << "[dd-check] reference full-matrix analysis failed\n";
+            std::cerr << tag << " reference full-matrix analysis failed\n";
             ref_ma57_.reset();
-            return;
+            return false;
          }
       }
       std::copy(vals_.begin(), vals_.end(), ref_ma57_->values());
+      // MA57 keeps INFO(25) = rank even when it continues through a null pivot,
+      // so a `false` here is a hard failure, not a rank deficiency — the
+      // deficiency case still returns true and is read off rank() below.
       if (!ref_ma57_->factorize()) {
-         std::cerr << "[dd-check] reference full-matrix factorization failed\n";
+         std::cerr << tag << " reference full-matrix factorization failed\n";
+         return false;
+      }
+      return true;
+   }
+
+   // DD_SINGULAR_PROBE: the discriminator this whole census exists for. When a
+   // W_k comes back rank-deficient, is the FULL matrix deficient too?
+   //   LOCAL  — A is full rank: the deficiency is an artefact of the partition.
+   //            This is the case a locally modified W̃_k could repair, because
+   //            In(A) is well defined and only Haynsworth's route to it is
+   //            blocked.
+   //   GLOBAL — A is deficient as well: SYMSOLVER_SINGULAR is the truthful
+   //            answer and IPOPT's δ_w is the correct cure.
+   // Expensive (a full-matrix factorization), so it fires only on singular
+   // events and only under the flag. Purely diagnostic — it reads vals_ and
+   // touches nothing the solve or the inertia depends on.
+   void probe_full_rank(int first_bad_k, int nbad, int deficit) {
+      if (!factor_reference("[dd-sing]")) { ++sing_probe_fail_; return; }
+      const int rank = ref_ma57_->rank();
+      const bool local = (rank >= (int)dim_);
+      if (local) ++sing_local_; else ++sing_global_;
+      std::cerr << "[dd-sing] fact=" << n_fact_ << " blocks=" << nbad
+                << " first_k=" << first_bad_k << " deficit=" << deficit
+                << "  A: rank=" << rank << "/" << dim_
+                << " nneg=" << ref_ma57_->negative_eigenvalues()
+                << (local ? "  → LOCAL\n" : "  → GLOBAL\n");
+   }
+
+   // Whole-run census, printed once from the destructor.
+   void report_singular_stats() const {
+      if (!sing_stats_ || n_fact_attempt_ == 0) return;
+      const long att = n_fact_attempt_;
+      const long retries = n_ret_sing_block_ + n_ret_sing_S_ + n_ret_sing_backsolve_
+                         + n_ret_sing_refine_ + n_ret_wrong_inertia_;
+      auto pct = [att](long v) { return 100.0 * (double)v / (double)att; };
+      std::cerr << "[dd-sing] SUMMARY  factorization attempts=" << att
+                << "  completed=" << n_fact_ << "  rejected=" << retries << "\n"
+                << "[dd-sing]   SINGULAR(block)=" << n_ret_sing_block_
+                << " (" << pct(n_ret_sing_block_) << "%)"
+                << "  SINGULAR(S)=" << n_ret_sing_S_
+                << "  SINGULAR(backsolve)=" << n_ret_sing_backsolve_
+                << "  SINGULAR(refine)=" << n_ret_sing_refine_ << "\n"
+                << "[dd-sing]   WRONG_INERTIA=" << n_ret_wrong_inertia_
+                << " (" << pct(n_ret_wrong_inertia_) << "%)"
+                << "   <- delta_w is the CORRECT cure for these; no block-level"
+                   " repair can touch them\n";
+      if (sing_events_ == 0) {
+         std::cerr << "[dd-sing]   no singular-block events\n";
          return;
       }
+      std::cerr << "[dd-sing]   singular blocks=" << sing_blocks_
+                << "  total rank deficit=" << sing_deficit_
+                << "  blocks/event=" << ((double)sing_blocks_ / (double)sing_events_)
+                << "\n";
+      if (sing_probe_)
+         std::cerr << "[dd-sing]   LOCAL=" << sing_local_
+                   << "  GLOBAL=" << sing_global_
+                   << "  probe-failed=" << sing_probe_fail_
+                   << "   (LOCAL = full matrix was full rank = repairable)\n";
+      std::cerr << "[dd-sing]   by block:";
+      for (size_t k = 0; k < sing_by_block_.size(); ++k)
+         if (sing_by_block_[k]) std::cerr << " k" << k << "=" << sing_by_block_[k];
+      std::cerr << "\n";
+   }
+
+   void check_solve(const std::vector<double>& rhs, const Number* got) {
+      if (!factor_reference("[dd-check]")) return;
       std::vector<double> ref = rhs;
       ref_ma57_->solve(ref.data(), 1);
 
@@ -611,11 +701,16 @@ private:
       for (Index i = 0; i < dim_; ++i)
          refres += (Ar[i] - rhs[i]) * (Ar[i] - rhs[i]);
       const int ref_neg = ref_ma57_->negative_eigenvalues();
+      // rank(A) too: an inertia MISMATCH means something very different when the
+      // reference itself is rank-deficient (In(A) is then not well defined and
+      // no decomposition could have reproduced it) than when A is full rank.
+      const int ref_rank = ref_ma57_->rank();
       std::cerr << "[dd-check] rel-err " << std::sqrt(dn / std::max(rn, 1e-300))
                 << "  rel-res " << std::sqrt(resn / std::max(bn, 1e-300))
                 << "  (ref " << std::sqrt(refres / std::max(bn, 1e-300)) << ")"
                 << "  inertia dd=" << nneg_ << " ref(full)=" << ref_neg
-                << (nneg_ == ref_neg ? "  MATCH" : "  MISMATCH") << "\n";
+                << (nneg_ == ref_neg ? "  MATCH" : "  MISMATCH")
+                << "  rank(A)=" << ref_rank << "/" << dim_ << "\n";
    }
 
    // ---- geometry ---------------------------------------------------------
@@ -1068,6 +1163,7 @@ private:
    // ---- assemble + factorize --------------------------------------------
    ESymSolverStatus factorize() {
       const int K = nsub_;
+      ++n_fact_attempt_;      // every ATTEMPT; n_fact_ counts only the ones that finish
       pc_valid_ = false;      // S changes ⇒ rebuild the CG preconditioner/peel cache
       cg_dead_ = false;       // …and give CG a fresh chance on the new operator
       const auto tic0 = std::chrono::steady_clock::now();
@@ -1171,6 +1267,31 @@ private:
       const auto tic1 = std::chrono::steady_clock::now();
       t_factor_ += std::chrono::duration<double>(tic1 - tic0).count();
 
+      // ---- singular-block census (DD_SINGULAR_STATS, DD_SINGULAR_PROBE) -----
+      // Diagnostic ONLY, and deliberately a separate pass: the loop below still
+      // returns from the FIRST bad block exactly as it always has, so nneg_ is
+      // left partial in the same way and no return value moves. This pass exists
+      // because that early return means we cannot otherwise tell whether one
+      // block failed or all of them did. Off by default; costs one extra sweep
+      // over K flags when on.
+      if (sing_stats_) {
+         int nbad = 0, deficit = 0, first_bad = -1;
+         for (int k = 0; k < K; ++k) {
+            if (ok[k] || wk_resource_failure(k)) continue;   // OOM is not a singularity
+            if (first_bad < 0) first_bad = k;
+            ++nbad;
+            deficit += dimk_[k] - wk_rank(k);
+            if ((int)sing_by_block_.size() < K) sing_by_block_.assign(K, 0);
+            ++sing_by_block_[k];
+         }
+         if (nbad) {
+            ++sing_events_;
+            sing_blocks_ += nbad;
+            sing_deficit_ += deficit;
+            if (sing_probe_) probe_full_rank(first_bad, nbad, deficit);
+         }
+      }
+
       for (int k = 0; k < K; ++k) {
          if (!ok[k]) {
             // OOM/workspace exhaustion is NOT a singularity: reporting it as
@@ -1187,6 +1308,7 @@ private:
                std::cerr << "[dd] W_" << k << " block status=" << wk_status(k)
                          << " rank=" << wk_rank(k) << "/" << dimk_[k]
                          << " → SINGULAR\n";
+            ++n_ret_sing_block_;
             return SYMSOLVER_SINGULAR;       // IPOPT responds by bumping δ_w
          }
          nneg_ += wk_neg(k);
@@ -1307,6 +1429,7 @@ private:
          if (ma57_[k]->solve_failed()) {
             std::cerr << "[dd] W_" << k << " backsolve failed during S_k "
                          "formation — discarding this factorization\n";
+            ++n_ret_sing_backsolve_;
             return SYMSOLVER_SINGULAR;
          }
       }
@@ -1371,6 +1494,7 @@ private:
             std::cerr << "[dd] S block status=" << s_ma57_->status()
                       << " rank=" << s_ma57_->rank() << "/" << p_
                       << " → SINGULAR\n";
+         ++n_ret_sing_S_;
          return SYMSOLVER_SINGULAR;
       }
       if (iface_ == IFACE_CG && cg_apply_ == APPLY_MATFREE) {
@@ -2310,6 +2434,29 @@ private:
    std::unique_ptr<SymBlock> ref_ma57_;     // DD_CHECK reference only
    double t_factor_ = 0, t_schur_ = 0, t_scatter_ = 0, t_sfact_ = 0, t_solve_ = 0;
    long n_fact_ = 0;
+
+   // ---- return-code census (DD_SINGULAR_STATS) ----------------------------
+   // facts/it is the metric this solver's δ_w overhead is judged by, but it
+   // conflates two unrelated causes: a SINGULAR return (a block or S could not
+   // be factorized) and a WRONG_INERTIA return (everything factorized fine, the
+   // inertia is simply not the one IPOPT wants). Only the former is a
+   // decomposition artefact; the latter is IPOPT working as designed. Counted
+   // separately so the two are never credited to each other.
+   long n_fact_attempt_ = 0;
+   long n_ret_sing_block_ = 0, n_ret_sing_S_ = 0, n_ret_sing_backsolve_ = 0;
+   long n_ret_sing_refine_ = 0, n_ret_wrong_inertia_ = 0;
+
+   // ---- singular-block telemetry (DD_SINGULAR_STATS / DD_SINGULAR_PROBE) ----
+   // Diagnostic only: nothing here influences a return value, a factorization or
+   // a step. See the note at the singular-block return in factorize().
+   bool sing_stats_ = false, sing_probe_ = false;
+   long sing_events_ = 0;        // factorizations that hit >=1 singular block
+   long sing_blocks_ = 0;        // singular blocks, summed over those events
+   long sing_deficit_ = 0;       // rank deficit, summed over those blocks
+   long sing_local_ = 0;         // events where the FULL matrix was full rank
+   long sing_global_ = 0;        // events where the FULL matrix was deficient too
+   long sing_probe_fail_ = 0;    // events where the probe itself failed
+   std::vector<long> sing_by_block_;
 };
 
 // ---------------------------------------------------------------------------

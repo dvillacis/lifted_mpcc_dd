@@ -842,6 +842,8 @@ part of this archival package.
 | `DD_HESSIAN=` | overrides `--hessian` (`exact` / `limited-memory`) |
 | `DD_MU_STRATEGY=` | IPOPT `mu_strategy`, default `monotone`; `adaptive` drops the fixed μ-decrease gate |
 | `DD_BARRIER_TOL=f` | IPOPT `barrier_tol_factor`, default 10 — raise it when monotone μ will not advance (at N=1024 a plateau at 62× the gate cleared immediately at f=1000) |
+| `DD_SINGULAR_STATS=1` | per-run census of factorization attempts by return code (`SINGULAR` by cause vs `WRONG_INERTIA`) plus singular blocks per subdomain |
+| `DD_SINGULAR_PROBE=1` | on each singular-block event only, factorize the FULL matrix and report `rank(A)` — `LOCAL` (A full rank, a partition artefact) vs `GLOBAL` (A deficient too). Implies `DD_SINGULAR_STATS` |
 | `DD_MA57_SCALING=1` | re-enable MC64 scaling (same as `--ma57-scaling on`) |
 | `DD_MA57_ICNTL13=n` | override MA57's BLAS2/BLAS3 multi-RHS threshold |
 | `DD_MA57_ICNTL6=n` | MA57 pivot ordering (2=AMD, 4=METIS, default 5=auto) — see the METIS note |
@@ -997,6 +999,66 @@ Kept here so they are not re-attempted:
 - **MUMPS partial-factorization Schur is a wash** here (4.95 s vs 5.01 s).
 - **CG / MINRES interface**: neutral to worse at these sizes; `--cg-apply matfree`
   is ~3× worse, as its comment already says.
+- **A locally modified `W̃_k` (Zavala–Laird–Biegler) has nothing to repair here
+  — the δ_w overhead is `WRONG_INERTIA`, not `SINGULAR`** (measured 2026-08-20,
+  `DD_SINGULAR_STATS` / `DD_SINGULAR_PROBE`, macOS/MA57, `--t-update geometric
+  --factor 0.3 --c-theta 0` unless noted).
+
+  The idea was to cure a rank-deficient `W_k` locally instead of letting IPOPT
+  bump δ_w globally and re-factorize everything. It rests on singular blocks being
+  common. They are not:
+
+  | instance | Hessian | attempts | its | facts/it | `SINGULAR(block)` | `WRONG_INERTIA` |
+  |---|---|---|---|---|---|---|
+  | cameraman N=16 k=2 | limited-memory | 2162 | 2095 | 1.03 | 0 | 0 |
+  | cameraman N=32 k=4 | limited-memory | 670 | 659 | 1.02 | 0 | 0 |
+  | cameraman N=32 k=4, `--no-promote-corners` | limited-memory | 666 | 651 | 1.02 | 0 | 3 |
+  | mariposa N=32 k=4 | limited-memory | 909 | 900 | 1.01 | **1** | 1 |
+  | cameraman N=32 k=4 | **exact** | 1235 | 686 | **1.80** | **0** | **541 (44%)** |
+  | cameraman N=32 k=4, μ-coupled | **exact** | 146 | 72 | **2.03** | **0** | **73 (50%)** |
+
+  Readings:
+
+  1. **The δ_w retry cost is real but it is entirely curvature correction.** Under
+     `--hessian exact` 44–50% of factorizations are rejected — and every single one
+     is `WRONG_INERTIA`: the blocks factorized, `S` factorized, Haynsworth
+     produced `In(A)` correctly, and IPOPT simply wanted a different inertia.
+     That is IPOPT working as designed, and **no block-level repair can touch
+     it**. `SINGULAR(block)` was zero in every exact-Hessian run.
+  2. **Under `limited-memory` there is no overhead to recover at all** (facts/it
+     1.01–1.03). L-BFGS keeps the Hessian positive definite, so the inertia is
+     never wrong. This is why the two Hessian modes differ so sharply here.
+  3. **Singular blocks are vanishingly rare**: one event in 909 factorizations
+     across all runs (mariposa, block k10, rank deficit 1, on the second
+     factorization of the run — the Chambolle–Pock cold start, where flat cells
+     put `r = δ = 0` exactly and the θ-gauge is undetermined). It never recurred.
+  4. **That one event was `LOCAL`** — `rank(A) = 16466/16466` while the block was
+     deficient. So the standing note at `dd_solver.hpp`'s block-factorization
+     loop, that what remains “is singular in the FULL matrix too”, is not
+     universally true; it is simply too rare to matter.
+  5. **`--no-promote-corners` does NOT produce MA57 rank deficiencies.** The
+     original “four `W_k` came back numerically singular (σ_min ~ 1e-16)” finding
+     was an SVD of dumped blocks; MA57's threshold pivoting factorizes those
+     blocks and reports full rank, so they never reach the `SINGULAR` path.
+     Border promotion's measured benefit is conditioning, not rank as MA57 sees it.
+  6. **The `--c-theta` table above (“2.12 / 2.30 facts/it”) does not reproduce.**
+     mariposa at `--c-theta 0` lands on the same weight (0.048549) and PSNR
+     (23.73 dB) to every printed digit, so it is the same instance and the same
+     solution — but 900 iterations and 909 factorizations, i.e. 1.01 facts/it.
+     The overhead that table describes appears under `--hessian exact`, not under
+     the driver's `limited-memory` default. Also note `--c-theta` now **defaults
+     to 1.0** in `dd_solve_2d` and `dd_solve_dataset` (0 only in `dd_solve_1d` and
+     `dd_solve`), which that section still describes as opt-in-with-default-0.
+
+  The instrumentation is kept (`DD_SINGULAR_STATS`, `DD_SINGULAR_PROBE`, both
+  default off and byte-identical when off) because it is the evidence, and
+  because it is the cheap way to re-test the premise on a new instance, a larger
+  `N`, or the dataset driver. The lever that *does* address a `WRONG_INERTIA`
+  cost is the inertia-free curvature test (`DD_NEG_CURV`), already present and
+  already measured as a loss at these sizes.
+
+  Not covered by this measurement: N ≥ 64, the dataset driver, MA97, and the deep
+  Scholtes tail where ‖A‖ ~ 1e18.
 
 ### Rebuilding MA57 against Accelerate (and the METIS trap)
 
