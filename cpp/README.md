@@ -425,6 +425,47 @@ certified. Geometric runs keep the classic per-level weight/comp panel.
 ./dd_solve_2d ... --t-mu-scale 1         # the c=1 A/B (Python: c≈1 ≈ c=10)
 ```
 
+**The barrier-advance stall scales with N, and both escape knobs clear it
+(measured 2026-08-20, mariposa N=128, 4×4 tiles, `--solver dd`, μ-coupled
+default, macOS/MA57, single-threaded).** The deadlock recorded at N=1024 (see
+`driver_common.hpp`) reproduces at N=128 on the laptop: at a fixed μ, `inf_du`
+cannot fall below ~O(μ) (the dual residual at a barrier solution IS the barrier
+perturbation), while monotone μ will not cut until
+`E_μ ≤ barrier_tol_factor·μ` — and the max-norm gate is taken over an
+O(cells) degenerate set, so the gap widens with N. Three arms, same binary,
+identical everything else:
+
+| arm | its | per-μ-level its | exit | weight | PSNR |
+|---|---|---|---|---|---|
+| monotone, default gate (factor 10) | **610** | 1 / **445** / 62 / 43 / 60 | acceptable | 0.066960 | 26.51 |
+| monotone, `DD_BARRIER_TOL=1000` | **131** | 1 / 29 / 71 | acceptable | 0.066967 | 26.51 |
+| `DD_MU_STRATEGY=adaptive` | **160** | (oracle; no levels) | acceptable | 0.066967 | 26.51 |
+
+Readings:
+
+1. The default gate spends **73% of the whole run (445/610 its) parked on its
+   first μ level**, grinding `inf_du` from ~1e2 to the gate 10μ = 0.2 at ~5%
+   per iteration. The same level took 45 its at N=64 — the stall is the
+   N-scaling of the max-norm gate, not of the linear algebra: the DD and
+   monolithic MA57 trajectories are iteration-identical at N=64, and once past
+   a gate every arm drives `inf_du` to ~6e-5 without difficulty.
+2. `DD_BARRIER_TOL=1000` is the cleanest fix at this size: **4.7× fewer
+   iterations**, smooth μ path (−1.0 → −3.8 → −8.0), same solution.
+3. `adaptive` also clears it (160 its) and lands on the byte-same weight/PSNR
+   as the f=1000 run, but its path is rough, as recorded above: two `inf_du`
+   excursions (2.3e3 at it 24, 2.5 at it 126) with μ bouncing up, then a
+   ~40-iteration polish oscillating at the tolerance. Under adaptive the
+   `t = c·μ` slave is TIGHTENING-ONLY (`mpcc_base.hpp`), so t ratchets to the
+   deepest μ excursion while μ itself bounces back up — semantics to keep in
+   mind when reading its trace.
+4. The three weights agree to 4 digits (the default-gate run stopped at
+   μ = 1e-5.7 rather than 1e-8/1e-9, hence 0.066960 vs 0.066967) — the stall
+   is bookkeeping, not a different answer.
+
+So at dataset/large-image scale the standing advice stands, now with an A/B/C
+at N=128 behind it: `DD_BARRIER_TOL=1000` first, `DD_MU_STRATEGY=adaptive` as
+the alternative when raising the gate is not enough.
+
 ## The MUMPS W_k backend (`--wk-backend mumps|hybrid`, 2026-07-25)
 
 An opt-in second backend for the subdomain blocks, attacking the measured
