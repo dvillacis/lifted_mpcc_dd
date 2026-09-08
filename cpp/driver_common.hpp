@@ -85,7 +85,10 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
   //                               to "monotone will not advance".
   //   DD_BARRIER_TOL=<f>          raise the gate. At f=1000 the N=1024 stall
   //                               above clears immediately (gate 0.15 > 0.095).
-  // Both default to the validated behaviour.
+  // Both default to the validated behaviour HERE; the 2D driver raises the
+  // gate to 1000 for --formulation consensus runs specifically (measured wins
+  // at N=32/N=128/N=256 there), because a global flip 14x-regressed the
+  // permutation form at N=32 — see dd_solve_2d.cpp.
   {
     const char *ms = std::getenv("DD_MU_STRATEGY");
     app->Options()->SetStringValue("mu_strategy", ms ? ms : "monotone");

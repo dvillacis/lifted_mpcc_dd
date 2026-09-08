@@ -794,6 +794,15 @@ int main(int argc, char** argv) {
 
    SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
    if (!driver::init_app(app, printlevel, maxiter, solver, hessian)) return 1;
+   // Barrier-advance gate, formulation-scoped default (2026-09-08).  For
+   // CONSENSUS runs the monotone gate defaults to 1000: measured 80→29 its at
+   // N=32 3×3, 332→138 at N=128 4×4, and it is what lets N=256 advance past
+   // the level the default gate stalled on — same α*/PSNR each time.  NOT
+   // flipped for the permutation form: the same gate 14×-regressed it at
+   // N=32 (113→1603 its).  DD_BARRIER_TOL always wins when set, and
+   // DD_BARRIER_TOL=10 reproduces the pre-flip consensus tables.
+   if (consensus && !std::getenv("DD_BARRIER_TOL"))
+      app->Options()->SetNumericValue("barrier_tol_factor", 1000.0);
    // DD_DERIV_TEST=first|second: run IPOPT's derivative checker against the
    // TNLP callbacks — the validation gate for a new formulation's eval code.
    if (const char* dt = std::getenv("DD_DERIV_TEST")) {

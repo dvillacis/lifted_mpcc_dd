@@ -1083,6 +1083,16 @@ geometric route's value is its per-level fallback on suspect instances, not a
 drop-in cure for μ-level stalls. So: monotone + `DD_BARRIER_TOL=1000` first,
 here as at every size measured before.
 
+**The gate default is now formulation-scoped (2026-09-08, same day).** For
+`--formulation consensus` the 2D driver defaults `barrier_tol_factor` to 1000
+— measured 80→**29** its at N=32 3×3, 84→**36** at 4×4, 332→138 at N=128
+4×4, identical PSNR, and at N=256 it advances past the level the default gate
+stalled on. **Not** flipped globally: the same gate 14×-regressed the
+permutation form at N=32 (113→1603 its, same PSNR — trajectory, not answer),
+so permutation keeps IPOPT's default 10. `DD_BARRIER_TOL` always wins when
+set; `DD_BARRIER_TOL=10` reproduces the pre-flip consensus numbers
+iteration-for-iteration.
+
 ## The MUMPS W_k backend (`--wk-backend mumps|hybrid`, 2026-07-25)
 
 An opt-in second backend for the subdomain blocks, attacking the measured
