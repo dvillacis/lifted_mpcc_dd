@@ -706,9 +706,27 @@ Contents: `N nsub n_var sigma t_last weight_exp averaged consensus` (scalars),
 
 Why this and not text: self-describing (no positional decoding), exact (raw
 IEEE-754 — verified bit-identical including signed zero, denormals and
-infinity), and ~30% smaller (119 KB vs 168 KB at N=32). Verified equivalent
-end to end: the seven panels rendered from `.npz` are **byte-identical** to
-those from the `.txt` of the same run.
+infinity), and smaller. Verified equivalent end to end: the seven panels
+rendered from `.npz` are **byte-identical** to those from the `.txt` of the
+same run.
+
+Members are **deflated** (ZIP method 8 — the only compressed method NumPy
+reads) via zlib, a system library on macOS and every Linux, so `-lz` is all
+the build needs and nothing is vendored. `-DNPZ_NO_ZLIB` drops the dependency
+and emits stored members; the archives stay valid either way, and the two are
+bit-identical on read. Sizes at N=32:
+
+| form | bytes | |
+|---|---|---|
+| `.txt` (legacy) | 167 818 | |
+| `.npz` stored | 119 006 | −29% (binary vs decimal) |
+| `.npz` deflated | 105 258 | −37% |
+
+Be honest about what deflate buys here: **~11%**, because float64 samples of
+noisy image data are high-entropy — `u_clean` (quantized from an 8-bit source)
+compresses to 49%, but every solved field sits at 89–95%. Level 6 is the
+default; measured on 200k Gaussian doubles, level 9 is byte-identical to 6 and
+level 1 within 0.4%, so the level is not a knob worth turning.
 
 One caveat recorded honestly: the `pAp ≤ 0` breakdown flag is reported as
 "non-positive curvature seen", not as proof of indefiniteness. In exact

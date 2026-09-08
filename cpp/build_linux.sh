@@ -184,4 +184,5 @@ exec "$CXX" -std=c++17 -O2 \
   ${HSL_EXTRA_LIBS:-} \
   -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" \
   -Wl,-rpath-link,"$CONDA_PREFIX/lib" -Wl,--allow-shlib-undefined \
+  -lz \
   $(pkg-config --libs ipopt)

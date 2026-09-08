@@ -42,6 +42,11 @@ if [ "${OMP:-0}" = "1" ]; then
   OMPFLAGS=(-Xpreprocessor -fopenmp -I"$LIBOMP/include" -L"$LIBOMP/lib" -lomp)
 fi
 
+# zlib (-lz): compresses the .npz solution files --save-solution writes
+# (npz_writer.hpp). A system library on macOS and every Linux, so there is
+# nothing to install. To drop it, build with -DNPZ_NO_ZLIB and remove -lz —
+# the archives are then uncompressed but still valid .npz.
+#
 # COIN ThirdParty-Mumps (optional): enables the --wk-backend mumps W_k backend
 # (partial-factorization Schur, mumps_block.hpp). Detected via pkg-config;
 # without it the build is byte-identical to before and the flag errors cleanly
@@ -81,4 +86,5 @@ exec clang++ -std=c++17 -O2 \
   "$@" \
   "${HSLLIBS[@]}" \
   "${MUMPSLIBS[@]}" \
+  -lz \
   $(pkg-config --libs ipopt)

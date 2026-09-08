@@ -17,10 +17,19 @@
 //   .npy  = "\x93NUMPY" + version + a padded Python-dict header giving descr /
 //           fortran_order / shape, then the raw buffer.  The 10-byte preamble
 //           plus header must be a multiple of 64 bytes (NumPy aligns the data).
-//   .npz  = a ZIP archive of those members, stored UNCOMPRESSED (method 0), so
-//           no deflate implementation is needed — only CRC-32, which is 15
-//           lines.  Member names must end in .npy; NumPy takes the stem as the
-//           array's key.
+//   .npz  = a ZIP archive of those members.  Members are DEFLATED (method 8,
+//           the only compressed method NumPy reads) through zlib, which is a
+//           system library on macOS and every Linux — `-lz`, nothing to
+//           install and nothing vendored.  Define NPZ_NO_ZLIB to drop the
+//           dependency and emit stored (method 0) members instead; the files
+//           stay valid either way.  Member names must end in .npy; NumPy takes
+//           the stem as the array's key.
+//
+//           ZIP wants a RAW deflate stream (no zlib header/trailer), hence
+//           deflateInit2 with negative windowBits.  The CRC-32 is always of
+//           the UNCOMPRESSED bytes.  A member that fails to shrink is written
+//           stored, which is what every ZIP writer does and costs nothing to
+//           support since both paths already exist.
 //
 // Scalars are written as 0-d arrays, so `int(d["N"])` and `float(d["sigma"])`
 // work on the Python side without special cases.
@@ -40,6 +49,10 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+#ifndef NPZ_NO_ZLIB
+#include <zlib.h>
+#endif
 
 namespace npz {
 
@@ -62,7 +75,11 @@ inline uint32_t crc32(const uint8_t* p, size_t n, uint32_t crc = 0) {
 
 class Writer {
 public:
-   explicit Writer(const std::string& path) : out_(path, std::ios::binary) {}
+   // level: zlib compression level, 0-9 (default 6 — the usual size/time knee;
+   // these arrays are smooth image data and compress well).  Ignored when
+   // built with NPZ_NO_ZLIB.
+   explicit Writer(const std::string& path, int level = 6)
+       : out_(path, std::ios::binary), level_(level) {}
    bool ok() const { return (bool)out_; }
 
    // ---- the public array API -------------------------------------------
@@ -86,8 +103,8 @@ public:
       closed_ = true;
       const uint64_t cd_off = pos_;
       for (const Member& m : members_) {
-         u32(0x02014b50); u16(20); u16(20); u16(0); u16(0); u16(0); u16(0);
-         u32(m.crc); u32((uint32_t)m.size); u32((uint32_t)m.size);
+         u32(0x02014b50); u16(20); u16(20); u16(0); u16(m.method); u16(0); u16(0);
+         u32(m.crc); u32((uint32_t)m.csize); u32((uint32_t)m.size);
          u16((uint16_t)m.name.size()); u16(0); u16(0); u16(0); u16(0); u32(0);
          u32((uint32_t)m.offset);
          raw(m.name.data(), m.name.size());
@@ -101,7 +118,35 @@ public:
    }
 
 private:
-   struct Member { std::string name; uint64_t offset, size; uint32_t crc; };
+   struct Member {
+      std::string name;
+      uint64_t offset, size, csize;      // size = uncompressed, csize = stored
+      uint32_t crc;
+      uint16_t method;
+   };
+
+#ifndef NPZ_NO_ZLIB
+   // Raw deflate (negative windowBits ⇒ no zlib header/trailer, which is what
+   // ZIP expects).  False on any zlib error, and the caller then stores.
+   static bool deflate_raw(const std::vector<uint8_t>& in,
+                           std::vector<uint8_t>& out, int level) {
+      z_stream zs{};
+      if (deflateInit2(&zs, level, Z_DEFLATED, -MAX_WBITS, 8,
+                       Z_DEFAULT_STRATEGY) != Z_OK)
+         return false;
+      out.resize(deflateBound(&zs, (uLong)in.size()));
+      zs.next_in = const_cast<Bytef*>(in.data());
+      zs.avail_in = (uInt)in.size();
+      zs.next_out = out.data();
+      zs.avail_out = (uInt)out.size();
+      const int rc = deflate(&zs, Z_FINISH);
+      const uLong produced = zs.total_out;
+      deflateEnd(&zs);
+      if (rc != Z_STREAM_END) return false;
+      out.resize(produced);
+      return true;
+   }
+#endif
 
    static size_t count(const std::vector<size_t>& shape) {
       size_t n = 1;
@@ -109,7 +154,8 @@ private:
       return n;
    }
 
-   // One .npy member, stored uncompressed inside the ZIP.
+   // One .npy member: build the .npy bytes, then add them to the ZIP —
+   // deflated when that shrinks them, stored otherwise.
    void put(const std::string& name, const char* descr, const uint8_t* data,
             size_t nbytes, const std::vector<size_t>& shape) {
       // -- the .npy header: a Python dict literal, space-padded so that the
@@ -136,15 +182,24 @@ private:
       std::vector<uint8_t> buf(npy.begin(), npy.end());
       buf.insert(buf.end(), data, data + nbytes);
 
-      // -- the ZIP local file header, then the member bytes --
-      const std::string fname = name + ".npy";
+      // The CRC is of the uncompressed member, whatever we do next.
       const uint32_t c = crc32(buf.data(), buf.size());
-      Member m{fname, pos_, buf.size(), c};
-      u32(0x04034b50); u16(20); u16(0); u16(0); u16(0); u16(0);
-      u32(c); u32((uint32_t)buf.size()); u32((uint32_t)buf.size());
+      uint16_t method = 0;
+      const std::vector<uint8_t>* payload = &buf;
+      std::vector<uint8_t> comp;
+#ifndef NPZ_NO_ZLIB
+      if (level_ > 0 && deflate_raw(buf, comp, level_) && comp.size() < buf.size()) {
+         method = 8;                       // ZIP_DEFLATED — what NumPy reads
+         payload = &comp;
+      }
+#endif
+      const std::string fname = name + ".npy";
+      Member m{fname, pos_, buf.size(), payload->size(), c, method};
+      u32(0x04034b50); u16(20); u16(0); u16(method); u16(0); u16(0);
+      u32(c); u32((uint32_t)payload->size()); u32((uint32_t)buf.size());
       u16((uint16_t)fname.size()); u16(0);
       raw(fname.data(), fname.size());
-      raw((const char*)buf.data(), buf.size());
+      raw((const char*)payload->data(), payload->size());
       members_.push_back(m);
    }
 
@@ -160,6 +215,7 @@ private:
    std::ofstream out_;
    std::vector<Member> members_;
    uint64_t pos_ = 0;
+   int level_ = 6;
    bool closed_ = false;
 };
 
