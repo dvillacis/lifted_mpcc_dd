@@ -50,6 +50,10 @@
 #include "dd_solver_simple.hpp"
 #include "driver_common.hpp"
 #include "mpcc_2d_tnlp.hpp"
+// The consensus (duplicate-and-link) reformulation — Lueg's structure imposed
+// on the same MPCC, selected by --formulation consensus. Same solutions; a
+// different KKT sparsity in which the border is purely primal.
+#include "mpcc_2d_consensus_tnlp.hpp"
 // struct Partition2D — the tile/strip cell ownership and the anchor rule, now
 // shared with dd_solve_dataset.cpp (which partitions each training pair with it).
 #include "partition_2d.hpp"
@@ -307,6 +311,11 @@ int main(int argc, char** argv) {
    // set; peeling them is on by default because it is what makes tile
    // partitions scale (see dd_solver_simple.hpp §6a). Use this to A/B.
    bool cross_peel = true;
+   // --formulation permutation|consensus: decompose the monolithic KKT by pure
+   // permutation (default, the validated route), or rebuild the NLP in Lueg's
+   // duplicate-and-link form so every complicating variable is primal and
+   // appears only in linear linking rows (see mpcc_2d_consensus_tnlp.hpp).
+   std::string formulation = "permutation";
    // --solver ddsimple has no --interface/--inertia knobs left: it is CG on
    // the peeled interface with the PREDICTED inertia, full stop (see the
    // dd_solver_simple.hpp header).  We only need to know whether --interface
@@ -365,6 +374,7 @@ int main(int argc, char** argv) {
       else if (a == "--no-alpha-peel") alpha_peel = false;
       else if (a == "--no-dual-peel") dual_peel = false;
       else if (a == "--no-cross-peel") cross_peel = false;
+      else if (a == "--formulation") formulation = next();
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
    if (data.empty()) {
@@ -391,6 +401,13 @@ int main(int argc, char** argv) {
                    "    complement. Honours --nsub, --partition, --cg-tol,\n"
                    "    --cg-max-iter, --no-alpha-peel, --no-dual-peel and\n"
                    "    --no-cross-peel.\n"
+                   "  --formulation permutation|consensus (default permutation):\n"
+                   "    permutation decomposes the monolithic KKT in place; consensus\n"
+                   "    rebuilds the NLP in Lueg's duplicate-and-link form (one local\n"
+                   "    copy per shared variable per tile + linear linking rows), so\n"
+                   "    the border is purely primal: no promoted duals, S SPD after\n"
+                   "    inertia correction. Same solutions (checked vs mumps); needs\n"
+                   "    --solver ddsimple or mumps.\n"
                    "  --no-cross-peel (needs --solver ddsimple): stop making the CROSS\n"
                    "    POINTS primal. A cross point is a border unknown touched by >=3\n"
                    "    subdomains -- (k-1)^2 of them on a k x k tile partition. Making\n"
@@ -453,6 +470,24 @@ int main(int argc, char** argv) {
                 << " needs --solver dd (it replaces the arrowhead's "
                    "interface solve)\n";
       return 2;
+   }
+   if (formulation != "permutation" && formulation != "consensus") {
+      std::cerr << "--formulation must be permutation|consensus\n";
+      return 2;
+   }
+   if (formulation == "consensus") {
+      if (solver != "ddsimple" && solver != "mumps") {
+         std::cerr << "--formulation consensus supports --solver ddsimple (the "
+                      "decomposition) and mumps (the monolithic equivalence "
+                      "reference)\n";
+         return 2;
+      }
+      if (check || !save_data.empty() || !save_dd.empty()) {
+         std::cerr << "--formulation consensus does not support --self-check/"
+                      "--save-data/--save-dd (they assume the permutation "
+                      "layout)\n";
+         return 2;
+      }
    }
    if (solver == "ddsimple" && precond != "asd") {
       std::cerr << "--precond " << precond << " is not implemented in "
@@ -566,8 +601,10 @@ int main(int argc, char** argv) {
       std::cerr << "an image input needs --size N (the target side length)\n";
       return 2;
    }
-   SmartPtr<Mpcc2DTNLP> mpcc =
-      new Mpcc2DTNLP(data, iopt, weight == "exp", stencil == "averaged");
+   const bool consensus = (formulation == "consensus");
+   SmartPtr<Mpcc2DTNLP> mpcc = consensus
+      ? new Mpcc2DConsensusTNLP(data, iopt, weight == "exp", stencil == "averaged")
+      : new Mpcc2DTNLP(data, iopt, weight == "exp", stencil == "averaged");
    mpcc->w_max_ = wmax;
    mpcc->reg_alpha_ = reg_alpha;
    if (!nsub_set && mpcc->file_nsub > 0) nsub = mpcc->file_nsub;
@@ -591,7 +628,18 @@ int main(int argc, char** argv) {
    Partition2D part(mpcc->N, nsub, partition == "strip");
    std::vector<int> col_owner;
    int n_promoted = 0;
-   std::vector<int> owner = kkt_owner(*mpcc, part, promote, &col_owner, &n_promoted);
+   std::vector<int> owner;
+   if (consensus) {
+      // Duplicate-and-link: rebuild the NLP so every complicating variable is
+      // primal and linear-only, then read the owner map off the construction.
+      // No corner promotion is needed — rows are never cut, so the rank
+      // deficiencies that forced it cannot arise.
+      Mpcc2DConsensusTNLP* c = static_cast<Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc));
+      c->init_consensus(part);
+      owner = c->kkt_owner_consensus();
+   } else {
+      owner = kkt_owner(*mpcc, part, promote, &col_owner, &n_promoted);
+   }
 
    std::cout << "2D lifted TV-MPCC (staggered, C++)  N=" << mpcc->N
              << "  nodes=" << mpcc->m_u << "  cells=" << mpcc->m_q
@@ -605,7 +653,13 @@ int main(int argc, char** argv) {
    if (solver == "dd" || solver == "ddsimple") {
       if (part.striped) std::cout << "  partition=" << nsub << " strips";
       else std::cout << "  nsub=" << nsub << "x" << nsub << " tiles";
-      if (n_promoted) std::cout << "  +" << n_promoted << " promoted corner duals";
+      if (consensus) {
+         const Mpcc2DConsensusTNLP* c =
+            static_cast<const Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc));
+         std::cout << "  formulation=consensus (+" << c->n_link
+                   << " copies/links, no promoted duals)";
+      }
+      else if (n_promoted) std::cout << "  +" << n_promoted << " promoted corner duals";
       else if (!promote) std::cout << "  (corner promotion OFF)";
       if (wk_backend == "mumps") std::cout << "  wk-backend=mumps(schur)";
    }
@@ -653,6 +707,15 @@ int main(int argc, char** argv) {
 
    SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
    if (!driver::init_app(app, printlevel, maxiter, solver, hessian)) return 1;
+   // DD_DERIV_TEST=first|second: run IPOPT's derivative checker against the
+   // TNLP callbacks — the validation gate for a new formulation's eval code.
+   if (const char* dt = std::getenv("DD_DERIV_TEST")) {
+      app->Options()->SetStringValue(
+         "derivative_test", std::string(dt) == "first" ? "first-order"
+                                                       : "second-order");
+      app->Options()->SetNumericValue("derivative_test_perturbation", 1e-7);
+      app->Options()->SetIntegerValue("print_level", 4);
+   }
 
 #ifdef DD_HAVE_MA57
    if (solver == "dd") {
@@ -695,7 +758,7 @@ int main(int argc, char** argv) {
       ddsimple::Arrowhead::Options o;
       // Border positions with a KKT index >= n are DUAL — the promoted corner
       // duals. They are S's negative eigenvalues, so CG needs them peeled.
-      o.n_primal = dual_peel ? mpcc->n : (1 << 30);
+      o.n_primal = dual_peel ? mpcc->n : (1 << 30);   // consensus: updated n
       o.alpha_index = alpha_peel ? mpcc->oa : -1;
       o.peel_cross_points = cross_peel;
       o.cg_tol = cg_tol;

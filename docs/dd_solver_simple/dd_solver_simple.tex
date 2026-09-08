@@ -798,6 +798,58 @@ unavailable to a solver behind IPOPT's linear-solver interface, where the
 regularization arrives already applied globally and the contract is limited
 to reporting \code{SINGULAR} or wrong inertia.
 
+\subsection{Removing the forced departure: the consensus formulation}
+\label{sec:consensus}
+
+The peel is an adaptation to a premise failure, and the failure is
+formulation-induced --- so it can be removed at the source.  The companion
+class \code{mpcc\_2d\_consensus\_tnlp.hpp} rebuilds the same MPCC in Lueg's
+duplicate-and-link form: every constraint row is assigned wholly to one tile,
+every variable referenced by rows of two or more tiles (the border $u$ nodes,
+the cut-line $q$ components, and $\alpha$ --- never $r,\delta,\theta$, which
+are strictly cell-local) receives one local copy per referencing tile, and
+the original index becomes a consensus variable appearing only in the linear
+linking rows $v_k - v = 0$.  The reformulation is exact: IPOPT's monolithic
+solver run on both formulations agrees on $\alpha^\star$ to six digits.  The
+solver of this paper is untouched --- it consumes the new problem through the
+same injected owner map, and its partition-leak check doubles as an audit of
+the construction.
+
+Structurally, the premise of \S 3.1 is thereby restored: rows are never cut,
+so the rank deficiencies that forced corner-dual promotion cannot arise, no
+dual reaches the border, and $S$ is positive definite once inertia correction
+succeeds; $\alpha$'s dense row collapses to $K$ linking couplings.  The dual
+peel becomes vacuous, while the cross points survive as consensus variables
+of degree three and are still handled by the (now purely primal) peel.
+Measured, with the cross-point peel active in both columns:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+run & permutation & consensus\\
+\midrule
+$N=16$, $2\times2$ tiles & 0.19\,s, 53 it & 0.13\,s, 56 it\\
+$N=32$, $3\times3$ tiles & 3.16\,s, 113 it & 1.26\,s, 80 it\\
+$N=32$, $4\times4$ tiles & 35.5\,s, 509 it & \textbf{2.06\,s, 84 it}\\
+$N=64$, $2\times2$ tiles & 10.6\,s, 170 it & 6.60\,s, 139 it\\
+$N=64$, $4\times4$ tiles & 172\,s, 782 it & \textbf{13.0\,s, 128 it}\\
+$N=64$, $4$ strips & 8.05\,s, 129 it & 8.05\,s, 136 it\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Identical reconstructions in every row.  The headline is the flatness of the
+consensus column in the tile count ($80 \to 84$ at $N=32$, $139 \to 128$ at
+$N=64$, against $113 \to 509$ and $170 \to 782$ for the permutation form):
+with the formulation-induced indefiniteness gone, the decomposition scales
+the way the theory of Section~\ref{sec:crosspoints} says it should.  The
+price is a larger NLP (one copy per shared variable per tile plus as many
+linking rows, $O(kN)$), a different barrier trajectory --- runs match the
+monolithic reference in solution, not iteration-for-iteration --- and one
+benign departure from strict Lueg form: the objective stays on the consensus
+variables, contributing a positive semidefinite diagonal to $C$, which can
+only help the definiteness of $S$.
+
 % =============================================================================
 \section{The predicted inertia}
 \label{sec:inertia-pred}

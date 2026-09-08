@@ -627,6 +627,55 @@ subdomain count, so `T` is only cheap at modest `k`; `build_peel_sets()`
 carries a guard that declines the cross-point peel outright if it would not
 stay a small fraction of `p`.
 
+### The consensus formulation (`--formulation consensus`, 2026-09-08)
+
+The cross-point peel treats the symptoms of the permutation route; the
+consensus (duplicate-and-link) reformulation removes their cause. Lueg et
+al.'s structure is a *modeling* choice — every partition works on its own
+LOCAL COPIES of the shared unknowns, tied together by linear linking rows
+`copy − consensus = 0` — and `mpcc_2d_consensus_tnlp.hpp` imposes it on this
+MPCC: constraint rows are assigned wholly to one tile (never cut), the shared
+`u`/`qx`/`qy`/α get one copy per referencing tile, and the consensus originals
+become the border. Consequences, all structural rather than numerical:
+
+- **no duals on the border** (rows are whole, so the rank deficiencies that
+  forced corner-dual promotion cannot arise — the dual peel is vacuous);
+- α's dense row is gone (the consensus α couples only to K linking rows);
+- the exact reformulation keeps the solutions: `--solver mumps` on both
+  formulations agrees to six digits (α\* = 0.070831 at N=16).
+
+Only `dd_solve_2d.cpp` and the new TNLP change — `dd_solver_simple.hpp` is
+untouched, consuming the new owner map through the same interface (its
+partition-leak check doubles as the owner-map audit, and its cross-point peel
+still handles the consensus corner variables). Measured (cameraman,
+`--hessian exact`, both with the cross-point peel on):
+
+| run | permutation | consensus |
+|---|---|---|
+| N=16, 2×2 tiles | 0.19 s, 53 it | 0.13 s, 56 it |
+| N=32, 3×3 tiles | 3.16 s, 113 it | 1.26 s, 80 it |
+| N=32, 4×4 tiles | 35.5 s, 509 it | **2.06 s, 84 it** |
+| N=64, 2×2 tiles | 10.6 s, 170 it | 6.60 s, 139 it |
+| N=64, 4×4 tiles | 172 s, 782 it | **13.0 s, 128 it** |
+| N=64, 4 strips | 8.05 s, 129 it | 8.05 s, 136 it |
+
+Identical PSNR in every row, and the border shrinks (p = 60 vs 128 at N=16
+2×2). The headline is the flatness: consensus iteration counts barely move
+with the tile count (80 → 84 at N=32, 139 → 128 at N=64) where the
+permutation form degraded 113 → 509 and 170 → 782. Refusals drop in step
+(N=32 4×4: 26 vs the permutation's hundreds). The formulation-induced
+indefiniteness, not the decomposition, was the hard part all along.
+
+Costs, stated honestly: `n` grows by one copy per (shared variable, tile)
+pair plus as many linking rows (~O(kN)); the barrier trajectory changes, so
+runs are comparable to the monolithic reference in solution, not
+iteration-for-iteration; and the objective stays on the consensus variables
+(one benign PSD diagonal in `C` — the single departure from strict Lueg
+form, chosen so the base-class objective code is untouched). Validated by
+IPOPT's derivative checker (`DD_DERIV_TEST=second`): the consensus callbacks
+show exactly the same 7 near-tolerance FD artifacts as the validated
+permutation code, and nothing else.
+
 One caveat recorded honestly: the `pAp ≤ 0` breakdown flag is reported as
 "non-positive curvature seen", not as proof of indefiniteness. In exact
 arithmetic it would be a one-directional proof, but with ‖A‖ ~ 1e18 a merely tiny
