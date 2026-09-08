@@ -1093,6 +1093,38 @@ so permutation keeps IPOPT's default 10. `DD_BARRIER_TOL` always wins when
 set; `DD_BARRIER_TOL=10` reproduces the pre-flip consensus numbers
 iteration-for-iteration.
 
+### N=256: the dual-infeasibility floor, diagnosed (2026-09-08)
+
+First N=256 results (mariposa, consensus, ddsimple), and a three-experiment
+diagnosis of the failure mode that showed up on the way. Symptom: `inf_du`
+oscillates at 1e1–1e3 instead of converging (4×4 could not leave its first μ
+level; 3×3 sawtoothed at 10–20 near the end), while `inf_pr` stays small —
+primal steps fine, multiplier updates carrying O(10⁺) error.
+
+1. **Formulation exonerated.** Monolithic MUMPS on the *identical* consensus
+   N=256 4×4 NLP passed the stuck level in <25 its, `inf_du` falling smoothly
+   71 → 7.5, ~1.7 s/it. Same problem, different linear solver, no floor.
+2. **Mechanism: interface-CG saturation.** At N=256 the tiles are 64–85 cells
+   across, the one-level ASd + cross-point coarse space degrades with that
+   subdomain size, and CG stops reaching the 1e-2 acceptance within
+   `--cg-max-iter 500`: 80% of interface solves rejected, the refinement
+   safety net bounding the *step* residual but unable to repair the *dual*
+   updates — whose worst components live on the border, where the consensus
+   linking multipliers are. The formulation *exposes* the weakness; it does
+   not cause it.
+3. **Budget confirms it.** The same 4×4 run with `--cg-max-iter 2000` sailed
+   through the formerly-stuck level by it 25 and reached μ=1.84e-6 with
+   `inf_du` = 5.3e-3 by it 200 (cap artifact; ~8 s/it, 455 CG its/solve,
+   rejections 80% → 60%).
+
+Converged reference: **N=256 3×3 consensus, default knobs: 593 it, 41 min,
+α\* = 0.072548, PSNR 28.11 dB** — at the price of 6702/8326 interface solves
+rejected and 1.6M CG iterations. So at N=256: raise `--cg-max-iter` (2000
+measured) and prefer more tiles (each tile at ≤ N=128's per-tile size, where
+everything converges cleanly); the durable fix is a real coarse space beyond
+the cross points — the multilevel direction the DD literature prescribes for
+exactly this growth.
+
 ## The MUMPS W_k backend (`--wk-backend mumps|hybrid`, 2026-07-25)
 
 An opt-in second backend for the subdomain blocks, attacking the measured
