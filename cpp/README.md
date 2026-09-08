@@ -1060,6 +1060,29 @@ trace knowing `t` floors immediately and the refinement absorbs the CG
 rejections.** If you want an honest continuation schedule under adaptive,
 decouple it: `DD_MU_STRATEGY=adaptive` with `--t-update geometric`.
 
+**Keeping monotone without the level-stall (2026-09-08, mariposa N=128 4×4,
+consensus).** Two new env passthroughs join `DD_BARRIER_TOL`:
+`DD_MU_LINEAR_DECREASE` (IPOPT `mu_linear_decrease_factor`, default 0.2) and
+`DD_MU_SUPERLINEAR_POWER` (`mu_superlinear_decrease_power`, default 1.5) —
+gentler monotone cuts mean a smaller `t = c·μ` shock per level. Defaults
+unchanged; nothing set = the validated behaviour. Four arms, same binary:
+
+| arm | its | wall | α\* | PSNR |
+|---|---|---|---|---|
+| monotone default | 332 | 200 s | 0.066960 | 26.51 |
+| `DD_BARRIER_TOL=1000` | **138** | **145 s** | 0.066963 | 26.51 |
+| gentle cuts (0.5 / 1.1) | 354 | 256 s | 0.066939 | 26.50 |
+| `--t-update geometric` | 853 | 513 s | **0.099625** | 26.32 |
+
+Readings: the gate raise is again the clean win (2.4×, same solution);
+**gentler cuts do not pay** — the per-level shock shrinks but the total grind
+is conserved, so the knobs stay for experiments, not as advice; and a caution
+flag on `--t-update geometric` with its *default* schedule on this instance —
+it wandered to a **different solution branch** (α\* 0.0996, PSNR 26.32). The
+geometric route's value is its per-level fallback on suspect instances, not a
+drop-in cure for μ-level stalls. So: monotone + `DD_BARRIER_TOL=1000` first,
+here as at every size measured before.
+
 ## The MUMPS W_k backend (`--wk-backend mumps|hybrid`, 2026-07-25)
 
 An opt-in second backend for the subdomain blocks, attacking the measured

@@ -91,6 +91,18 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
     app->Options()->SetStringValue("mu_strategy", ms ? ms : "monotone");
     if (const char *bt = std::getenv("DD_BARRIER_TOL"))
       app->Options()->SetNumericValue("barrier_tol_factor", std::atof(bt));
+    // GENTLER MONOTONE CUTS. The other way monotone gets stuck is not at the
+    // gate but at the shock AFTER a cut: mu+ = min(kappa*mu, mu^theta)
+    // (defaults 0.2, 1.5) can cut 20-80x in one step, and with t = c*mu slaved
+    // to it the complementarity constraint tightens by the same factor at
+    // once — measured at N=256 that drove inf_du to 1.8e5 for hundreds of
+    // iterations (1.2e8x above the gate, where DD_BARRIER_TOL cannot reach).
+    // Raising kappa toward 1 / lowering theta toward 1 makes each cut (and
+    // each t shock) small: more levels, each cheap.
+    if (const char *ld = std::getenv("DD_MU_LINEAR_DECREASE"))
+      app->Options()->SetNumericValue("mu_linear_decrease_factor", std::atof(ld));
+    if (const char *sp = std::getenv("DD_MU_SUPERLINEAR_POWER"))
+      app->Options()->SetNumericValue("mu_superlinear_decrease_power", std::atof(sp));
   }
   // HESSIAN (--hessian exact|limited-memory, default limited-memory).
   //
