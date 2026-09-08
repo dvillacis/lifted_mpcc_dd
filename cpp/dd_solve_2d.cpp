@@ -57,6 +57,8 @@
 // struct Partition2D — the tile/strip cell ownership and the anchor rule, now
 // shared with dd_solve_dataset.cpp (which partitions each training pair with it).
 #include "partition_2d.hpp"
+// Dependency-free NumPy .npz writer — the structured solution format.
+#include "npz_writer.hpp"
 
 using namespace Ipopt;
 
@@ -197,7 +199,77 @@ static std::vector<int> kkt_owner2(const Mpcc2DTNLP &p, const Partition2D &part,
 // the data costs a few KB and means plot_2d.py needs nothing else — which matters
 // most on the image route, where there is no .txt instance to point at and
 // re-decoding the PNG in Python would silently plot a DIFFERENT noise realization.
-static void save_solution(const std::string& fn, const Mpcc2DTNLP& p,
+// ---------------------------------------------------------------------------
+//  SOLUTION OUTPUT.  Two formats, chosen by the extension of --save-solution:
+//
+//    .npz  (default, recommended)  a NumPy archive of NAMED, SHAPED arrays —
+//          self-describing, exact (raw IEEE-754), ~3x smaller than the text
+//          form, and readable by np.load / MATLAB / Julia / R.
+//    .txt  the original positional token stream, kept so existing result
+//          directories and any external scripts keep working.
+//
+//  Both carry the same content: the solution, the instance it was solved on,
+//  the per-level continuation history and the μ-trace — self-contained, so a
+//  plot needs nothing but this one file.
+// ---------------------------------------------------------------------------
+static void save_solution_npz(const std::string& fn, const Mpcc2DTNLP& p,
+                              const std::vector<driver::Level>& hist,
+                              const std::vector<double>& x, double t_last,
+                              int nsub) {
+   // The consensus formulation carries local copies past the original layout;
+   // the leading n_orig entries are the consensus values, which at a feasible
+   // point equal every copy — i.e. exactly the original-formulation solution.
+   const Mpcc2DConsensusTNLP* cons = dynamic_cast<const Mpcc2DConsensusTNLP*>(&p);
+   const int nw = cons ? cons->n_orig : p.n;
+   const size_t mu = (size_t)p.m_u, mq = (size_t)p.m_q, nc = (size_t)p.nc;
+   const size_t Nn = (size_t)p.N;
+
+   npz::Writer w(fn);
+   if (!w.ok()) { std::cerr << "cannot write " << fn << "\n"; return; }
+
+   // -- what this run was ------------------------------------------------
+   w.scalar_i("N", p.N);
+   w.scalar_i("nsub", nsub);
+   w.scalar_i("n_var", nw);
+   w.scalar_d("sigma", p.sigma_);
+   w.scalar_d("t_last", t_last);
+   w.scalar_i("weight_exp", p.weight_exp ? 1 : 0);
+   w.scalar_i("averaged", p.averaged ? 1 : 0);
+   w.scalar_i("consensus", cons ? 1 : 0);
+
+   // -- the instance (so the file is self-contained) ---------------------
+   w.array_d("u_clean", p.uclean_.data(), {Nn, Nn});
+   w.array_d("f", p.f_.data(), {Nn, Nn});
+
+   // -- the solution, as SHAPED, NAMED fields rather than one flat vector --
+   w.array_d("u", x.data() + p.ou, {Nn, Nn});
+   w.array_d("qx", x.data() + p.oqx, {nc, nc});
+   w.array_d("qy", x.data() + p.oqy, {nc, nc});
+   w.array_d("r", x.data() + p.oR, {nc, nc});
+   w.array_d("delta", x.data() + p.oD, {nc, nc});
+   w.array_d("theta", x.data() + p.oTh, {nc, nc});
+   w.scalar_d("alpha", x[p.oa]);
+   w.scalar_d("weight", p.Q(x[p.oa]));
+   // the raw primal vector too: authoritative, and what a warm start needs
+   w.array_d("x", x.data(), {(size_t)nw});
+
+   // -- the continuation history, one row per level ----------------------
+   std::vector<double> lv;
+   lv.reserve(hist.size() * 8);
+   for (const driver::Level& l : hist) {
+      lv.push_back(l.t); lv.push_back((double)l.status); lv.push_back((double)l.iters);
+      lv.push_back(l.comp_res); lv.push_back(l.weight); lv.push_back(l.obj);
+      lv.push_back(l.xi_max); lv.push_back(l.converged ? 1.0 : 0.0);
+   }
+   w.array_d("levels", lv.data(), {hist.size(), 8});
+   // and the in-solve μ-trace of the μ-coupled route
+   w.array_d("mu_trace", p.mu_hist_.data(), {p.mu_hist_.size() / 5, 5});
+
+   (void)mu; (void)mq;
+   if (!w.close()) std::cerr << "failed writing " << fn << "\n";
+}
+
+static void save_solution_txt(const std::string& fn, const Mpcc2DTNLP& p,
                           const std::vector<driver::Level>& hist,
                           const std::vector<double>& x, double t_last, int nsub) {
    std::ofstream out(fn);
@@ -443,8 +515,12 @@ int main(int argc, char** argv) {
                    "  generate the data file first:\n"
                    "    uv run python cpp2/dump_data_2d.py --N 16 --nsub 2 "
                    "-o cpp2/data_2d_16.txt\n"
+                   "  --save-solution FILE: .npz (recommended) writes a NumPy\n"
+                   "    archive of named, shaped arrays; .txt writes the legacy\n"
+                   "    positional text. Both are self-contained (solution +\n"
+                   "    instance + continuation history + mu-trace).\n"
                    "  and plot the result with (seven panels per solution):\n"
-                   "    ./dd_solve_2d ... --save-solution runs/sols/sol_TAG.txt\n"
+                   "    ./dd_solve_2d ... --save-solution runs/sols/sol_TAG.npz\n"
                    "    (cd ../python && uv sync && uv run python plot_slurm.py "
                    "../cpp/runs)\n";
       return 2;
@@ -829,7 +905,11 @@ int main(int argc, char** argv) {
 
    if (!res.best_x.empty()) {
       if (!save_sol.empty()) {
-         save_solution(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
+         if (save_sol.size() > 4 &&
+             save_sol.compare(save_sol.size() - 4, 4, ".txt") == 0)
+            save_solution_txt(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
+         else
+            save_solution_npz(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
          std::cout << "  wrote " << save_sol << "\n";
       }
       if (!save_dd.empty())

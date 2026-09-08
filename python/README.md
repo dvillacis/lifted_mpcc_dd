@@ -34,6 +34,11 @@ mkdir -p runs/sols
 uv run python plot_slurm.py runs          # -> runs/plots/N32_k3_*.png
 ```
 
+Use a `.npz` extension (the structured format: named, shaped arrays — see
+`cpp/README.md`); `.txt` still works for older files, and a directory may
+hold both (same tag, `.npz` wins). Decoding either gives the same dict, so
+`parse_solution` is the one entry point for both.
+
 Seven panels per solution (noisy, recon, diff, delta, indexsets, residual,
 continuation); `--only TAG` restricts to one, `--diff residual` switches the
 difference panel to `u−f`, `--out DIR` redirects. The solution file is

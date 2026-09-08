@@ -677,8 +677,38 @@ show exactly the same 7 near-tolerance FD artifacts as the validated
 permutation code, and nothing else.
 
 `--save-solution` writes only the **consensus** variables (the copies equal
-them at any feasible point), so consensus solution files are byte-format
-identical to permutation ones and `python/plot_slurm.py` reads both unchanged.
+them at any feasible point), so consensus solution files are indistinguishable
+from permutation ones and `python/plot_slurm.py` reads both unchanged.
+
+### Solution files: `.npz` (2026-09-08)
+
+`--save-solution` picks its format from the extension. **`.npz` is the
+default and the one to use**: a NumPy archive of *named, shaped* arrays,
+written by the dependency-free `npz_writer.hpp` (a `.npy` encoder plus a
+stored-mode ZIP container — no HDF5, nothing added to the build). `.txt`
+still writes the original positional token stream so existing result
+directories keep working.
+
+```python
+import numpy as np
+d = np.load("sol_N32_k3.npz")
+d["u"]        # (N, N)      reconstruction
+d["delta"]    # (N-1, N-1)  dual radius
+d["levels"]   # (n_lev, 8)  continuation history
+d["mu_trace"] # (n_it, 5)   in-solve (iter, mu, t, weight, comp)
+float(d["alpha"]), int(d["N"])      # scalars are 0-d arrays
+```
+
+Contents: `N nsub n_var sigma t_last weight_exp averaged consensus` (scalars),
+`u_clean f` (instance), `u qx qy r delta theta alpha weight` (solution, shaped),
+`x` (the raw primal vector — authoritative, and what a warm start needs),
+`levels`, `mu_trace`. Self-contained, so a plot needs nothing else.
+
+Why this and not text: self-describing (no positional decoding), exact (raw
+IEEE-754 — verified bit-identical including signed zero, denormals and
+infinity), and ~30% smaller (119 KB vs 168 KB at N=32). Verified equivalent
+end to end: the seven panels rendered from `.npz` are **byte-identical** to
+those from the `.txt` of the same run.
 
 One caveat recorded honestly: the `pAp ≤ 0` breakdown flag is reported as
 "non-positive curvature seen", not as proof of indefiniteness. In exact
