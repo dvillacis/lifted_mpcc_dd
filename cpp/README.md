@@ -1023,6 +1023,43 @@ So at dataset/large-image scale the standing advice stands, now with an A/B/C
 at N=128 behind it: `DD_BARRIER_TOL=1000` first, `DD_MU_STRATEGY=adaptive` as
 the alternative when raising the gate is not enough.
 
+**Adaptive μ × the tightening-only t ratchet (2026-09-08): the trace looks
+broken, the outcome is fine, and two attempted "fixes" measurably are not.**
+Under `DD_MU_STRATEGY=adaptive` the μ oracle *explores*: from a near-feasible
+CP start its first probes dive to μ ≲ 1e-5, the ratchet slams `t` to the floor
+within a few callbacks, and μ then bounces back up (0.85 at it 25 in the run
+that prompted this) with `t` unable to follow — the whole Scholtes
+continuation is bypassed and the run solves the tightest relaxation cold.
+The visible symptoms: `t` pinned at the floor from the first progress row,
+and an interface-CG **rejection rate of 45–83%** (healthy runs: ≤5%) with the
+iterative refinement carrying the run by brute force. `mpcc_base.hpp` states
+the μ-coupled mode "REQUIRES monotone μ"; adaptive breaks that precondition.
+
+Measured on mariposa N=128, consensus, before touching anything: the outcome
+is nevertheless **correct and competitive** — 4×4: 190 it, α\*=0.066968,
+PSNR 26.51 (the reference values); 3×3: **81 it**, faster than monotone at
+the same size, consistent with the earlier 610→160 adaptive win at 4×4/`dd`.
+
+Two guards were implemented and A/B'd across both tile counts before being
+**rejected**:
+
+| t-ratchet guard | 4×4 | 3×3 |
+|---|---|---|
+| none (current behaviour) | 190 it, 82% rej | **81 it**, 45% rej |
+| ≤10×-per-callback rate limit | **126 it**, 68% rej | 176 it, 83% rej |
+| upper envelope of last 8 μ | 229 it, 85% rej | ≥375 it (killed) |
+
+The two candidates *swap places* between samples — trajectory noise, not
+mechanism — while the envelope is consistently worst: holding `t` loose while
+adaptive's μ runs genuinely low creates the opposite mismatch (t ≫ 10μ, the
+ξ ~ μ/slack coupling violated the other way; its `indef` counters exploded to
+887/453). Neither earns a behaviour change, so none was kept.
+
+Standing advice: **adaptive + μ-coupled works and is often faster — read its
+trace knowing `t` floors immediately and the refinement absorbs the CG
+rejections.** If you want an honest continuation schedule under adaptive,
+decouple it: `DD_MU_STRATEGY=adaptive` with `--t-update geometric`.
+
 ## The MUMPS W_k backend (`--wk-backend mumps|hybrid`, 2026-07-25)
 
 An opt-in second backend for the subdomain blocks, attacking the measured
