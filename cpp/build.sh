@@ -57,18 +57,28 @@ fi
 # the prefix with HSLDIR if the library lives elsewhere. The dylib pulls in
 # openblas / libfakemetis / libgfortran through its own absolute-path load
 # commands, so only MA57 itself needs to be named here.
+# MA57 is OPTIONAL since the ddsimple simplification: without it the build
+# defines no DD_HAVE_MA57, dd_solve_2d.cpp compiles out --solver dd, and the
+# Eigen-only --solver ddsimple (plus IPOPT's own mumps) still works. Targets
+# that hard-require dd_solver.hpp (dd_solve.cpp, dd_solve_1d.cpp,
+# dd_solve_dataset.cpp) will fail to link without HSL — that is expected.
 HSLDIR="${HSLDIR:-$HOME/.local/hsl-ma57}"
-if [ ! -f "$HSLDIR/lib/libhsl_ma57.dylib" ]; then
-  echo "error: HSL MA57 not found at $HSLDIR/lib/libhsl_ma57.dylib" >&2
-  echo "       set HSLDIR to the install prefix (the one holding lib/ and include/)" >&2
-  exit 1
+HSLFLAGS=()
+HSLLIBS=()
+if [ -f "$HSLDIR/lib/libhsl_ma57.dylib" ]; then
+  HSLFLAGS=(-DDD_HAVE_MA57)
+  HSLLIBS=(-L"$HSLDIR/lib" -lhsl_ma57 -Wl,-rpath,"$HSLDIR/lib")
+else
+  echo "note: HSL MA57 not found at $HSLDIR/lib/libhsl_ma57.dylib" >&2
+  echo "      building WITHOUT it: --solver dd is disabled, --solver ddsimple" >&2
+  echo "      and mumps still work (set HSLDIR to re-enable MA57)" >&2
 fi
 
 exec clang++ -std=c++17 -O2 \
   -nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK" \
   -I"$EIGEN" -I"$ROOT" -I"$ROOT/third_party" $(pkg-config --cflags ipopt) \
-  "${OMPFLAGS[@]}" "${MUMPSFLAGS[@]}" \
+  "${OMPFLAGS[@]}" "${MUMPSFLAGS[@]}" "${HSLFLAGS[@]}" \
   "$@" \
-  -L"$HSLDIR/lib" -lhsl_ma57 -Wl,-rpath,"$HSLDIR/lib" \
+  "${HSLLIBS[@]}" \
   "${MUMPSLIBS[@]}" \
   $(pkg-config --libs ipopt)

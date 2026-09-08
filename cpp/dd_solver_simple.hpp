@@ -2,35 +2,74 @@
 //  dd_solver_simple.hpp — a READABLE domain-decomposition (arrowhead) linear
 //  solver for IPOPT.  Eigen only: no HSL/MA57, no MA97, no MUMPS.
 //
-//  This is the teaching twin of dd_solver.hpp.  Same mathematics, same IPOPT
-//  contract, ~1/5 of the code, because every research lever of the production
-//  file is gone (see "WHAT IS NOT HERE" at the bottom of this comment).
+//  This is the teaching twin of dd_solver.hpp, reduced to the one configuration
+//  that survived measurement:
+//
+//      W_k     Eigen::SimplicialLDLT — sparse unpivoted LDLᵀ, one per subdomain
+//      S       never assembled, never factorized: ASd-preconditioned CONJUGATE
+//              GRADIENTS on the peeled interface, applied matrix-free through
+//              the local Schur blocks S_k
+//      In(S)   PREDICTED from the tiny dense peel complement T (§8)
+//
+//  Full derivations, references and the measurement record live in the
+//  companion paper, docs/dd_solver_simple/dd_solver_simple.tex.  This header
+//  is self-contained at the "why is this line here" level; the paper is the
+//  "prove it" level.
+//
+//  VALIDATION GATES
+//      dd_simple_smoke.cpp   standalone (no IPOPT, no HSL): the arrowhead
+//                            solve vs a dense LU, the predicted inertia vs a
+//                            dense symmetric eigendecomposition.  Run it after
+//                            ANY edit to this file.
+//      DDS_SCHUR_CHECK=1     every S_k re-derived by the naive two-sided route
+//                            and compared, per block per factorization
+//      DDS_DEBUG=1           partition / CG / refusal diagnostics
+//
+//  CONTENTS                                                     (code map)
+//      §1  the IPOPT contract                                    ─ adapter
+//      §2  the arrowhead permutation and the Schur solve         ─ Arrowhead
+//      §3  inertia by Haynsworth additivity                      ─ factorize
+//      §4  the subdomain blocks: unpivoted LDLᵀ                  ─ Ldlt
+//      §5  forming S_k: forward-only, static reach, contraction  ─ factorize
+//      §6  the peel                                              ─ peel cache
+//      §6a why the cross points must be peeled too               ─ peel sets
+//      §7  ASd-preconditioned conjugate gradients                ─ Precond, cg
+//      §8  the predicted inertia                                 ─ peel cache
+//      §9  refinement and failure semantics                      ─ solve
 //
 // -----------------------------------------------------------------------------
-//  1.  WHAT IPOPT ASKS OF A LINEAR SOLVER
+//  §1  WHAT IPOPT ASKS OF A LINEAR SOLVER
 // -----------------------------------------------------------------------------
-//  At every Newton step IPOPT hands us the symmetric augmented KKT matrix A —
+//  At every Newton step IPOPT hands over the symmetric augmented KKT matrix A —
 //  lower triangle only, in triplet (i, j, value) form, 1-based, possibly with
 //  duplicate entries that must be SUMMED — with its own δ_w/δ_c regularization
-//  ALREADY applied.  It then wants two things back:
+//  ALREADY applied.  It wants two things back:
 //
 //     (a) a solve            A · Δz = r
 //     (b) the INERTIA        n_neg = #negative eigenvalues of A
 //
 //  (b) is not optional.  IPOPT's inertia-correction loop reads n_neg to decide
 //  whether the current δ_w makes the reduced Hessian positive definite on the
-//  null space of the constraints; if we lie about it the filter line search
-//  chases a curvature defect that is not there.  So a solver that only does
-//  (a) — a pure Krylov method, say — cannot be plugged in here without also
-//  switching IPOPT to its inertia-free mode.
+//  null space of the constraints; a wrong answer sends the filter line search
+//  chasing a curvature defect that is not there.
+//
+//  Failure semantics — and the principle behind every failure path here:
+//
+//      SYMSOLVER_SINGULAR        IPOPT raises δ_w/δ_c and retries
+//      SYMSOLVER_WRONG_INERTIA   IPOPT raises δ_w and retries
+//
+//  Both retries are REGULARIZATION.  So this file reports SINGULAR only for
+//  conditions a larger δ can actually cure (a broken factorization, an inertia
+//  it cannot stand behind) and never for conditions it cannot (an iterative
+//  solve that merely failed to converge — §9 explains what happens instead).
 //
 //  IPOPT owns everything else: the filter line search, the μ-homotopy, the
-//  restoration phase.  We own only the linear algebra.
+//  restoration phase.  This file owns only the linear algebra.
 //
 // -----------------------------------------------------------------------------
-//  2.  THE ARROWHEAD IDEA
+//  §2  THE ARROWHEAD IDEA
 // -----------------------------------------------------------------------------
-//  The caller gives us an OWNER MAP: for every KKT index, the subdomain that
+//  The caller provides an OWNER MAP: for every KKT index, the subdomain that
 //  owns it, or −1 meaning "border" (a complicating unknown, shared by ≥ 2
 //  subdomains).  Permuting the border indices last turns A into a bordered
 //  block-diagonal — "arrowhead" — matrix:
@@ -41,9 +80,11 @@
 //        ⎢                W_K B_Kᵀ⎥
 //        ⎣ B_1   B_2  ⋯   B_K  C ⎦
 //
-//  NOTE this is a pure PERMUTATION — no unknowns are duplicated, no linking
+//  This is a pure PERMUTATION — no unknowns are duplicated, no linking
 //  constraints are introduced — so C is genuinely nonzero and the B_k carry
-//  real Jacobian/Hessian entries.
+//  real Jacobian/Hessian entries.  It requires that no triplet couple two
+//  DIFFERENT subdomains directly; route_triplets() verifies that and rejects
+//  the owner map as a "partition leak" otherwise.
 //
 //  Block elimination of the W_k gives the INTERFACE (Schur complement) system
 //
@@ -56,309 +97,303 @@
 //        Δx_k = W_k⁻¹ (r_k − B_kᵀ Δy)                                     (2.4)
 //
 //  Everything with a subscript k is INDEPENDENT across k — that is the whole
-//  point of the decomposition.  Only (2.3) is global.
+//  point.  Only (2.3) is global, and it is the only place a global object
+//  could appear.  It never does: S is applied matrix-free,
 //
-//  The inertia comes for free, by HAYNSWORTH ADDITIVITY:
+//        S·y = C·y + Σ_k N_k S_k N_kᵀ y,      S_k = −B_k W_k⁻¹ B_kᵀ,      (2.5)
 //
-//        In(A) = Σ_k In(W_k) + In(S)                                      (2.5)
-//
-//  so we answer IPOPT's inertia query WITHOUT ever factorizing the full KKT.
-//  (Eigenvalues would not do: with the barrier terms Σ ~ z²/μ these matrices
-//  reach ‖A‖ ~ 1e18 and eigenvalue signs become rounding noise.  Pivot signs
-//  of an LDLᵀ are exact regardless of scaling.)
-//
-// -----------------------------------------------------------------------------
-//  3.  WHAT SOLVES WHAT, IN THIS FILE
-// -----------------------------------------------------------------------------
-//    W_k   Eigen::SimplicialLDLT  (sparse LDLᵀ, no pivoting).  Gives both the
-//          local solves and In(W_k) from the signs of D.  The S_k formation
-//          does NOT go through its solve(): it uses the raw L and D directly,
-//          for a forward-only, sparse-right-hand-side route — see the long
-//          comment at step 2 of factorize().
-//    S     assembled sparse, then
-//            · Eigen::SimplicialLDLT — for In(S) only (eq. 2.5), plus a free
-//              direct fallback since the factorization exists anyway;
-//            · preconditioned CONJUGATE GRADIENTS — the actual interface solve,
-//              with the additive-Schur (ASd) preconditioner by default. Which
-//              preconditioner is used is not a detail: see §6.
-//
-//  CG needs a symmetric POSITIVE DEFINITE operator, and S is generally not:
-//  see §4.  The factorization of S therefore does double duty — it is the exact
-//  admissibility gate for CG (we know In(S) before we try) and the safety net
-//  when CG fails.
-//
-//  Which raises the obvious objection, and §7 is about it: if S is assembled and
-//  factorized anyway, CG cannot possibly SAVE anything.  Options::inertia_free
-//  is the answer — it deletes that factorization, at a price worth measuring.
-//
-//  ⚠ THE ONE REAL WEAKNESS of the Eigen route.  SimplicialLDLT does NOT pivot.
-//  On a symmetric QUASI-DEFINITE matrix (positive definite (1,1) block, negative
-//  definite (2,2) block) an unpivoted LDLᵀ always exists, and IPOPT's δ_w > 0,
-//  δ_c > 0 make the KKT matrix exactly that.  But IPOPT usually starts a step
-//  with δ_w = δ_c = 0, and then a zero pivot is possible.  We detect it
-//  (zero / non-finite D entry) and return SYMSOLVER_SINGULAR.  IPOPT responds
-//  by raising δ_w and δ_c and handing us the matrix again — which is precisely
-//  the regularization that makes the unpivoted factorization safe.  So the
-//  failure is self-correcting; the price is extra factorizations per iteration
-//  compared with a pivoting Bunch–Kaufman code such as MA57.  That price is
-//  the honest cost of dropping HSL, and it is why dd_solver.hpp uses MA57.
+//  through the LOCAL dense Schur blocks S_k, which each subdomain forms on its
+//  own (§5).  N_k selects the border positions subdomain k touches.  This is
+//  the distributed algorithm, not a simulation of it: the only communication a
+//  real implementation needs per CG iteration is one reduction over the border
+//  vector.
 //
 // -----------------------------------------------------------------------------
-//  4.  WHY THERE IS A "PEEL", AND WHY IT IS THE ONLY EXTRA IDEA HERE
+//  §3  INERTIA BY HAYNSWORTH ADDITIVITY
 // -----------------------------------------------------------------------------
-//  Two kinds of border index make S unfit for CG:
+//  For symmetric M = [E Fᵀ; F G] with E nonsingular, Haynsworth's identity
+//  states In(M) = In(E) + In(G − F E⁻¹ Fᵀ).  Applied to the arrowhead:
 //
-//    (i)  DUAL border indices.  On a k×k tile partition the driver promotes the
-//         cut-corner dual pairs to the border (otherwise the local blocks are
-//         structurally rank-deficient).  Those promoted duals are EXACTLY the
-//         negative eigenvalues of S — measured: In(S)_neg equals the promoted
-//         count at every single solve.  So S is indefinite by construction and
-//         plain CG can never run on a tile partition.
-//    (ii) The scalar α.  It appears in every subdomain, so its row/column of S
-//         is dense, which wrecks both sparsity and the conditioning.
+//        In(A) = Σ_k In(W_k) + In(S)                                      (3.1)
 //
-//  The PEEL removes both before the Krylov solve.  Split the border into the
-//  peeled set P (the promoted duals + α) and the kept set f:
+//  Σ_k In(W_k) is FREE — the pivot signs of factorizations that happen anyway,
+//  locally, in parallel.  (Eigenvalues would not do: the barrier terms Σ ~
+//  z²/μ drive ‖A‖ to ~1e18, where the signs of small eigenvalues are rounding
+//  noise.  Pivot signs of an LDLᵀ are exact regardless of scaling — Sylvester's
+//  law.  Every inertia statement in this file reduces to pivot signs or to an
+//  exact eigendecomposition of a small, deliberately equilibrated matrix.)
+//
+//  In(S) is the term that would classically force assembling and factorizing
+//  S — the one serial step in an otherwise embarrassingly parallel scheme.
+//  §8 derives it instead from a second application of the same identity.
+//
+// -----------------------------------------------------------------------------
+//  §4  THE SUBDOMAIN BLOCKS: UNPIVOTED LDLᵀ
+// -----------------------------------------------------------------------------
+//  Each W_k is factorized by Eigen::SimplicialLDLT, which does NOT pivot for
+//  stability — the one real weakness of the Eigen route.  The saving grace is
+//  structural: with δ_w > 0, δ_c > 0 the KKT matrix is symmetric QUASI-DEFINITE
+//  (positive definite (1,1) block, negative definite (2,2) block), and an
+//  unpivoted LDLᵀ of a quasi-definite matrix always exists (Vanderbei).  But
+//  IPOPT usually offers δ_w = δ_c = 0 first, where a zero pivot is possible.
+//  The breakdown is detected exactly (a zero or non-finite entry of D) and
+//  reported SINGULAR; IPOPT responds with δ_w, δ_c > 0 — precisely the
+//  regularization that makes the unpivoted factorization safe.  Self-
+//  correcting, at the price of a few extra factorizations per run relative to
+//  a pivoting Bunch–Kaufman code such as MA57.  That price is the honest cost
+//  of dropping HSL, and it is why dd_solver.hpp uses MA57.
+//
+//  No artificial shift is ever added inside the solver: masking a local rank
+//  deficiency would corrupt the inertia signal (3.1) that drives IPOPT's δ_w
+//  loop.
+//
+// -----------------------------------------------------------------------------
+//  §5  FORMING S_k: FORWARD-ONLY, STATIC REACH, ROW CONTRACTION
+// -----------------------------------------------------------------------------
+//  S_k is mathematically DENSE — entry (a,b) is −b_aᵀ W_k⁻¹ b_b with W_k⁻¹
+//  full — so the design question is not how to store it but how cheaply it can
+//  be FORMED, and (per §7) it is worth forming: CG applies it as a dense
+//  p_k × p_k GEMV, cheaper per iteration than any factored or matrix-free
+//  alternative, and the ASd preconditioner needs its entries anyway.
+//
+//  Naively the formation is p_k full back-solves through W_k with dense
+//  right-hand sides — the dominant cost of the whole factorization.  Three
+//  exact observations remove nearly all of it:
+//
+//  (a) FORWARD ONLY.  With W = P⁻¹ L D Lᵀ P (Eigen applies no scaling, so the
+//      halves compose exactly) and Pᵀ = P⁻¹,
+//
+//          B W⁻¹ Bᵀ = (L⁻¹ P Bᵀ)ᵀ D⁻¹ (L⁻¹ P Bᵀ) = Yᵀ D⁻¹ Y.              (5.1)
+//
+//      The Lᵀ half of the solve cancels against the B multiplying it back on
+//      the left: the BACKWARD substitution is never performed, and B itself
+//      disappears — Y already carries it.
+//
+//  (b) STATIC REACH.  The columns of Bᵀ hold a handful of nonzeros each, and a
+//      forward substitution propagates column j of L only through a nonzero
+//      multiplier — so each column of Y lives on the REACH of its right-hand
+//      side: the union of elimination-tree paths from the RHS pattern to the
+//      root (Gilbert's theorem).  The pattern is fixed for the whole run, so
+//      the reach is computed ONCE per column (route_triplets) and both the
+//      substitution and everything downstream iterate only those lists.
+//      Nothing of size n_k is ever swept: profiled before this structure
+//      existed, the pattern-blind O(n_k) sweeps and scans over the mostly-
+//      empty dense Y buffer were ~90% of the formation time — the arithmetic
+//      was never the cost.
+//
+//  (c) ROW CONTRACTION.  The product (5.1) is contracted by rows,
+//
+//          S_k = − Σ_r (1/d_r) · y_rᵀ y_r,     y_r = the r-th row of Y,   (5.2)
+//
+//      at cost Σ_r nnz(y_r)² ≤ p_k·nnz(Y), instead of a dense GEMM's
+//      2·n_k·p_k² — which multiplied almost nothing but zeros.
+//
+//  Measured together (cameraman N=64, exact Hessian, whole-run wall clock,
+//  identical iterations): 2×2 tiles 42.8 s → 16.0 s, 4 strips 25.7 s → 8.1 s
+//  against the dense-GEMM formation.  DDS_SCHUR_CHECK=1 referees every block
+//  (rel-err ~1e-11 typical).
+//
+// -----------------------------------------------------------------------------
+//  §6  THE PEEL
+// -----------------------------------------------------------------------------
+//  CG needs a symmetric POSITIVE DEFINITE operator, and S is generally not.
+//  THREE kinds of border index are to blame, and the peel removes all three:
+//
+//    (i)   DUAL border indices.  On a k×k tile partition the driver promotes
+//          the cut-corner dual pairs to the border (otherwise the local blocks
+//          are structurally rank-deficient).  Those promoted duals are EXACTLY
+//          the negative eigenvalues of S — measured: In(S)_neg equals the
+//          promoted count at every solve — so on tiles S is indefinite by
+//          construction and plain CG can never run on it.
+//    (ii)  The scalar α.  It appears in every subdomain, so its row/column of
+//          S is dense, wrecking both sparsity and conditioning.
+//    (iii) The CROSS POINTS — border positions touched by ≥ 3 subdomains.
+//          These do not make S indefinite; they make it BADLY CONDITIONED as
+//          the subdomain count grows, which is a different and subtler defect
+//          (§6a below).
+//
+//  Split the border into the peeled set P (all three of the above) and the
+//  kept set f:
 //
 //        ⎡ S_ff  S_fP ⎤ ⎡Δy_f⎤   ⎡r_f⎤
 //        ⎣ S_Pfᵀ S_PP ⎦ ⎣Δy_P⎦ = ⎣r_P⎦
 //
-//  With  Z = S_ff⁻¹ S_fP  and  T = S_PP − S_fPᵀ Z  (dense, |P| × |P|, tiny):
+//  With  Z = S_ff⁻¹ S_fP  and  T = S_PP − S_fPᵀ Z  (dense, |P| × |P|):
 //
-//        Δy_P = T⁻¹ (r_P − S_fPᵀ S_ff⁻¹ r_f)                              (4.1)
-//        Δy_f = S_ff⁻¹ r_f − Z Δy_P                                       (4.2)
+//        Δy_P = T⁻¹ (r_P − S_fPᵀ S_ff⁻¹ r_f)                              (6.1)
+//        Δy_f = S_ff⁻¹ r_f − Z Δy_P                                       (6.2)
 //
-//  The indefinite and dense directions now live entirely inside T, and S_ff —
-//  the operator CG actually iterates on — is SPD.  Z is built once per
-//  factorization, one CG solve per column of S_fP.  |P| is small: 2(k−1)² + 1
-//  on a k×k tile partition (3 at k=2, 19 at k=4), and just 1 (α alone) on
-//  strips or in 1D.
-//
-//  This is the FETI-DP/BDDC corner treatment, and it is the same construction
-//  dd_solver.hpp calls the α peel + dual peel.
+//  The indefinite, dense and cross-point directions now live entirely inside
+//  T — which is solved EXACTLY — and S_ff, the operator CG actually iterates
+//  on, is SPD whenever the design premise holds.
 //
 // -----------------------------------------------------------------------------
-//  5.  WHAT IS NOT HERE (deliberately) — look in dd_solver.hpp for these
+//  §6a  WHY THE CROSS POINTS MUST BE PEELED TOO
 // -----------------------------------------------------------------------------
-//    · MA57 / MA97 / MUMPS block backends and the MUMPS partial-Schur route
-//    · the second (nested) arrowhead level on S
-//    · signed-LDLᵀ-preconditioned MINRES on the full indefinite S
-//    · the LAGGED Schur (caching S_k across Newton steps). The FORWARD-ONLY
-//      Schur is kept — see the S_k comment in factorize(); it is exact, it is
-//      four lines, and it is what lets the sparse-RHS pruning pay
-//    · matrix-free application of S (the distributed cost simulation)
-//    · the BJ (block-Jacobi-on-S_k) preconditioner — here you get Jacobi and
-//      ASd, which are the two that matter (see the Precond comment)
-//    · frozen value-slot maps (here: the sparse matrices are simply rebuilt
-//      from triplets every Newton step — a few percent slower, far clearer)
-//    · the singular-block census, the arrowhead dump, DD_CHECK
-//    · dd_solver.hpp's APPLY_MATFREE (S·y re-derived through K subdomain
-//      back-solves EVERY iteration, modelling the regime where the local Schur
-//      blocks are not kept).  The inertia-free mode here keeps the S_k, which is
-//      what a real distributed code does — see apply_S()
-//    · the built-in 2D image geometry (here: the owner map is always injected)
+//  This is the FETI-DP corner rule, and it is not an analogy: Farhat, Lesoinne,
+//  LeTallec, Pierson & Rixen (IJNME 50:1523–1544, 2001) define a corner as
+//  "its cross points — that is, the points belonging to more than two
+//  subdomains" (their definition D1) and make exactly those unknowns primal.
+//  T is then precisely their coarse problem, and the reason it works in 2D is
+//  a theorem: Mandel & Tezaur (Numer. Math. 88:543–558, 2001) prove that in
+//  two dimensions CORNER CONSTRAINTS ALONE give a condition number bounded by
+//  C(1+log(H/h))², INDEPENDENT of the number of subdomains.  (The edge and
+//  face averages that dominate the BDDC literature are a 3D requirement — in
+//  2D they are not needed.)
 //
-//  Environment switches:  DDS_DEBUG=1        partition / CG diagnostics
-//                         DDS_SCHUR_CHECK=1  every S_k vs the naive route
+//  Without them the interface preconditioner is ONE-LEVEL, using only local
+//  information, and one-level preconditioners are known not to scale in the
+//  partition count.  Lueg, Bynum, Laird & Biegler (Optim. Eng. 27:555–585,
+//  2026) — the source of this file's ASd preconditioner — say so of their own
+//  method, and propose a two-level coarse correction (their eq. 22) as the
+//  remedy, leaving its application to optimization Schur complements as future
+//  work.  Note their PDE test problem cuts along time breakpoints, where "any
+//  set of two complicating variables are at most shared by one partition" —
+//  i.e. NO cross points at all, so ASd was never exercised in this regime.
+//  Peeling the cross points is the cheapest possible coarse correction: they
+//  go into T, which is already built and already solved exactly.
 //
-//  (Sections 6 and 7 below carry the measurements.)
+//  MEASURED (cameraman, --hessian exact), cross-point peel off → on:
 //
-// -----------------------------------------------------------------------------
-//  6.  MEASURED (cameraman, --hessian exact, macOS, 2026-09-07)
-// -----------------------------------------------------------------------------
-//  Against IPOPT's own monolithic MUMPS on the SAME instance — the point of the
-//  comparison is that the decomposition must not change the answer:
+//        N=64  4 strips    129 it, 7.99 s  →  bit-identical (no cross points)
+//        N=64  2×2 tiles   178 it, 11.4 s  →  170 it, 10.6 s
+//        N=32  3×3 tiles   195 it, 6.31 s  →  113 it, 3.24 s
+//        N=32  4×4 tiles  2251 it,  160 s  →  509 it, 36.8 s
+//        N=64  4×4 tiles  did not converge →  782 it,  173 s
 //
-//    N=16   mumps                            48 it   α*=0.070831  PSNR 24.97 dB
-//           ddsimple 2×2 tiles, direct       50 it   α*=0.070831  PSNR 24.97 dB
-//           ddsimple 2×2 tiles, cg           50 it   α*=0.070831  PSNR 24.97 dB
-//           ddsimple 2 strips,  cg           50 it   α*=0.070831  PSNR 24.97 dB
-//    N=32   mumps                            65 it   α*=0.070859  PSNR 26.34 dB
-//           ddsimple 3 strips,  cg           75 it   α*=0.070859  PSNR 26.34 dB
-//           ddsimple 3×3 tiles, cg           75 it   α*=0.070859  PSNR 26.34 dB
+//  Same PSNR in every row.  The gain scales with the cross-point count, and
+//  STRIPS ARE BIT-IDENTICAL because they have none — which is the mechanism
+//  confirming itself.
 //
-//  Identical solutions everywhere; the ~15% extra iterations are the unpivoted
-//  LDLᵀ asking IPOPT for regularization it would not otherwise have needed (§3).
+//  SIZES.  On a k×k tile partition, measured: (k−1)² cross points, each of
+//  degree 3, and 4(k−1)² promoted duals (four per cut-corner cell — the driver
+//  promotes two rank-1 dual pairs there).  So
 //
-//  How much work CG actually carried (solves it completed / solves attempted):
+//        |P| = 4(k−1)² + (k−1)² + 1 = 5(k−1)² + 1,
 //
-//    N=16  2 strips    246/246   45 its/solve   ← no peel needed, no fallbacks
-//    N=16  2×2 tiles   105/129   90 its/solve
-//    N=16  4×4 tiles    64/ 90 1219 its/solve   ← the peel-by-CG cost, see §4
-//    N=32  3 strips    346/346   72 its/solve
-//    N=32  3×3 tiles   176/208  334 its/solve
+//  measured 6, 21, 46 at k = 2, 3, 4 against interfaces of p = 128, 261, 400.
+//  On strips and in 1D there are no cross points and no promoted duals, and
+//  |P| = 1 (α alone).  |P| still grows LINEARLY with the subdomain count, so
+//  T is only cheap at modest k; that growth is what the DD literature answers
+//  with multilevel or inexact coarse solves (Klawonn & Rheinbach, "Inexact
+//  FETI-DP methods", IJNME 69:284–307, 2007; Tu, "Three-level BDDC", SISC
+//  29:1759–1780, 2007), and build_peel_sets() carries a guard that declines
+//  the cross-point peel outright when it would not stay small.
 //
-//  Cost of the S_k formation — the forward-only + sparse-RHS route of step 2 in
-//  factorize(), against the naive "p_k full back-solves with a dense RHS".
-//  Whole-run wall clock, --interface direct so the interface solve does not
-//  blur the comparison, iteration counts and PSNR identical in every row:
-//
-//    N=32  3×3 tiles    1.63 s → 0.90 s   1.8×
-//    N=48  3×3 tiles    9.06 s → 5.25 s   1.7×
-//    N=64  4×4 tiles   23.48 s → 14.19 s  1.65×
-//
-//  Why only ~1.7× when the triangular-solve work drops far more than that: of
-//  L, the pruned forward substitution visits
-//
-//    N=32  4.4% of the columns, 13.8% of the nonzeros
-//    N=48  3.1% of the columns, 14.1% of the nonzeros
-//    N=64  3.0% of the columns, 13.7% of the nonzeros
-//
-//  — about 1/7 of the work — and the backward half is not performed at all, so
-//  the triangular solves themselves get roughly 14× cheaper.  What is left is
-//  everything else: the W_k factorizations, the Yᵀ D⁻¹ Y products, the assembly
-//  and factorization of S.  Those now dominate, which is the point at which
-//  optimizing this phase further stops paying.
-//
-//  (Note how much lower the COLUMN percentage is than the NONZERO percentage:
-//  the columns a sparse right-hand side reaches are the fat ones near the root
-//  of the elimination tree, where the fill lives.  Pruning by column count
-//  would look ~30× better than the work actually saved — worth remembering
-//  before quoting a reach ratio as a speedup.)
-//
-//  DDS_SCHUR_CHECK=1 compares every S_k against the naive two-sided route:
-//  rel-err ~1e-12 typical, worst 3e-8 at the most ill-conditioned iterates,
-//  where the two roundings diverge and the iterative refinement is what keeps
-//  the step honest.
-//
-//  Two things to read off this.  First, on STRIP partitions there is no peel and
-//  no fallback at all: CG carries every interface solve, which is the cleanest
-//  demonstration that the scheme works.  Second, the preconditioner matters
-//  enormously — with JACOBI instead of ASD the same N=16 2×2 run fell back on
-//  EVERY solve (0/50 carried).  A Krylov interface solve stands or falls on its
-//  preconditioner, and that is the honest headline of this file.
+//  Z costs one CG solve per column of S_fP, once per factorization — the
+//  expensive part of the scheme, and the honest part: EVERY system involving
+//  S_ff in this file goes through CG.  Two hard-won details (see the peel
+//  cache code for the measurements):
+//    · each column is WARM-STARTED from its last accepted value — the systems
+//      change slowly along the barrier path, and the dominant cold-start
+//      failure mode was CG stalling with zero progress on a column it could
+//      solve fine one build later;
+//    · a column that still fails means the prediction of §8 cannot be issued,
+//      and the whole factorization is refused (SINGULAR) — see §8.
 //
 // -----------------------------------------------------------------------------
-//  7.  INERTIA-FREE MODE — and the contradiction it resolves
+//  §7  ASd-PRECONDITIONED CONJUGATE GRADIENTS
 // -----------------------------------------------------------------------------
-//  THE OBJECTION.  The point of a Krylov interface solve is to never form or
-//  factorize the global object.  But IPOPT wants In(A), Haynsworth turns that
-//  into In(S), and In(S) comes only from a factorization of S — so in the
-//  DEFAULT mode S is assembled and factorized every Newton step regardless, the
-//  direct back-solve is then nearly free, and CG is strictly overhead.  It
-//  cannot win.  The objection is correct.
+//  A Krylov interface solve stands or falls on its preconditioner.  Measured
+//  (cameraman N=16, 2×2 tiles): with ASd, CG carried the interface solves;
+//  with plain Jacobi it stalled on EVERY one.  ASd (Lueg eq. 20–21) is
+//  therefore the ONLY preconditioner in this file — see Precond below for the
+//  construction and why its diagonal swap is the whole trick.
 //
-//  Note where it bites: NOT on Σ_k In(W_k), which is free (those factorizations
-//  happen anyway, locally, in parallel).  Only In(S) forces the one global
-//  object and the one serial factorization.
+//  The CG routine itself (cg_solve) is textbook PCG plus three provisions
+//  that turn "CG assumes SPD" into a runtime check: an rz ≤ 0 guard (the
+//  preconditioner is not SPD), a pAp ≤ 0 guard (the operator is not SPD along
+//  this direction), and best-iterate memory so a stalled solve still returns
+//  something usable.  Interface answers are ACCEPTED only if both CG's own
+//  residual and the residual of the full interface system pass 1e-2; §9 says
+//  what happens to rejected ones.
 //
-//  Options::inertia_free removes exactly that.  S is never assembled and never
-//  factorized; the interface operator is applied through the local Schur blocks
-//  (apply_S); IPOPT is told ProvidesInertia() = false and falls back on its
-//  inertia-free curvature test (Chiang & Zavala — it will refuse to run unless
-//  neg_curv_test_tol > 0, so the driver sets both together).
-//
-//  WHAT IT COSTS.  Three things go at once, and only the first is obvious:
-//    · the serial factorization of S               ← the point
-//    · the exact CG admissibility gate.  In(S) told us BEFORE a solve whether
-//      S_ff was SPD.  Without it CG just runs, and its pSp ≤ 0 guard finds out
-//      during the solve, along whichever directions the Krylov space happens to
-//      explore.  Strictly weaker.
-//    · the free direct fallback.  With no safety net, a CG failure has nowhere
-//      to go.  Reporting SINGULAR is truthful but useless — IPOPT answers with
-//      δ_w, which cannot fix a Krylov convergence failure, and the run dies
-//      (measured: IPOPT Internal_Error on 3 of 4 configurations).  So the mode
-//      hands back CG's best iterate instead and lets solve()'s refinement judge
-//      it against the true triplets.  That is what makes it survive at all.
-//
-//  MEASURED (cameraman, --hessian exact, ASd, same solutions to 2 dp of PSNR):
-//
-//    run                    inertia            inertia-free          its   wall
-//    N=16  2 strips      50 it   0.10 s      71 it   0.11 s         1.4×   1.1×
-//    N=16  2×2 tiles     50 it   0.10 s     108 it   0.24 s         2.2×   2.4×
-//    N=32  3 strips      75 it   1.48 s     115 it   1.81 s         1.5×   1.2×
-//    N=32  3×3 tiles     75 it   1.71 s     555 it  20.23 s         7.4×  11.8×
-//
-//  CG failures (fallbacks / attempted solves) tell the story:
-//    N=16 2 strips     0/245  →    5/362
-//    N=16 2×2 tiles   24/129  →   96/564
-//    N=32 3 strips     0/349  →  232/790
-//    N=32 3×3 tiles   32/208  → 1007/3071   (1.67M CG iterations in total)
-//
-//  READ IT LIKE THIS.  On STRIPS — no promoted duals, S genuinely SPD — the mode
-//  works: ~1.4× the iterations and essentially the same wall clock, with the
-//  serial factorization gone.  That is a real result: the Amdahl floor CAN be
-//  removed here, and what you pay is IPOPT iterations, not linear algebra.
-//
-//  On TILES it degrades badly, and the reason is precisely the second and third
-//  costs above.  Tile partitions are where S is indefinite by construction, so
-//  they are exactly where knowing In(S) in advance was doing the most work — and
-//  losing the gate turns "skip CG, back-solve instead" into "run CG for 500
-//  iterations, fail, take the bad step anyway, make IPOPT clean it up".
-//
-//  So the inertia is not only a tax.  It also buys the certificate that CG may
-//  run and the insurance for when it may not, and dropping it costs both.  §8 is
-//  the attempt to keep them without the factorization.
+//  HOW THIS MAPS ONTO LUEG §3.1.  Their strategy is PCG on the Schur system,
+//  admissible because THEIR S is SPD outright once inertia correction
+//  succeeds — their complicating variables are primal-only and appear only in
+//  linear linking constraints, so no dual ever reaches the border.  Ours do
+//  (the promoted corner duals), which is why the peel (§6) must first carve
+//  out the non-SPD directions: S_ff plays the role their S plays, and CG runs
+//  there.  Their §3.5 offers two In(S) checks for the iterative mode — the
+//  pAp ≥ 0 monitoring inside PCG ("not a rigorous check", their words) and a
+//  conservative per-block In(S_k) test.  The first is exactly our pAp guard,
+//  kept as guard and telemetry; the second is inapplicable here, since our
+//  S_k routinely carry dual contributions and are indefinite by design.  The
+//  §8 prediction replaces both with an exact count.  Finally, their
+//  implementation notes name tight PCG tolerances as forced by the absence of
+//  a filter line search and of iterative refinement, and list both as
+//  "sensible extensions" — this solver has both (IPOPT's filter, and §9),
+//  which is what lets the acceptance threshold sit at 1e-2 rather than their
+//  1e-9.
 //
 // -----------------------------------------------------------------------------
-//  8.  PREDICTED INERTIA  (Options::PREDICTED) — the middle road
+//  §8  THE PREDICTED INERTIA — In(S) without S
 // -----------------------------------------------------------------------------
-//  IDEA.  Do not compute In(S); DERIVE it from something already at hand.
 //  Haynsworth applies to the peel split of S exactly as it applied to the
 //  arrowhead split of A:
 //
-//        In(S) = In(S_ff) + In(T),        T = S_PP − S_fPᵀ S_ff⁻¹ S_fP     (8.1)
+//        In(S) = In(S_ff) + In(T)                                         (8.1)
 //
-//  and T is ALREADY BUILT — it is the peel cache of §4, |P| × |P| with |P|
-//  between 1 and a few dozen.  So In(T) costs a dense symmetric
-//  eigendecomposition of a tiny matrix: nothing.
+//  and T is ALREADY BUILT — it is the peel cache of §6, |P| × |P|, so In(T)
+//  costs a dense symmetric eigendecomposition of a tiny matrix: nothing.  The
+//  entire prediction is one assumption:
 //
-//  The entire prediction is therefore one assumption:
+//        In(S_ff) = 0,  i.e. the kept block is positive definite,         (8.2)
 //
-//        In(S_ff) = 0,  i.e. the field block is positive definite.           (8.2)
+//  and what makes that the right assumption to bet on is that it is ALSO
+//  exactly what CG requires: the peel exists precisely to make S_ff definite.
+//  The scheme is self-consistent — the operator is usable exactly when the
+//  inertia is right — and the answer reported to IPOPT is
 //
-//  What makes that the right assumption to bet on is that IT IS ALSO WHAT CG
-//  REQUIRES.  The peel exists precisely to make S_ff definite (§4); if (8.2)
-//  fails, CG could not have run either.  The mode is self-consistent: the
-//  operator is usable exactly when the inertia is right.
+//        n_neg(A) = Σ_k n_neg(W_k) + n_neg(T).                            (8.3)
 //
-//  WHY In(S)_neg IS PREDICTABLE AT ALL.  Write In(A)_neg = m + ν, where m is the
-//  number of dual unknowns and ν the negative-curvature count of the reduced
-//  Hessian — IPOPT drives δ_w until ν = 0.  Each W_k is itself a saddle-point
-//  matrix, so In(W_k)_neg = m_k + ν_k with m_k its interior duals.  Every dual
-//  row is owned by one subdomain or promoted to the border, so Σ_k m_k =
-//  m − p_dual.  Substituting into In(A) = Σ_k In(W_k) + In(S):
+//  Scored against a referee LDLᵀ of the assembled S (temporarily reinstated
+//  for the experiment), the prediction is right 199/200 factorizations at
+//  N=32 3×3 tiles, every miss off by exactly one, with identical final
+//  solutions — the record is in the paper.
 //
-//        In(S)_neg = p_dual + ν − Σ_k ν_k                                   (8.3)
+//  REFUSING TO PREDICT.  If the peel cache cannot be built — a Z column fails
+//  to converge, or an eigenvalue of T is too close to zero for its sign to be
+//  meaningful — no prediction is issued and the factorization is reported
+//  SINGULAR.  A prediction the solver cannot stand behind would corrupt
+//  IPOPT's δ_w loop silently; SINGULAR merely costs a re-factorization at a
+//  larger δ_w, a failure IPOPT knows how to cure.  (The zero test is made on
+//  the diagonally EQUILIBRATED T — a congruence, so the inertia is unchanged —
+//  because T mixes barrier-scaled α directions ~1e20 with corner-dual
+//  directions ~1e-9, and a test against the global eigenvalue scale mistakes
+//  honest tiny eigenvalues for noise: it refused every factorization of the
+//  N=64 4×4 run before the equilibration existed.)
 //
-//  which is exactly the measured fact of §4 — In(S)_neg equals the promoted
-//  corner-dual count — whenever the local and global curvature counts agree.
-//  (8.1) is the better route in practice because it needs no such assumption
-//  about ν: T sees whatever the corner duals actually contribute.
+// -----------------------------------------------------------------------------
+//  §9  REFINEMENT AND WHAT HAPPENS WHEN CG'S ANSWER IS POOR
+// -----------------------------------------------------------------------------
+//  Every solve runs the arrowhead recursion (2.2)–(2.4) inside a few sweeps of
+//  ITERATIVE REFINEMENT measured against the ORIGINAL input triplets.  This is
+//  not a luxury: near-singular pivots (IPOPT's own δ_c = 1e-8·μ^¼ on the dual
+//  directions, for instance) lose ~10 digits through the Schur recursion —
+//  measured rel-res ~0.1 unrefined against ~1e-12 refined.  Because the
+//  residual is evaluated straight from the triplets, refinement checks the
+//  DECOMPOSITION, not just the arithmetic inside it.
 //
-//  REFUSING TO PREDICT.  If the peel cache cannot be built — a CG solve for a
-//  column of Z fails to converge — no prediction is issued and the factorization
-//  is reported SINGULAR.  That is deliberate and it is the mode's safety
-//  property: a prediction we cannot stand behind would corrupt IPOPT's δ_w loop
-//  silently, whereas SINGULAR merely costs a re-factorization at a larger δ_w.
-//  The same applies when an eigenvalue of T is too close to zero for its sign to
-//  be meaningful.
+//  Refinement is also the answer to "what if CG's interface answer is bad?".
+//  S was never factorized, so a rejected answer has no direct solve to fall
+//  back on.  Reporting SINGULAR would be truthful but useless — δ_w cannot fix
+//  a Krylov convergence failure, and the run dies (measured).  So the best
+//  iterate is handed back anyway, refinement judges it against the true
+//  matrix, and the best refined step seen is returned — the same bargain a
+//  monolithic sparse solver makes at a nasty iterate: return your answer and
+//  let IPOPT's globalization cope.
 //
-//  MEASURED (cameraman, --hessian exact, ASd, DDS_INERTIA_CHECK=1 scoring every
-//  prediction against a factorization of S computed purely as a referee):
-//
-//    run              exact          predicted                  none
-//    N=16 2 strips   50 it 0.11 s   50 it 0.09 s  78/79 ✓    71 it 0.11 s
-//    N=16 2×2 tiles  50 it 0.10 s   80 it 0.21 s  99/99 ✓   108 it 0.24 s
-//    N=32 3 strips   75 it 1.49 s   80 it 1.48 s 111/117 ✓  115 it 1.83 s
-//    N=32 3×3 tiles  75 it 1.72 s  125 it 4.51 s 132/133 ✓ 1051 it 63.31 s
-//
-//  Every mismatch was off by exactly ONE.  All three modes reach the same
-//  solution (PSNR identical to 2 dp).
-//
-//  READ IT LIKE THIS.  The prediction is right 99–100% of the time, and it
-//  recovers most of what §7 gave up: at N=32 3×3 it turns 1051 iterations and
-//  63 s back into 125 iterations and 4.5 s.  On STRIPS it is free — same
-//  iteration count, same wall clock as EXACT, with the serial factorization of S
-//  gone.  That is the result this whole line of questioning was after.
-//
-//  What still costs on TILES is not the prediction being wrong; it is the
-//  REFUSALS (90 and 205 of them above), where CG could not build the peel cache
-//  and the factorization had to be thrown away.  So the remaining obstacle has
-//  moved: it is no longer "we must factorize S to know its inertia", it is "the
-//  peel cache needs a Krylov solve that sometimes does not converge".  That is a
-//  preconditioning problem, and preconditioning problems are the kind a
-//  distributed implementation can attack.
+// -----------------------------------------------------------------------------
+//  WHAT IS NOT HERE (deliberately — it lives in dd_solver.hpp)
+// -----------------------------------------------------------------------------
+//    · MA57 / MA97 / MUMPS block backends and the MUMPS partial-Schur route
+//    · a direct or MINRES interface solve; an assembled or factorized S
+//    · the second (nested) arrowhead level, the lagged Schur cache
+//    · frozen value-slot maps (here the sparse blocks are rebuilt from
+//      triplets every Newton step — a few percent slower, far clearer)
+//    · the singular-block census, the arrowhead dump, the built-in geometry
+//      (here the owner map is always injected)
 // =============================================================================
 #ifndef DD_SOLVER_SIMPLE_HPP
 #define DD_SOLVER_SIMPLE_HPP
@@ -382,15 +417,13 @@ using Trip = Eigen::Triplet<double>;
 using Vec = Eigen::VectorXd;
 using Mat = Eigen::MatrixXd;
 
-// -----------------------------------------------------------------------------
-//  A sparse symmetric LDLᵀ with the two things we need from it: a solve, and
-//  the inertia read off the signs of D.  Wraps Eigen::SimplicialLDLT so the
-//  "did it break down?" test lives in exactly one place (see §3 of the header
-//  comment for why breakdown is possible at all).
+// =============================================================================
+//  Ldlt — sparse symmetric LDLᵀ (§4), plus the raw pieces §5 needs.
 //
-//  Only the LOWER triangle of the matrix handed to compute() is read, so a
-//  matrix stored lower-only and a matrix stored fully symmetric both work.
-// -----------------------------------------------------------------------------
+//  Wraps Eigen::SimplicialLDLT so the "did it break down?" test lives in
+//  exactly one place.  Only the LOWER triangle of the matrix handed to it is
+//  read, so lower-only and fully symmetric storage both work.
+// =============================================================================
 class Ldlt {
 public:
    // Symbolic analysis: fill-reducing ordering + elimination tree.  Depends on
@@ -403,16 +436,17 @@ public:
    }
 
    // Numeric factorization.  False = this matrix is unusable (breakdown or a
-   // zero pivot); the caller must report SYMSOLVER_SINGULAR rather than solve.
+   // zero pivot, §4); the caller must report SINGULAR rather than solve.
    bool factorize(const SpMat& A) {
       ok_ = false;
       n_neg_ = 0;
       if (!analyzed_ && !analyze(A)) return false;
       f_.factorize(A);
       if (f_.info() != Eigen::Success) return false;
-      // Inertia = signs of D.  A zero or non-finite pivot means the unpivoted
-      // factorization has broken down: the solve would return garbage and the
-      // inertia would be meaningless, so both are refused.
+      // Inertia = signs of D (Sylvester, §3).  A zero or non-finite pivot
+      // means the unpivoted factorization has broken down: the solve would
+      // return garbage and the inertia would be meaningless, so both are
+      // refused.
       const Vec& d = f_.vectorD();
       for (int i = 0; i < d.size(); ++i) {
          if (!std::isfinite(d[i]) || d[i] == 0.0) return false;
@@ -434,112 +468,96 @@ public:
    int negative_eigenvalues() const { return n_neg_; }
    bool ok() const { return ok_; }
 
-   // ---- the pieces of the factorization, for the sparse-RHS Schur route ----
+   // ---- the pieces of the factorization the S_k formation (§5) needs ------
    //
-   //  Eigen factorizes  W = P⁻¹ L D Lᵀ P  (its solve applies, in order, P, L⁻¹,
-   //  D⁻¹, L⁻ᵀ, P⁻¹).  L is UNIT lower triangular and Eigen stores only its
-   //  STRICTLY lower entries; D lives in a separate vector.  Both are needed by
-   //  the S_k formation in Arrowhead::factorize — see the long comment there.
+   //  Eigen factorizes  W = P⁻¹ L D Lᵀ P  (its solve applies, in order, P,
+   //  L⁻¹, D⁻¹, L⁻ᵀ, P⁻¹).  L is UNIT lower triangular and Eigen stores only
+   //  its STRICTLY lower entries; D lives in a separate vector.
    const Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int>&
    permutationP() const { return f_.permutationP(); }
    const Vec& vectorD() const { return f_.rawD(); }
 
-   //  y ← L⁻¹ y, in place, for ONE right-hand side — the SPARSE-RHS forward
-   //  substitution, and the whole point of it is the `continue`.
+   //  The elimination tree (parent[j] = etree parent of column j, −1 at a
+   //  root), fixed by the symbolic analysis.  It is what turns the sparse-RHS
+   //  pruning of §5(b) from a runtime test into a STATIC structure: the
+   //  nonzeros of L⁻¹b lie inside the union of etree paths from the nonzero
+   //  positions of b to the root (Gilbert's reach theorem), so a right-hand
+   //  side with a fixed PATTERN has a fixed reach, computable once.
+   const int* etree_parent() const { return f_.rawParent().data(); }
+
+   //  y ← L⁻¹ y, in place, for ONE right-hand side whose pattern is covered
+   //  by `reach` — the sparse-RHS forward substitution of §5(b).
    //
    //  A forward substitution propagates column j of L only through the
-   //  multiplier y[j].  When y[j] is zero, column j contributes nothing and can
-   //  be skipped entirely — so a right-hand side with a handful of nonzeros
-   //  touches only the part of L those nonzeros can reach, instead of all of it.
-   //  Correct for ANY y (a zero multiplier really does contribute nothing), so
-   //  no structural analysis, reach computation or elimination tree is needed:
-   //  the test IS the pruning.
+   //  multiplier y[j]; a zero multiplier contributes nothing.  Iterating the
+   //  precomputed reach instead of all n columns deletes the O(n) outer sweep
+   //  a pattern-blind version needs — profiled on this code, that sweep
+   //  visited ~98% empty columns and cost more than the arithmetic it
+   //  guarded.  The numeric test stays as a second, finer pruning within the
+   //  reach.
    //
-   //  Ascending j is the right order because L is lower triangular — by the time
-   //  the loop reaches column j, every column that could have written into y[j]
-   //  has already been processed, so y[j] is final.
+   //  Ascending order is correct because an etree parent always has the
+   //  larger index: by the time the loop reaches column j, every column that
+   //  could have written into y[j] has already been processed.
    //
-   //  Eigen's own sparse-RHS overload does NOT do this: it converts the
-   //  right-hand side to dense panels (solve_sparse_through_dense_panels) and
-   //  runs the ordinary dense solve on them.
-   //
-   //  The one inefficiency left is the outer sweep itself, which is O(n) even
-   //  when almost nothing is reached; an elimination-tree reach would visit only
-   //  the reached columns, at the cost of a second data structure.  Measured at
-   //  ~3% of the work here, so it is not worth the machinery.
-   void forward_solve(double* y) const {
+   //  (Eigen's own sparse-RHS overload does neither pruning: it converts the
+   //  right-hand side to dense panels and runs the ordinary dense solve.)
+   void forward_solve_reach(double* y, const std::vector<int>& reach) const {
       const auto& L = f_.rawL();
-      const int n = (int)L.cols();
-      for (int j = 0; j < n; ++j) {
+      for (int j : reach) {
          const double yj = y[j];
-         if (yj == 0.0) continue;              // <- the pruning
+         if (yj == 0.0) continue;
          for (SpMat::InnerIterator it(L, j); it; ++it)
             if ((int)it.row() > j) y[it.row()] -= it.value() * yj;
       }
    }
 
 private:
-   // Eigen keeps the raw factor and D protected — reasonably, since they are
-   // useless without knowing the exact convention above.  This is the only way
-   // to reach them, and it adds no behaviour of its own.
+   // Eigen keeps the raw factor, D and the etree protected — reasonably,
+   // since they are useless without knowing the exact convention above.  This
+   // is the only way to reach them, and it adds no behaviour of its own.
    struct Impl : Eigen::SimplicialLDLT<SpMat, Eigen::Lower> {
       const SpMat& rawL() const { return this->m_matrix; }
       const Vec& rawD() const { return this->m_diag; }
+      const Eigen::VectorXi& rawParent() const { return this->m_parent; }
    };
    Impl f_;
    bool analyzed_ = false, ok_ = false;
    int n_neg_ = 0;
 };
 
-// -----------------------------------------------------------------------------
-//  The interface preconditioner.  Two choices, both taken from Lueg's paper as
-//  implemented by the Python reference (dd_kkt.py's make_preconditioner):
+// =============================================================================
+//  Precond — the ASd interface preconditioner (§7).
 //
-//    JACOBI   P = diag(|S_ff|).  Trivial, and the right answer in 1D, where the
-//             interface is so small that CG terminates in <= p steps anyway.
-//             It does NOT work on a 2D interface: measured on cameraman N=16,
-//             2x2 tiles, every CG solve stalled and fell back to the direct
-//             route.  Kept because it is the honest baseline to compare with.
+//  "Additive Schur, assembled diagonal" (Lueg eq. 20–21, as implemented by the
+//  Python reference dd_kkt.py::make_preconditioner).  For each subdomain: take
+//  its LOCAL Schur block S_k, restrict it to the kept border positions that
+//  subdomain touches, REPLACE ITS DIAGONAL by the diagonal of the ASSEMBLED S,
+//  invert the small dense result, and apply the inverses additively:
 //
-//    ASD      (Lueg eq. 20-21) "additive Schur, assembled diagonal".  For each
-//             subdomain take its LOCAL Schur block S_k, restrict it to the kept
-//             border positions that subdomain touches, REPLACE ITS DIAGONAL by
-//             the diagonal of the ASSEMBLED S, invert the small dense result,
-//             and apply the inverses additively.
+//      M⁻¹ = Σ_k R_kᵀ M_k⁻¹ R_k,   M_k = R_k S_k R_kᵀ with diag ← diag(S)|R_k
 //
-//             The diagonal swap is the whole trick.  S_k on its own describes
-//             what subdomain k alone does to the shared border unknowns, so it
-//             badly underestimates their true self-coupling — every other
-//             subdomain touching the same unknown contributes to that diagonal
-//             as well.  diag(S) is the assembled truth, and it is also the one
-//             quantity a distributed implementation can share cheaply (a single
-//             all-reduce over a vector), which is exactly why Lueg picks it.
+//  The diagonal swap is the whole trick.  S_k on its own describes what
+//  subdomain k alone does to the shared border unknowns, so it badly
+//  underestimates their true self-coupling — every neighbouring subdomain
+//  contributes to that diagonal as well.  diag(S) is the assembled truth, and
+//  it is also the one quantity a distributed implementation can share cheaply
+//  (a single all-reduce over a p-vector), which is exactly why Lueg picks it —
+//  and why factorize() assembles diag(S) without assembling S.
 //
 //  A singular local block is simply skipped: a preconditioner is allowed to be
-//  incomplete, and if what remains is useless CG's rz-breakdown guard catches
-//  it and the solve falls back to the direct route.
-// -----------------------------------------------------------------------------
+//  incomplete, and if what remains is useless, CG's rz-breakdown guard catches
+//  it and the solve is rejected.
+// =============================================================================
 class Precond {
 public:
-   enum Kind { JACOBI, ASD };
-
    // nf = number of kept border positions (the dimension CG works in).
    // Sk / Nk / keptpos describe the local Schur blocks and how their rows map
    // onto kept positions; diagS_kept is diag(S) gathered on the kept positions.
-   void build(Kind kind, int nf, const std::vector<Mat>& Sk,
+   void build(int nf, const std::vector<Mat>& Sk,
               const std::vector<std::vector<int>>& Nk,
               const std::vector<int>& keptpos, const Vec& diagS_kept) {
-      kind_ = kind;
       nf_ = nf;
-      if (kind_ == JACOBI) {
-         // |.| rather than the raw diagonal: an entry that has drifted negative
-         // off the central path would make P indefinite, and CG's rz > 0 guard
-         // would then abort a solve that is otherwise perfectly fine.
-         d_.resize(nf);
-         for (int c = 0; c < nf; ++c)
-            d_[c] = 1.0 / std::max(std::abs(diagS_kept[c]), 1e-300);
-         return;
-      }
       Minv_.assign(Nk.size(), Mat());
       idx_.assign(Nk.size(), {});
       for (size_t k = 0; k < Nk.size(); ++k) {
@@ -561,9 +579,8 @@ public:
       }
    }
 
-   // z <- P^-1 r
+   // z ← M⁻¹ r
    void apply(const Vec& r, Vec& z) const {
-      if (kind_ == JACOBI) { z = r.cwiseProduct(d_); return; }
       z.setZero(nf_);
       for (size_t k = 0; k < idx_.size(); ++k) {
          const std::vector<int>& idx = idx_[k];
@@ -577,53 +594,53 @@ public:
    }
 
 private:
-   Kind kind_ = ASD;
    int nf_ = 0;
-   Vec d_;                                  // JACOBI: the already-inverted diagonal
-   std::vector<Mat> Minv_;                  // ASD: the small dense block inverses
-   std::vector<std::vector<int>> idx_;      // ASD: their kept-position lists
+   std::vector<Mat> Minv_;                  // the small dense block inverses
+   std::vector<std::vector<int>> idx_;      // their kept-position lists
 };
 
-// -----------------------------------------------------------------------------
-//  Preconditioned conjugate gradients.
+// =============================================================================
+//  cg_solve — preconditioned conjugate gradients (§7).
 //
-//  Note the signature: it takes applyA, a CALLABLE, not a matrix.  That is not
-//  decoration — the only thing CG ever needs of an operator is its action on a
-//  vector, and keeping that in the type is what lets the same routine serve
-//  both the assembled interface matrix and the matrix-free one (see §7).
+//  It takes applyA, a CALLABLE, not a matrix: the only thing CG ever needs of
+//  an operator is its action on a vector, which is what lets the interface
+//  operator stay matrix-free (2.5).  Parameter-free (the step lengths come out
+//  of the Krylov space itself); the guards and the best-iterate memory are
+//  described in §7.  Returns the best relative residual actually achieved;
+//  the CALLER decides whether that is good enough.
 //
-//  Parameter-free (the step lengths come out of the Krylov space itself), and
-//  it keeps the BEST iterate rather than the last one so a stalled run still
-//  returns something usable.  The two breakdown guards are what turn "CG
-//  assumes SPD" into a runtime check:
-//        rz  ≤ 0  →  the preconditioner is not SPD
-//        pSp ≤ 0  →  A is not SPD along this search direction
-//  Either one means the caller must fall back to the direct solve.
-//
-//  Returns the relative residual actually achieved; the caller decides whether
-//  that is good enough (interface_cg() applies its own acceptance test).
-// -----------------------------------------------------------------------------
-//  What CG reports back.  `indefinite` is the interesting one: pAp <= 0 exhibits
-//  a search direction along which A is not positive definite.  In exact
-//  arithmetic that is a one-directional PROOF of indefiniteness (not seeing it
-//  proves nothing).  In floating point on these matrices it is weaker than it
-//  sounds: with ‖A‖ ~ 1e18 a pAp that is merely tiny can come out non-positive
-//  from rounding alone, so the flag over-reports.  §8 measured exactly that —
-//  runs where it fired a dozen times still predicted the inertia correctly on
-//  78 of 79 factorizations.  Treat it as evidence, not as a certificate.
+//  What it reports back: `indefinite` records a pAp ≤ 0 event — in exact
+//  arithmetic a one-directional PROOF that A is not SPD (not seeing it proves
+//  nothing).  In floating point at ‖A‖ ~ 1e18 a merely tiny pAp can round
+//  non-positive, so the flag OVER-REPORTS; the referee experiments recorded
+//  runs where it fired repeatedly while the §8 prediction stayed correct.
+//  Treat it as evidence, not as a certificate — the Stats counters do.
+// =============================================================================
 struct CgResult {
-   double rel = 1.0;      // best relative residual reached
+   double rel = 1.0;          // best relative residual reached
    long iters = 0;
    bool indefinite = false;   // pAp <= 0 was observed
 };
 
 template <class ApplyA>
 inline CgResult cg_solve(ApplyA&& applyA, const Precond& P, const Vec& b, Vec& x,
-                         double tol, int maxit) {
+                         double tol, int maxit, const Vec* x0 = nullptr) {
    const int n = (int)b.size();
    const double bnorm = std::max(b.norm(), 1e-300);
-   x.setZero(n);
-   Vec r = b, z(n);
+   Vec r(n), z(n);
+   // Optional warm start: CG converges from any x₀, so a caller solving a
+   // slowly-varying sequence of systems (the peel columns of §6, across
+   // Newton steps and δ-retries) can seed with its previous answer.  Costs
+   // one extra operator application; a useless x₀ merely reproduces the cold
+   // start via the best-iterate memory below.
+   if (x0 != nullptr && x0->size() == n && x0->allFinite()) {
+      x = *x0;
+      applyA(x, r);
+      r = b - r;
+   } else {
+      x.setZero(n);
+      r = b;
+   }
    P.apply(r, z);
    Vec p = z, Ap(n);
    double rz = r.dot(z);
@@ -656,67 +673,56 @@ inline CgResult cg_solve(ApplyA&& applyA, const Precond& P, const Vec& b, Vec& x
 }
 
 // =============================================================================
-//  The solver itself.  Pure Eigen — this class knows nothing about IPOPT, so it
-//  can be unit-tested standalone.  The IPOPT adapter is at the bottom of the
-//  file.
+//  Arrowhead — the solver itself (§2–§9).  Pure Eigen: this class knows
+//  nothing about IPOPT, so it can be unit-tested standalone (that is what
+//  dd_simple_smoke.cpp does).  The IPOPT adapter is at the bottom of the file.
 //
 //  Life cycle:
-//        set_structure(...)   once per sparsity pattern  (partition + symbolic)
-//        values()             refresh the matrix entries  (every Newton step)
-//        factorize()          W_k, S_k, S, inertia
-//        solve(rhs)           the arrowhead solve, in place
+//      set_structure(...)   once per sparsity pattern  (partition + symbolic)
+//      values()             refresh the matrix entries  (every Newton step)
+//      factorize()          W_k, S_k, peel cache, predicted inertia
+//      solve(rhs)           the refined arrowhead solve, in place
 // =============================================================================
 class Arrowhead {
 public:
    struct Options {
       // KKT indices >= n_primal are DUAL unknowns.  Border positions with such
-      // an index are peeled (§4 (i)).  Leave it huge to disable the dual peel.
+      // an index are peeled (§6 (i)).  Leave it huge to disable the dual peel.
       int n_primal = 1 << 30;
-      // KKT index of the scalar α, or −1 if the formulation has none (§4 (ii)).
+      // KKT index of the scalar α, or −1 if the formulation has none (§6 (ii)).
       int alpha_index = -1;
-      bool use_cg = true;      // false = always use the direct LDLᵀ solve of S
-      // How In(S) is obtained — the axis §7 and §8 are about.
-      //   EXACT      assemble S, factorize it, read the pivot signs.  The
-      //              default, and the only mode with a direct fallback.
-      //   PREDICTED  never assemble or factorize S; In(S) = In(T) from the tiny
-      //              dense peel complement, assuming S_ff is SPD (§8).  Still
-      //              reports an inertia to IPOPT, so δ_w works normally.
-      //   NONE       never assemble or factorize S and report NO inertia; IPOPT
-      //              must use its inertia-free curvature test (§7).
-      // PREDICTED and NONE both force use_cg — there is nothing to solve
-      // directly with.
-      enum InertiaMode { EXACT, PREDICTED, NONE };
-      InertiaMode inertia = EXACT;
-      // ASd is the default; Jacobi is measurably useless on a 2D interface.
-      Precond::Kind precond = Precond::ASD;
-      double cg_tol = 1e-10;
+      // Make the CROSS POINTS primal too — border positions touched by >= 3
+      // subdomains (§6 (iii)).  On by default: it is the FETI-DP corner rule,
+      // and measured it is what makes tile partitions scale.  Set false to
+      // A/B against the α + dual peel alone.
+      bool peel_cross_points = true;
+      double cg_tol = 1e-10;    // CG target; acceptance is separate (1e-2, §7)
       int cg_maxit = 500;
    };
 
    struct Stats {
-      long solves = 0;        // interface solves attempted through CG
+      long solves = 0;        // interface solves attempted
       long iters = 0;         // CG iterations summed over all of them
-      long fallbacks = 0;     // CG ran but its answer was rejected
-      long skipped = 0;       // CG never ran (S inadmissible for it)
+      long rejected = 0;      // CG answers that failed the acceptance test
+                              // (still handed back — there is no fallback —
+                              // and judged again by solve()'s refinement, §9)
       long cache_builds = 0;  // peel caches built (one per factorization)
-      // §8 telemetry.  The two falsification counters are NOT the same thing:
+      // §8 falsification telemetry.  The two counters are NOT the same thing:
       //   before  CG saw non-positive curvature while BUILDING the prediction,
       //           so no prediction was issued — the safe outcome (SINGULAR).
       //   after   it happened during a later solve, i.e. an inertia already
       //           handed to IPOPT rests on a premise this run has evidence
-      //           against.  Compare it with pred_wrong before concluding
-      //           anything: the flag over-reports (see CgResult).
+      //           against.  The flag over-reports (see CgResult), so treat it
+      //           as a hint, not a verdict.
       long indef_before = 0, indef_after = 0;
       long pred_refused = 0;  // factorizations where we declined to predict
-      long pred_checked = 0;  // DDS_INERTIA_CHECK: predictions compared
-      long pred_wrong = 0;    //   ... of which disagreed with the true In(S)
-      long pred_maxerr = 0;   //   ... the largest |predicted − true| seen
    };
 
    // --------------------------------------------------------------------
    //  STRUCTURE.  irow/jcol are 0-based lower-triangle coordinates, owner is
    //  one label per KKT index (subdomain id, or −1 for border).  Everything
-   //  that depends only on the pattern is computed here, once.
+   //  that depends only on the pattern is computed here, once: the numbering,
+   //  the triplet routing, the symbolic analyses, the reaches, the peel sets.
    // --------------------------------------------------------------------
    bool set_structure(int dim, std::vector<int> irow, std::vector<int> jcol,
                       std::vector<int> owner, int nsub, const Options& opt) {
@@ -740,7 +746,8 @@ public:
          std::cerr << "[dds] dim=" << dim_ << " nnz=" << nnz_
                    << " subdomains=" << nsub_ << " border p=" << p_
                    << " peeled=" << peel_.size() << " (" << n_peel_dual_
-                   << " dual)  max dim W_k=" << max_dimk_ << "\n";
+                   << " dual, " << n_peel_cross_ << " cross)  max dim W_k="
+                   << max_dimk_ << "\n";
       return true;
    }
 
@@ -752,17 +759,16 @@ public:
 
    // --------------------------------------------------------------------
    //  FACTORIZATION.  Four steps, in order:
-   //     1. factorize every W_k                       (independent per k)
-   //     2. form the local Schur blocks S_k = −B_k W_k⁻¹ B_kᵀ  (independent)
-   //     3. assemble S = C + Σ_k scatter(S_k)         (eq. 2.1)
-   //     4. factorize S — for In(S) (eq. 2.5) and as CG's safety net
+   //     1. factorize every W_k                    (§4, independent per k)
+   //     2. form the local Schur blocks S_k        (§5, independent per k)
+   //     3. assemble C and diag(S)                 (S itself is never built)
+   //     4. build the peel cache, predict In(S)    (§6 + §8)
    // --------------------------------------------------------------------
    Status factorize() {
       n_neg_ = 0;
-      peel_valid_ = false;   // S changed ⇒ the peel cache is void
-      cg_dead_ = false;      // …and CG gets a fresh chance on the new operator
+      peel_valid_ = false;   // the operator changed ⇒ the peel cache is void
 
-      // ---- 1. the subdomain blocks ------------------------------------
+      // ---- 1. the subdomain blocks (§4) --------------------------------
       // Independent per k, and Eigen keeps no global state, so this loop is
       // safe to run in parallel (unlike MA97, whose concurrent factorization
       // corrupts its own heap — see dd_solver.hpp).
@@ -777,55 +783,19 @@ public:
       }
       for (int k = 0; k < nsub_; ++k) {
          if (!ok[k]) {
-            // No artificial shift here.  A masked rank deficiency would
-            // corrupt the very inertia signal that drives IPOPT's δ_w loop, so
-            // we report the truth and let IPOPT regularize (§3).
             if (std::getenv("DDS_DEBUG"))
                std::cerr << "[dds] W_" << k << " (dim " << dimk_[k]
                          << ") factorization failed → SINGULAR\n";
             return SINGULAR;
          }
-         n_neg_ += ldlt_[k]->negative_eigenvalues();   // the Σ_k In(W_k) of (2.5)
+         n_neg_ += ldlt_[k]->negative_eigenvalues();   // the Σ_k In(W_k) of (3.1)
       }
 
-      // ---- 2. the local Schur blocks ----------------------------------
-      //  S_k = −B_k W_k⁻¹ B_kᵀ, a dense p_k × p_k block, where p_k = |N_k| is
-      //  the number of border unknowns subdomain k actually touches.
-      //
-      //  Written naively this is p_k FULL back-solves (forward, diagonal,
-      //  backward) through W_k with a dense right-hand side, and it is the
-      //  dominant cost of the entire factorization.  Two observations remove
-      //  most of it.  Both are EXACT — nothing here is an approximation:
-      //
-      //  (a) FORWARD ONLY.  With W_k = P⁻¹ L D Lᵀ P (Eigen does no scaling, so
-      //      the halves compose exactly),
-      //
-      //          B_k W_k⁻¹ B_kᵀ = (L⁻¹ P B_kᵀ)ᵀ D⁻¹ (L⁻¹ P B_kᵀ) = Yᵀ D⁻¹ Y,
-      //
-      //      using Pᵀ = P⁻¹.  The Lᵀ half of the solve cancels against the B_k
-      //      that multiplies it back on the left, so the BACKWARD substitution
-      //      is never performed at all.  As a bonus, B_k itself disappears from
-      //      the product: Y already carries it.
-      //
-      //  (b) SPARSE RIGHT-HAND SIDE.  The columns of B_kᵀ carry only a handful
-      //      of nonzeros each (each border unknown couples to a few interior
-      //      ones), so most of L is unreachable from them and the pruned
-      //      forward substitution in Ldlt::forward_solve never touches it.
-      //
-      //  The two compose especially well, and not by accident: (b) can ONLY
-      //  help the forward half — a back-substituted vector is dense however
-      //  sparse the right-hand side was — and (a) is exactly what deletes the
-      //  backward half.  Separately each is worth a little; together they turn
-      //  "solve with every column of B_kᵀ" into "touch the reachable part of L
-      //  once per column".
-      //
-      //  What is paid instead is the Yᵀ D⁻¹ Y product, a dense p_k × p_k × dim_k
-      //  GEMM.  It replaces the backward triangular solve, so the trade is only
-      //  a win while p_k stays small against dim_k — i.e. large subdomains with
-      //  small interfaces, which is the regime the decomposition is for anyway.
-      //
-      //  DDS_SCHUR_CHECK=1 verifies every block against the naive two-sided
-      //  route, per block per factorization.
+      // ---- 2. the local Schur blocks (§5) ------------------------------
+      // S_k = −B_k W_k⁻¹ B_kᵀ via (5.1)/(5.2): pruned forward solves on the
+      // static reaches, then the sparse row contraction.  Exact throughout —
+      // every skipped term is exactly zero.  DDS_SCHUR_CHECK=1 referees each
+      // block against the naive two-sided route.
       static const bool schur_check = std::getenv("DDS_SCHUR_CHECK") != nullptr;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -837,23 +807,67 @@ public:
          // P B_kᵀ, still sparse.  Eigen's own permutation product, so there is
          // no way to get P and P⁻¹ the wrong way round.
          const SpMat PBt = ldlt_[k]->permutationP() * SpMat(B_[k].transpose());
-         Mat Y = Mat::Zero(nk, pk);
+         const std::vector<std::vector<int>>& RK = reach_[k];
+
+         // Y = L⁻¹ P B_kᵀ, held COMPRESSED on the static reach: column a is
+         // stored as the |reach(a)| values aligned with reach_[k][a].  One
+         // dense scatter workspace serves every column; the restore step below
+         // keeps it zero outside the current column's reach, so nothing of
+         // size n_k is ever swept or memset (§5(b)).
+         std::vector<std::vector<double>> Yc(pk);
+         Vec w = Vec::Zero(nk);
          for (int a = 0; a < pk; ++a) {
-            double* col = Y.data() + (size_t)a * nk;    // Y is column-major
-            for (SpMat::InnerIterator it(PBt, a); it; ++it) col[it.row()] = it.value();
-            ldlt_[k]->forward_solve(col);               // Y(:,a) ← L⁻¹ P B_kᵀ(:,a)
-         }
-         const Mat Z = ldlt_[k]->vectorD().cwiseInverse().asDiagonal() * Y;
-         Sk_[k].noalias() = -(Y.transpose() * Z);
-         // Yᵀ D⁻¹ Y is symmetric in exact arithmetic; the computed product
-         // differs in the last bits.  In(S) and the scatter both assume exact
-         // symmetry, so enforce it in place.
-         for (int j = 0; j < pk; ++j)
-            for (int i = 0; i < j; ++i) {
-               const double m = 0.5 * (Sk_[k](i, j) + Sk_[k](j, i));
-               Sk_[k](i, j) = m;
-               Sk_[k](j, i) = m;
+            const std::vector<int>& R = RK[a];
+            for (SpMat::InnerIterator it(PBt, a); it; ++it) w[it.row()] = it.value();
+            ldlt_[k]->forward_solve_reach(w.data(), R);
+            std::vector<double>& v = Yc[a];
+            v.resize(R.size());
+            for (size_t i = 0; i < R.size(); ++i) {
+               v[i] = w[R[i]];
+               w[R[i]] = 0.0;                          // restore the invariant
             }
+         }
+
+         // The row contraction (5.2), driven by the same reaches: group Y's
+         // nonzeros by row (counting sort — columns are appended in ascending
+         // order, which the upper-triangle accumulation needs), then one small
+         // outer product per nonempty row.  Exactly symmetric by construction
+         // (upper triangle accumulated, then mirrored), which In(T) and the
+         // preconditioner both rely on.
+         {
+            std::vector<int> rowptr(nk + 1, 0);
+            for (int a = 0; a < pk; ++a)
+               for (size_t i = 0; i < RK[a].size(); ++i)
+                  if (Yc[a][i] != 0.0) ++rowptr[RK[a][i] + 1];
+            for (int r = 0; r < nk; ++r) rowptr[r + 1] += rowptr[r];
+            std::vector<int> rcol(rowptr[nk]);
+            std::vector<double> rval(rowptr[nk]);
+            std::vector<int> fill(rowptr.begin(), rowptr.end() - 1);
+            for (int a = 0; a < pk; ++a)
+               for (size_t i = 0; i < RK[a].size(); ++i)
+                  if (Yc[a][i] != 0.0) {
+                     const int r = RK[a][i];
+                     rcol[fill[r]] = a;
+                     rval[fill[r]] = Yc[a][i];
+                     ++fill[r];
+                  }
+            const Vec& d = ldlt_[k]->vectorD();
+            Mat& S = Sk_[k];
+            S.setZero(pk, pk);
+            for (int r = 0; r < nk; ++r) {
+               const int b0 = rowptr[r], b1 = rowptr[r + 1];
+               if (b0 == b1) continue;
+               const double dinv = 1.0 / d[r];
+               for (int ib = b0; ib < b1; ++ib) {
+                  const int b = rcol[ib];
+                  const double wv = dinv * rval[ib];
+                  for (int ia = b0; ia <= ib; ++ia)
+                     S(rcol[ia], b) -= rval[ia] * wv;
+               }
+            }
+            for (int j = 0; j < pk; ++j)
+               for (int i = 0; i < j; ++i) S(j, i) = S(i, j);
+         }
       }
       if (schur_check) {                      // serial: it prints
          for (int k = 0; k < nsub_; ++k) {
@@ -870,12 +884,12 @@ public:
          }
       }
 
-      // ---- 3. the corner block C --------------------------------------
-      // Always built: it is small (only the border–border KKT couplings) and
-      // both interface routes need it.  Fully symmetric, since it is applied to
+      // ---- 3. the corner block C and diag(S) ---------------------------
+      // C is small (only the border–border KKT couplings) and the matrix-free
+      // application (2.5) needs it.  Fully symmetric, since it is applied to
       // vectors rather than factorized.
       std::vector<Trip> t;
-      t.reserve(ctrip_.size() * 2 + s_entries_);
+      t.reserve(ctrip_.size() * 2);
       for (const auto& e : ctrip_) {
          const double v = vals_[e.t];
          t.emplace_back(e.r, e.c, v);
@@ -887,103 +901,28 @@ public:
 
       // diag(S), assembled WITHOUT assembling S: the corner diagonal plus each
       // subdomain's own contribution to the border unknowns it touches.  In a
-      // distributed code this is one all-reduce over a p-vector — which is
-      // exactly why Lueg's ASd preconditioner is built around it (see Precond).
+      // distributed code this is one all-reduce over a p-vector — exactly why
+      // the ASd preconditioner is built around it (see Precond).
       diagS_.setZero(p_);
       for (const auto& e : ctrip_)
          if (e.r == e.c) diagS_[e.r] += vals_[e.t];
       for (int k = 0; k < nsub_; ++k)
          for (int a = 0; a < (int)Nk_[k].size(); ++a) diagS_[Nk_[k][a]] += Sk_[k](a, a);
 
-      // ---- 4. In(S) ----------------------------------------------------
-      // This is the step §7 and §8 are about: the one global object and the one
-      // serial factorization in an otherwise embarrassingly parallel scheme.  It
-      // exists ONLY because IPOPT asks for In(A) and In(A) = Σ_k In(W_k) + In(S)
-      // needs In(S).
-      //
-      // DDS_INERTIA_CHECK=1 assembles and factorizes S even in the modes that do
-      // not need it, purely to print predicted-vs-true.  It changes nothing the
-      // algorithm uses — apply_S() keys off the MODE, not off whether S_ happens
-      // to exist — so the checked run takes exactly the same steps.
-      static const bool inertia_check = std::getenv("DDS_INERTIA_CHECK") != nullptr;
-      const bool need_S = (opt_.inertia == Options::EXACT) || inertia_check;
-      int s_true = -1;
-      if (need_S) {
-         for (int k = 0; k < nsub_; ++k) {        // scatter every S_k
-            const int pk = (int)Nk_[k].size();
-            for (int b = 0; b < pk; ++b)
-               for (int a = 0; a < pk; ++a)
-                  t.emplace_back(Nk_[k][a], Nk_[k][b], Sk_[k](a, b));
-         }
-         S_.resize(p_, p_);
-         S_.setFromTriplets(t.begin(), t.end());
-         S_.makeCompressed();
-         if (!s_analyzed_) {
-            // The pattern of S is fixed by the partition, so this happens once.
-            if (!ldltS_.analyze(S_)) {
-               std::cerr << "[dds] symbolic analysis of S failed\n";
-               return SINGULAR;
-            }
-            s_analyzed_ = true;
-         }
-         if (!ldltS_.factorize(S_)) {
-            if (opt_.inertia != Options::EXACT) {
-               s_true = -1;                       // check only; not fatal here
-            } else {
-               if (std::getenv("DDS_DEBUG"))
-                  std::cerr << "[dds] interface matrix S (p=" << p_
-                            << ") factorization failed → SINGULAR\n";
-               return SINGULAR;
-            }
-         } else {
-            s_true = ldltS_.negative_eigenvalues();
-         }
-      }
-      if (opt_.inertia == Options::EXACT) {
-         s_neg_ = s_true;
-         n_neg_ += s_neg_;                        // Haynsworth, eq. (2.5)
-         return OK;
-      }
-      if (opt_.inertia == Options::NONE) {
-         s_neg_ = -1;                             // unknown, and nobody may ask
-         n_neg_ = 0;
-         return OK;
-      }
-      // ---- PREDICTED (§8) ----------------------------------------------
-      // In(S) = In(S_ff) + In(T) by Haynsworth on the peel split, and the whole
-      // prediction is the single assumption In(S_ff) = 0 — which is ALSO exactly
-      // what CG requires of S_ff, so the mode is self-consistent: the operator
-      // is usable iff the inertia is right.  T is |P| × |P| — three to a few
-      // dozen — so In(T) is computed exactly, densely, and for nothing.
-      //
-      // Building the peel cache HERE rather than lazily at the first solve is
-      // what makes the prediction available in time to answer IPOPT.
+      // ---- 4. peel cache + predicted In(S) (§6, §8) --------------------
+      // Building the cache HERE rather than lazily at the first solve is what
+      // makes the prediction available in time to answer IPOPT.
       if (!build_peel_cache()) {
-         // Refusing is the point: a prediction we cannot stand behind would
-         // silently corrupt IPOPT's δ_w loop, whereas SINGULAR merely costs a
-         // re-factorization at a larger δ_w.
+         // Refusing is the point (§8): a prediction we cannot stand behind
+         // would silently corrupt IPOPT's δ_w loop, whereas SINGULAR merely
+         // costs a re-factorization at a larger δ_w.
          ++stats_.pred_refused;
          if (std::getenv("DDS_DEBUG"))
             std::cerr << "[dds] peel cache failed, so In(S) cannot be predicted "
                          "→ SINGULAR\n";
          return SINGULAR;
       }
-      s_neg_ = t_neg_;
-      n_neg_ += s_neg_;
-      if (inertia_check) {
-         ++stats_.pred_checked;
-         if (s_true >= 0 && s_true != s_neg_) {
-            ++stats_.pred_wrong;
-            stats_.pred_maxerr =
-               std::max(stats_.pred_maxerr, (long)std::abs(s_true - s_neg_));
-         }
-         std::cerr << "[dds-inertia] predicted In(S)_neg=" << s_neg_
-                   << "  true=" << (s_true < 0 ? std::string("n/a")
-                                               : std::to_string(s_true))
-                   << (s_true == s_neg_ ? "  MATCH" : "  MISMATCH")
-                   << "   (peeled duals=" << n_peel_dual_ << ", |P|="
-                   << peel_.size() << ")\n";
-      }
+      n_neg_ += t_neg_;                        // Haynsworth twice: (3.1) + (8.1)
       return OK;
    }
 
@@ -992,24 +931,17 @@ public:
    void reset_stats() { stats_ = Stats(); }
 
    // --------------------------------------------------------------------
-   //  SOLVE, in place.  rhs is overwritten by the solution.
-   //
-   //  Wrapped in a few sweeps of ITERATIVE REFINEMENT against the ORIGINAL
-   //  triplets.  This is not a luxury: near-singular pivots (IPOPT's own
-   //  δ_c = 1e-8·μ^¼ on the dual directions, for instance) lose ~10 digits
-   //  through the Schur assembly — measured rel-res ~0.1 unrefined against
-   //  ~1e-12 refined.  We keep the best iterate seen and always hand it back,
-   //  which is exactly what a monolithic sparse solver does at a nasty
-   //  iterate: return its answer and let IPOPT's globalization cope.
-   //
-   //  Returns false only if the residual never even evaluated finite — then
-   //  rhs holds nothing usable and the caller must report SINGULAR.
+   //  SOLVE, in place: the arrowhead recursion wrapped in iterative
+   //  refinement against the ORIGINAL triplets (§9).  rhs is overwritten by
+   //  the best refined step seen.  Returns false only if the residual never
+   //  once evaluated finite — then rhs holds nothing usable and the caller
+   //  must report SINGULAR.
    // --------------------------------------------------------------------
    bool solve(double* rhs) {
       const std::vector<double> b0(rhs, rhs + dim_);
       std::vector<double> x(b0), r(dim_), Ax(dim_), best;
-      // Without a direct fallback the very first solve can genuinely fail; then
-      // there is no step to refine and rhs is left alone.
+      // The very first interface solve can genuinely fail (there is no direct
+      // fallback); then there is no step to refine and rhs is left alone.
       if (!solve_arrowhead(x.data())) return false;
 
       double bnorm = 0.0;
@@ -1040,11 +972,11 @@ public:
 
 private:
    // =====================================================================
-   //  Structure: numbering, routing, peel sets
+   //  Structure: numbering, routing, reaches, peel sets  (pattern only)
    // =====================================================================
 
    // Give every unknown its coordinates in the permuted picture:
-   //   border index  i  →  ypos_[i] ∈ [0, p)      its column of S
+   //   border index  i  →  ypos_[i] ∈ [0, p)      its position on the border
    //   interior      i  →  lpos_[i] ∈ [0, dim_k)  its row/column of W_k
    // Both numberings follow ASCENDING KKT index, which matters: it makes the
    // local index order agree with the global one, so a lower-triangle triplet
@@ -1065,8 +997,9 @@ private:
 
    // Sort every input triplet into the arrowhead block it belongs to, discover
    // which border unknowns each subdomain sees (the index list N_k — Lueg's
-   // selection matrix), build the sparsity patterns of W_k and B_k, and run the
-   // symbolic analysis of every W_k.  All of this depends on the PATTERN only.
+   // selection matrix), build the sparsity patterns of W_k and B_k, run the
+   // symbolic analysis of every W_k, and precompute the §5(b) reaches.  All of
+   // this depends on the PATTERN only.
    bool route_triplets() {
       // -- pass 1: which border positions does each subdomain touch? --
       std::vector<std::vector<char>> seen(nsub_, std::vector<char>(p_, 0));
@@ -1075,8 +1008,8 @@ private:
          const int oi = owner_[i], oj = owner_[j];
          if (oi >= 0 && oj >= 0 && oi != oj) {
             // The owner map is supposed to be a partition with no direct
-            // subdomain-to-subdomain coupling; if it is not, the arrowhead
-            // shape does not hold and nothing below is valid.
+            // subdomain-to-subdomain coupling (§2); if it is not, the
+            // arrowhead shape does not hold and nothing below is valid.
             std::cerr << "[dds] partition leak: entry (" << i << "," << j
                       << ") couples subdomains " << oi << " and " << oj << "\n";
             return false;
@@ -1097,7 +1030,6 @@ private:
       wtrip_.assign(nsub_, {});
       btrip_.assign(nsub_, {});
       ctrip_.clear();
-      s_entries_ = 0;
       for (int t = 0; t < nnz_; ++t) {
          const int i = irow_[t], j = jcol_[t];
          const int oi = owner_[i], oj = owner_[j];
@@ -1112,7 +1044,7 @@ private:
          }
       }
 
-      // -- allocate the blocks and analyze the W_k --
+      // -- allocate the blocks, analyze the W_k, precompute the reaches --
       W_.assign(nsub_, SpMat());
       B_.assign(nsub_, SpMat());
       Sk_.assign(nsub_, Mat());
@@ -1120,35 +1052,101 @@ private:
       // movable, so they cannot live in a vector directly
       ldlt_.clear();
       for (int k = 0; k < nsub_; ++k) ldlt_.emplace_back(new Ldlt());
+      reach_.assign(nsub_, {});
       for (int k = 0; k < nsub_; ++k) {
          const int pk = (int)Nk_[k].size();
-         s_entries_ += (size_t)pk * pk;              // for the S assembly reserve
          W_[k].resize(dimk_[k], dimk_[k]);           // lower triangle only
          B_[k].resize(pk, dimk_[k]);
          fill_from_triplets(W_[k], wtrip_[k]);       // zeros: pattern only
+         fill_from_triplets(B_[k], btrip_[k]);       // zeros: pattern for the reach
          if (!ldlt_[k]->analyze(W_[k])) {
             std::cerr << "[dds] symbolic analysis of W_" << k << " failed\n";
             return false;
+         }
+         // Symbolic reach of every column of P_k B_kᵀ (§5(b)): walk each
+         // nonzero row index up the elimination tree until the root or an
+         // already-marked column.  Ascending sort makes the list a valid
+         // substitution order (an etree parent always has the larger index).
+         const SpMat PBt = ldlt_[k]->permutationP() * SpMat(B_[k].transpose());
+         const int* parent = ldlt_[k]->etree_parent();
+         std::vector<int> mark(dimk_[k], -1);
+         reach_[k].resize(pk);
+         for (int a = 0; a < pk; ++a) {
+            std::vector<int>& R = reach_[k][a];
+            for (SpMat::InnerIterator it(PBt, a); it; ++it)
+               for (int j = (int)it.row(); j >= 0 && mark[j] != a; j = parent[j]) {
+                  mark[j] = a;
+                  R.push_back(j);
+               }
+            std::sort(R.begin(), R.end());
          }
       }
       return true;
    }
 
-   // Decide which border positions are PEELED (§4): every dual border index,
+   // Decide which border positions are PEELED (§6): every dual border index,
    // plus α.  The rest are KEPT — those are the ones CG iterates on.
    void build_peel_sets() {
       peel_.clear();
       n_peel_dual_ = 0;
-      if (opt_.use_cg) {
-         for (int i = 0; i < dim_; ++i)
-            if (owner_[i] < 0 && i >= opt_.n_primal) {
-               peel_.push_back(ypos_[i]);
-               ++n_peel_dual_;
-            }
-         const int a = opt_.alpha_index;
-         if (a >= 0 && a < dim_ && owner_[a] < 0) peel_.push_back(ypos_[a]);
-         std::sort(peel_.begin(), peel_.end());
-         peel_.erase(std::unique(peel_.begin(), peel_.end()), peel_.end());
+      for (int i = 0; i < dim_; ++i)
+         if (owner_[i] < 0 && i >= opt_.n_primal) {
+            peel_.push_back(ypos_[i]);
+            ++n_peel_dual_;
+         }
+      const int a = opt_.alpha_index;
+      if (a >= 0 && a < dim_ && owner_[a] < 0) peel_.push_back(ypos_[a]);
+      std::sort(peel_.begin(), peel_.end());
+      peel_.erase(std::unique(peel_.begin(), peel_.end()), peel_.end());
+
+      // ---- the cross points (§6 (iii)) --------------------------------
+      //
+      // Also make PRIMAL every border position touched by >= 3 subdomains.
+      // That is the FETI-DP definition of a corner (Farhat et al. 2001, "D1:
+      // its cross points — the points belonging to more than two subdomains"),
+      // and in 2D corner constraints ALONE are proved to give a condition
+      // number C(1+log(H/h))^2 independent of the subdomain count
+      // (Mandel & Tezaur 2001).  Measured here: exactly (k-1)^2 such positions
+      // on a k x k tile partition, each of degree 3 — 4 at k=3, 9 at k=4 — so
+      // the peel grows by very little.  Strips have none, so this is a no-op
+      // there (verified: bit-identical runs).
+      //
+      // Measured effect (cameraman, --hessian exact), off -> on:
+      //   N=32 3x3   195 it, 6.31 s  ->  113 it, 3.24 s
+      //   N=32 4x4  2251 it, 160  s  ->  509 it, 36.8 s
+      //   N=64 4x4   did not converge (barrier stall)  ->  782 it, 173 s
+      // The interpretation is the one Lueg et al. (2025) give for their own
+      // ASd: a ONE-LEVEL preconditioner does not scale in the partition count,
+      // and the fix is a coarse correction.  Peeling the cross points is the
+      // cheapest such correction — it puts them in T, which is solved exactly.
+      n_peel_cross_ = 0;
+      if (opt_.peel_cross_points && p_ > 0) {
+         std::vector<char> already(p_, 0);
+         for (int j : peel_) already[j] = 1;
+         std::vector<int> deg(p_, 0);
+         for (int k = 0; k < nsub_; ++k)
+            for (int j : Nk_[k]) ++deg[j];
+         std::vector<int> cross;
+         for (int j = 0; j < p_; ++j)
+            if (!already[j] && deg[j] >= 3) cross.push_back(j);
+         // SAFETY VALVE.  The whole bet is that cross points are FEW — on a
+         // k x k tile partition there are (k-1)^2 of them against an interface
+         // of size O(kN), so |P| stays a small fraction of p and T stays cheap
+         // (it is dense, LU-factorized, and costs |P| CG solves to build).  A
+         // partition where that is false has no small coarse space of this
+         // kind, and peeling anyway would just move the whole interface into a
+         // dense direct solve.  Refuse, and keep the α + dual peel.
+         const size_t limit = (size_t)std::max(1, p_ / 4);
+         if (!cross.empty() && peel_.size() + cross.size() <= limit) {
+            peel_.insert(peel_.end(), cross.begin(), cross.end());
+            n_peel_cross_ = (int)cross.size();
+            std::sort(peel_.begin(), peel_.end());
+         } else if (!cross.empty() && std::getenv("DDS_DEBUG")) {
+            std::cerr << "[dds] cross-point peel declined: " << cross.size()
+                      << " cross points would put |P| at "
+                      << (peel_.size() + cross.size()) << " of p=" << p_
+                      << " (cap " << limit << ")\n";
+         }
       }
       peelpos_.assign(p_, -1);
       keptpos_.assign(p_, -1);
@@ -1176,13 +1174,13 @@ private:
    }
 
    // =====================================================================
-   //  The solve
+   //  The solve  (§2 recursion, §6 peel, §7 CG, §9 refinement)
    // =====================================================================
 
    // y = A·x straight from the input triplets (lower triangle + its mirror).
    // This is the ONLY place the true matrix is applied, and it is what the
    // iterative refinement measures its residual against — so refinement checks
-   // the decomposition, not just the arithmetic inside it.
+   // the decomposition, not just the arithmetic inside it (§9).
    void matvec(const double* x, double* y) const {
       std::fill(y, y + dim_, 0.0);
       for (int t = 0; t < nnz_; ++t) {
@@ -1192,9 +1190,8 @@ private:
       }
    }
 
-   // One arrowhead solve — equations (2.2)–(2.4), in place.  Returns false only
-   // when the interface solve failed outright, which can happen only when there
-   // is no factorization of S to fall back on (inertia-free mode).
+   // One arrowhead solve — equations (2.2)–(2.4), in place.  Returns false
+   // only when the interface solve produced nothing usable at all.
    bool solve_arrowhead(double* rhs) {
       // -- split the RHS into interior pieces r_k and the border piece r_y --
       std::vector<Vec> rk(nsub_), wk(nsub_);
@@ -1247,25 +1244,23 @@ private:
       return true;
    }
 
-   // ---------------------------------------------------------------------
-   //  APPLYING THE INTERFACE OPERATOR.  Two routes, same operator:
+   // The interface operator, matrix-free — equation (2.5).  Every term is
+   // LOCAL to one subdomain; the only communication a distributed run needs
+   // per application is one reduction over the border vector.
    //
-   //    assembled     out = S·y, one sparse matrix–vector product.
-   //    matrix-free   out = C·y + Σ_k N_k S_k (N_kᵀ y) — the SAME sum that the
-   //                  assembly would have carried out, evaluated on the fly.
-   //                  S is never formed, and every term is LOCAL to one
-   //                  subdomain: each rank owns its dense S_k, and the only
-   //                  communication is one reduction over the border vector.
-   //
-   //  This is the distributed algorithm, not a simulation of it.  Note what it
-   //  does NOT do: it does not re-derive S·y through K subdomain back-solves
-   //  every iteration (dd_solver.hpp's APPLY_MATFREE does, to model the stricter
-   //  regime where the local Schur blocks are not kept either).  Keeping S_k is
-   //  the normal choice — it is formed once per Newton step, locally, and turns
-   //  every CG iteration into a small dense product.
-   // ---------------------------------------------------------------------
+   // This is the iterative strategy of Lueg et al. §3.1 with ONE deliberate
+   // change.  Their eq. (12) applies S·u by one W_k BACK-SOLVE per partition
+   // per CG iteration, so that not even the local Schur blocks are formed.
+   // Here the S_k are formed once per factorization (§5) and each application
+   // is a p_k × p_k GEMV — measured ~10× cheaper per iteration, and at the
+   // observed 10²–10³ CG iterations per factorization the formation cost is
+   // repaid ~20× over (their preconditioners of eqs. 17/20–21 need the local
+   // blocks anyway, and §5's reach route makes forming them far cheaper than
+   // the p_k full back-solves their cost model assumes).  Same operator, same
+   // one-reduction communication pattern; only the local cost model differs.
+   // Their per-iteration-back-solve regime is what dd_solver.hpp's
+   // APPLY_MATFREE measures.
    void apply_S(const Vec& y, Vec& out) const {
-      if (opt_.inertia == Options::EXACT) { out.noalias() = S_ * y; return; }
       out.noalias() = C_ * y;
       for (int k = 0; k < nsub_; ++k) {
          const int pk = (int)Nk_[k].size();
@@ -1277,9 +1272,9 @@ private:
       }
    }
 
-   // S_ff v — the operator CG actually iterates on.  Embedding v with zeros on
-   // the peeled positions, applying the full S and reading back the kept ones
-   // IS S_ff v; there is no need to hold the sub-block separately.
+   // S_ff v — the operator CG actually iterates on (§6).  Embedding v with
+   // zeros on the peeled positions, applying the full S and reading back the
+   // kept ones IS S_ff v; there is no need to hold the sub-block separately.
    void apply_Sff_into(const Vec& v, Vec& out) const {
       if (peel_.empty()) { apply_S(v, out); return; }
       Vec full = Vec::Zero(p_);
@@ -1290,77 +1285,26 @@ private:
       for (size_t a = 0; a < kept_.size(); ++a) out[(int)a] = Sf[kept_[a]];
    }
 
-   // ---------------------------------------------------------------------
-   //  The interface solve (2.3).
-   //
-   //  DEFAULT MODE: preconditioned CG on S_ff with the peel, and the direct
-   //  LDLᵀ back-solve as the safety net.  The fallback is FREE — S is already
-   //  factorized, because the inertia needed it — which is what makes it safe
-   //  to be aggressive about rejecting a CG answer we do not fully trust.  It
-   //  is also why CG cannot WIN in this mode: see §7.
-   //
-   //  INERTIA-FREE MODE: CG is all there is.  A failure is reported honestly
-   //  and IPOPT regularizes, exactly as for a singular block.
-   // ---------------------------------------------------------------------
+   // The interface solve (2.3): CG on the peeled S_ff, and CG is all there is.
+   // A rejected answer has nowhere to fall back to, so its best iterate is
+   // taken anyway and §9's refinement judges it against the true triplets;
+   // only a solve that produced no iterate at all is reported as failed.
    bool solve_interface(const Vec& ry, Vec& dy) {
-      if (opt_.use_cg && cg_admissible() && interface_cg(ry, dy)) return true;
-      if (opt_.inertia == Options::EXACT) {     // the free direct safety net
-         dy = ry;
-         ldltS_.solve(dy.data(), p_, 1);
-         return true;
-      }
-      // PREDICTED / NONE: there is no safety net, so take CG's best iterate even
-      // though we do not trust it.  That is the same bargain the rest of this
-      // file makes — solve() measures the TRUE residual against the original
-      // triplets and keeps the best step it has seen — and it matters here:
-      // reporting SINGULAR instead sends IPOPT into a δ_w loop that cannot fix
-      // a Krylov convergence failure, and the run dies.  Only a solve that
-      // produced no iterate at all (a failed peel cache) is reported as failed.
+      if (interface_cg(ry, dy)) return true;
       if (dy.size() == p_ && dy.allFinite()) return true;
       if (std::getenv("DDS_DEBUG"))
-         std::cerr << "[dds-cg] interface solve produced nothing and there is "
-                      "no factorization of S to fall back on\n";
+         std::cerr << "[dds-cg] interface solve produced nothing usable\n";
       return false;
    }
 
-   // Is CG allowed to run on this factorization's S?
-   //
-   // In the default mode the gate is EXACT, not a heuristic: In(S) comes from
-   // the LDLᵀ pivots, and the peeled duals are the only negative directions we
-   // have arranged to remove.  If S has any other negative eigenvalue, S_ff is
-   // not SPD and CG has no business being there.
-   //
-   // Inertia-free mode cannot ask that question — not knowing In(S) is the whole
-   // point — so CG simply runs, and its own pSp ≤ 0 breakdown guard is what
-   // catches an indefinite operator.  That is strictly weaker: the guard finds
-   // out during the solve rather than before it, and only along the directions
-   // the Krylov space happens to explore.
-   bool cg_admissible() {
-      // EXACT is the only mode with something to skip TO.  In PREDICTED the gate
-      // would be circular (we predicted S_ff SPD; asking whether S_ff is SPD is
-      // the same statement), and in NONE there is nothing to ask with.  So there
-      // CG always runs and its own pAp ≤ 0 guard is the only protection — which
-      // is weaker, but is also the falsification test of §8.
-      if (opt_.inertia != Options::EXACT) return true;
-      if (cg_dead_) { ++stats_.skipped; return false; }
-      if (s_neg_ != n_peel_dual_) { ++stats_.skipped; return false; }
-      return true;
-   }
-
-   // Build, once per factorization, everything the peel needs (§4):
-   //   S_fP, S_PP    the peel's blocks of S, by applying S to the |P| unit
-   //                 vectors of the peeled positions — so this works unchanged
-   //                 whether S is assembled or not
-   //   Z = S_ff⁻¹ S_fP     one CG solve per column of S_fP
-   //   T = S_PP − S_fPᵀ Z  dense, |P| × |P|, factorized by LU
-   //
-   // Note the honesty of the Z construction: EVERY system involving S_ff in
-   // this file, including these, is solved by CG.  It is also the expensive
-   // part — |P| CG solves per factorization.  dd_solver.hpp instead factorizes
-   // S_ff sparsely once and gets Z with a single multi-RHS back-solve; that is
-   // the optimization to reach for in the DEFAULT mode, where S is factorized
-   // anyway.  It is not available inertia-free, which is a real cost of that
-   // mode rather than an oversight.
+   // Build, once per factorization, everything §6 and §8 need:
+   //   S_fP, S_PP    the peel's blocks of S, read off by applying (2.5) to
+   //                 the |P| unit vectors of the peeled positions
+   //   Z = S_ff⁻¹ S_fP     one warm-started CG solve per column
+   //   T = S_PP − S_fPᵀ Z  dense |P| × |P|, LU-factorized for (6.1)
+   //   In(T)               the §8 prediction, from the equilibrated T
+   // Returns false — and factorize() reports SINGULAR — whenever any of that
+   // cannot be stood behind.
    bool build_peel_cache() {
       if (peel_valid_) return peel_ok_;
       peel_valid_ = true;
@@ -1368,11 +1312,11 @@ private:
       ++stats_.cache_builds;
       const int nf = (int)kept_.size(), nP = (int)peel_.size();
 
-      // The preconditioner (see the Precond comment above).  It needs diag(S)
-      // on the kept positions — assembled in factorize() without assembling S.
+      // The ASd preconditioner (§7).  It needs diag(S) on the kept positions —
+      // assembled in factorize() without assembling S.
       Vec dkept(nf);
       for (int a = 0; a < nf; ++a) dkept[a] = diagS_[kept_[a]];
-      pc_.build(opt_.precond, nf, Sk_, Nk_, keptpos_, dkept);
+      pc_.build(nf, Sk_, Nk_, keptpos_, dkept);
 
       t_neg_ = 0;
       if (nP == 0) { peel_ok_ = true; return true; }   // In(T) of a 0×0 block
@@ -1392,13 +1336,21 @@ private:
          }
       }
 
-      // Z = S_ff⁻¹ S_fP, column by column.
+      // Z = S_ff⁻¹ S_fP, column by column, each solve WARM-STARTED from the
+      // column's last accepted value (§6): across a δ-retry only the
+      // regularization moved, and across Newton steps the barrier path is
+      // continuous, so the previous Z is usually a few CG iterations from the
+      // new one.  The warm start also breaks the measured cold-start failure
+      // mode — CG stalling at rel=1 with no progress at all on a column it
+      // solved fine one build later — by handing it a different Krylov space.
       auto applyA = [this](const Vec& v, Vec& out) { apply_Sff_into(v, out); };
       Z_.resize(nf, nP);
+      if (Zwarm_.rows() != nf || Zwarm_.cols() != nP) Zwarm_ = Mat::Zero(nf, nP);
       for (int j = 0; j < nP; ++j) {
          Vec z;
+         const Vec w0 = Zwarm_.col(j);
          const CgResult r = cg_solve(applyA, pc_, Vec(SfP_.col(j)), z,
-                                     opt_.cg_tol, opt_.cg_maxit);
+                                     opt_.cg_tol, opt_.cg_maxit, &w0);
          stats_.iters += r.iters;
          if (r.indefinite) ++stats_.indef_before;
          if (!(r.rel < 1e-2) || !z.allFinite()) {
@@ -1409,22 +1361,42 @@ private:
             return false;                       // peel_ok_ stays false
          }
          Z_.col(j) = z;
+         Zwarm_.col(j) = z;                    // the next build's starting point
       }
       const Mat T = SPP - SfP_.transpose() * Z_;
       if (!T.allFinite()) return false;
       Tlu_.compute(T);
 
-      // In(T), for the predicted-inertia mode (§8).  A dense SYMMETRIC
-      // EIGENDECOMPOSITION, deliberately: T is |P| × |P| with |P| ≤ a few dozen,
-      // so O(|P|³) is nothing, and it sidesteps the reason this file does not
-      // trust Eigen's dense LDLT for inertia (it is a pivoted Cholesky for
-      // semi-definite matrices, not Bunch–Kaufman, and on indefinite input its
-      // pivot signs are unreliable — dd_solver.hpp measured 485–491 negatives
-      // where the truth was 512).
+      // In(T), the §8 prediction.  A dense SYMMETRIC EIGENDECOMPOSITION,
+      // deliberately: T is |P| × |P| with |P| ≤ a few dozen, so O(|P|³) is
+      // nothing, and it sidesteps the reason this file does not trust Eigen's
+      // dense LDLT for inertia (a pivoted Cholesky for semi-definite matrices,
+      // not Bunch–Kaufman; on indefinite input its pivot signs are unreliable —
+      // dd_solver.hpp measured 485–491 negatives where the truth was 512).
       //
-      // An eigenvalue too close to zero means In(T) is not well determined, and
-      // a prediction we cannot stand behind is worse than none: refuse.
-      Eigen::SelfAdjointEigenSolver<Mat> es(T);
+      // EQUILIBRATE FIRST (§8).  T mixes the α direction (barrier-scaled, up
+      // to ~1e20) with corner-dual directions (down to ~1e-9), so a zero test
+      // against T's global eigenvalue scale mistakes honest tiny eigenvalues
+      // for noise — measured at N=64 4×4 it refused EVERY factorization that
+      // way (|λ|=4e-9 against scale 1e20) and the run could not start.
+      // Inertia is invariant under the congruence T → D T D (Sylvester), so
+      // the test is made on the diagonally equilibrated matrix, where "small"
+      // is meaningful per direction.
+      Mat Teq = T;
+      {
+         double dmax = 0.0;
+         for (int i = 0; i < nP; ++i) dmax = std::max(dmax, std::abs(T(i, i)));
+         if (dmax > 0.0) {
+            Vec dsc(nP);
+            for (int i = 0; i < nP; ++i)
+               dsc[i] = 1.0 / std::sqrt(std::max(std::abs(T(i, i)), 1e-16 * dmax));
+            Teq = dsc.asDiagonal() * T * dsc.asDiagonal();
+         }
+      }
+      // An eigenvalue still too close to zero means In(T) is not well
+      // determined, and a prediction we cannot stand behind is worse than
+      // none: refuse (§8).
+      Eigen::SelfAdjointEigenSolver<Mat> es(Teq);
       if (es.info() != Eigen::Success) return false;
       const Vec ev = es.eigenvalues();
       const double scale = std::max(ev.cwiseAbs().maxCoeff(), 1e-300);
@@ -1432,8 +1404,8 @@ private:
       for (int i = 0; i < nP; ++i) {
          if (std::abs(ev[i]) < 1e-12 * scale) {
             if (std::getenv("DDS_DEBUG"))
-               std::cerr << "[dds] In(T) is undetermined (|λ|=" << std::abs(ev[i])
-                         << " vs scale " << scale << ")\n";
+               std::cerr << "[dds] In(T) is undetermined (equilibrated |λ|="
+                         << std::abs(ev[i]) << " vs scale " << scale << ")\n";
             return false;
          }
          if (ev[i] < 0.0) ++t_neg_;
@@ -1442,12 +1414,13 @@ private:
       return true;
    }
 
-   // The CG interface solve.  Returns false whenever its answer must not be
-   // used — the caller then falls back to the direct back-solve, or reports
-   // failure if there is none.
+   // The CG interface solve (§7).  Returns false whenever its answer failed
+   // the acceptance test — dy still holds the best iterate, and
+   // solve_interface decides what to do with it.  factorize() has already
+   // built the peel cache (or reported SINGULAR), so by the time a solve
+   // arrives the cache is guaranteed valid.
    bool interface_cg(const Vec& ry, Vec& dy) {
       ++stats_.solves;
-      if (!build_peel_cache()) { ++stats_.fallbacks; cg_dead_ = true; return false; }
       const int nf = (int)kept_.size(), nP = (int)peel_.size();
 
       Vec rf(nf);
@@ -1464,29 +1437,29 @@ private:
       if (r.indefinite) ++stats_.indef_after;
 
       // Assemble the full Δy from CG's best iterate WHATEVER its quality, and
-      // judge afterwards.  A rejected step is still the best thing available to
-      // a caller that has no fallback (see solve_interface).
+      // judge afterwards.  A rejected step is still the best thing available
+      // to a caller with no fallback (see solve_interface).
       dy.resize(p_);
       if (nP == 0) {
          for (int a = 0; a < nf; ++a) dy[kept_[a]] = g[a];
       } else {
          Vec rP(nP);
          for (int j = 0; j < nP; ++j) rP[j] = ry[peel_[j]];
-         const Vec dP = Tlu_.solve(rP - SfP_.transpose() * g);   // (4.1)
-         const Vec df = g - Z_ * dP;                             // (4.2)
+         const Vec dP = Tlu_.solve(rP - SfP_.transpose() * g);   // (6.1)
+         const Vec df = g - Z_ * dP;                             // (6.2)
          for (int a = 0; a < nf; ++a) dy[kept_[a]] = df[a];
          for (int j = 0; j < nP; ++j) dy[peel_[j]] = dP[j];
       }
 
-      // Honest acceptance test: the residual of the FULL interface system, not
-      // of the S_ff subproblem CG actually saw.  The peel algebra sits between
-      // the two, so only this test certifies the answer we are about to return.
+      // Honest acceptance test (§7): the residual of the FULL interface
+      // system, not of the S_ff subproblem CG actually saw.  The peel algebra
+      // sits between the two, so only this test certifies the answer we are
+      // about to return.
       Vec Sdy;
       apply_S(dy, Sdy);
       const double true_rel = (ry - Sdy).norm() / std::max(ry.norm(), 1e-300);
       if (!(rel < 1e-2) || !(true_rel < 1e-2) || !dy.allFinite()) {
-         ++stats_.fallbacks;
-         cg_dead_ = true;
+         ++stats_.rejected;
          return false;
       }
       return true;
@@ -1498,54 +1471,58 @@ private:
    std::vector<int> irow_, jcol_, owner_;
    std::vector<double> vals_;
 
-   // ---- numbering -----------------------------------------------------
+   // ---- numbering (pattern only) ---------------------------------------
    std::vector<int> ypos_;                 // KKT index → border position (−1 if interior)
    std::vector<int> lpos_;                 // KKT index → position inside its W_k
    std::vector<int> dimk_;                 // size of each W_k
    std::vector<std::vector<int>> Nk_;      // border positions each subdomain sees
    std::vector<std::vector<int>> ykrow_;   // border position → its row in B_k (−1 if unseen)
 
-   // ---- routed triplets ------------------------------------------------
+   // ---- static symbolic reaches (§5(b), pattern only) -------------------
+   //  reach_[k][a]: ascending list of the L_k-columns reachable from column a
+   //  of P_k B_kᵀ — the union of elimination-tree paths from its nonzero
+   //  positions.  Computed once in route_triplets, valid for every
+   //  factorization; the forward solves and the row contraction both iterate
+   //  ONLY these lists.
+   std::vector<std::vector<std::vector<int>>> reach_;
+
+   // ---- routed triplets (pattern only) ----------------------------------
    std::vector<std::vector<Entry>> wtrip_, btrip_;
    std::vector<Entry> ctrip_;
-   size_t s_entries_ = 0;                  // Σ_k p_k², the S-assembly reserve
 
-   // ---- blocks and factorizations --------------------------------------
+   // ---- blocks and factorizations (per Newton step) ---------------------
    std::vector<SpMat> W_, B_;
-   std::vector<Mat> Sk_;                   // local Schur complements
+   std::vector<Mat> Sk_;                   // local Schur complements (§5)
    std::vector<std::unique_ptr<Ldlt>> ldlt_;   // one per subdomain
-   SpMat C_;                               // the corner block, always built
+   SpMat C_;                               // the corner block
    Vec diagS_;                             // diag(S), assembled without S
-   SpMat S_;                               // the assembled interface matrix
-   Ldlt ldltS_;                            // its factorization: inertia + fallback
-   bool s_analyzed_ = false;               // (S_/ldltS_ unused unless EXACT)
-   int n_neg_ = 0;
-   int s_neg_ = 0;                         // In(S)_neg, or −1 when not computed
+   int n_neg_ = 0;                         // the (8.3) total
    int t_neg_ = 0;                         // In(T)_neg — the §8 prediction
 
-   // ---- peel + CG ------------------------------------------------------
+   // ---- peel + CG (per factorization, except the warm starts) -----------
    std::vector<int> peel_, peelpos_;       // peeled border positions, and the inverse
    std::vector<int> kept_, keptpos_;       // the SPD complement CG iterates on
    int n_peel_dual_ = 0;                   // how many peeled entries are duals
-   Precond pc_;                            // the interface preconditioner
+   int n_peel_cross_ = 0;                  // ... and how many are cross points
+   Precond pc_;                            // the ASd preconditioner
    Mat SfP_, Z_;                           // S_fP and Z = S_ff⁻¹ S_fP
-   Eigen::PartialPivLU<Mat> Tlu_;          // the dense peel Schur complement T
+   Mat Zwarm_;                             // last accepted Z columns (warm starts)
+   Eigen::PartialPivLU<Mat> Tlu_;          // the dense peel complement T, factorized
    bool peel_valid_ = false, peel_ok_ = false;
-   bool cg_dead_ = false;                  // CG failed on THIS factorization's S
    Stats stats_;
 };
 
 }  // namespace ddsimple
 
 // =============================================================================
-//  IPOPT ADAPTER
+//  IPOPT ADAPTER (§1)
 //
 //  Everything above is plain Eigen and can be tested on its own.  What follows
 //  is the thin layer that makes it look like an IPOPT linear solver, plus the
 //  AlgorithmBuilder override that injects it.
 //
 //  Define DD_SIMPLE_NO_IPOPT to compile the header without IPOPT at all (that
-//  is how the standalone unit test of Arrowhead builds).
+//  is how dd_simple_smoke.cpp builds).
 // =============================================================================
 #ifndef DD_SIMPLE_NO_IPOPT
 
@@ -1580,16 +1557,9 @@ public:
 
    bool InitializeImpl(const OptionsList&, const std::string&) override { return true; }
    EMatrixFormat MatrixFormat() const override { return Triplet_Format; }
-   // The one place the inertia experiment is visible to IPOPT.  EXACT and
-   // PREDICTED both answer the inertia question — one from a factorization of S,
-   // one from In(T) — so IPOPT's δ_w loop runs normally.  Only NONE returns
-   // false, which makes IPOPT fall back on its inertia-free curvature test
-   // (Chiang & Zavala) — and it REFUSES to do that unless neg_curv_test_tol has
-   // been set positive, so the driver must set both together.
-   bool ProvidesInertia() const override {
-      using O = ddsimple::Arrowhead::Options;
-      return cfg_opt().inertia != O::NONE;
-   }
+   // The §8 prediction answers the inertia question like a factorization
+   // would, so IPOPT's δ_w loop runs completely normally.
+   bool ProvidesInertia() const override { return true; }
    bool IncreaseQuality() override { return false; }
    Index NumberOfNegEVals() const override { return a_.negative_eigenvalues(); }
 
@@ -1616,14 +1586,12 @@ public:
                                Index numberOfNegEVals) override {
       if (new_matrix && a_.factorize() != ddsimple::Arrowhead::OK) {
          stats() = a_.stats();
-         return SYMSOLVER_SINGULAR;              // IPOPT answers by raising δ_w
+         return SYMSOLVER_SINGULAR;              // IPOPT answers by raising δ_w (§1)
       }
-      // The inertia is not the one IPOPT wants: everything factorized fine, the
-      // curvature is simply wrong, and δ_w is the correct cure.  This is IPOPT
-      // working as designed, not a failure of the decomposition.  (IPOPT does
-      // not ask when ProvidesInertia() is false; the guard makes that explicit.)
-      if (check_NegEVals && ProvidesInertia() &&
-          a_.negative_eigenvalues() != numberOfNegEVals) {
+      // The inertia is not the one IPOPT wants: everything factorized fine,
+      // the curvature is simply wrong, and δ_w is the correct cure.  This is
+      // IPOPT working as designed, not a failure of the decomposition.
+      if (check_NegEVals && a_.negative_eigenvalues() != numberOfNegEVals) {
          stats() = a_.stats();
          return SYMSOLVER_WRONG_INERTIA;
       }
@@ -1640,14 +1608,14 @@ private:
    ddsimple::Arrowhead a_;
 };
 
-// Injection point.  Overriding SymLinearSolverFactory is what makes IPOPT route
-// every Newton system through our solver instead of its own:
+// Injection point.  Overriding SymLinearSolverFactory is what makes IPOPT
+// route every Newton system through this solver instead of its own:
 //
 //    SmartPtr<AlgorithmBuilder> b = new SimpleSolverBuilder();
 //    app->OptimizeNLP(new TNLPAdapter(GetRawPtr(tnlp)), b);
 //
-// ONE solver instance serves the whole process, so the structure and the
-// symbolic analyses survive across continuation levels.
+// ONE solver instance serves the whole process, so the structure, the symbolic
+// analyses and the warm starts survive across continuation levels.
 class SimpleSolverBuilder : public AlgorithmBuilder {
 public:
    SmartPtr<SymLinearSolver> SymLinearSolverFactory(const Journalist&,

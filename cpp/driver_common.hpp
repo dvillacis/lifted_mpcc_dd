@@ -385,6 +385,11 @@ inline void print_summary(const Ipopt::MpccTNLPBase &p, const RunResult &r) {
             << psnr(p.uclean_, r.best_x.data(), p.n_state) << " dB\n";
 }
 
+// The two printers below read Ipopt::DDArrowheadSolver, so they only exist
+// when the including .cpp pulled in dd_solver.hpp (the MA57 production
+// solver) first.  An Eigen-only build (--solver ddsimple, no HSL) compiles
+// this header without them.
+#ifdef DD_SOLVER_HPP
 // End-of-run telemetry for the CG interface solve (--interface cg). Printed
 // even when the run does not converge — the skip/fallback counts are exactly
 // what diagnoses an interface the iteration cannot handle.
@@ -479,6 +484,7 @@ inline void print_minres_stats(double tol, int lag) {
             << " s over " << DDArrowheadSolver::omp_threads()
             << " OpenMP thread(s)\n";
 }
+#endif  // DD_SOLVER_HPP
 
 // The five evaluation checksums of --self-check, reproducible from Python in a
 // few lines. Catches a mis-ported derivative BEFORE IPOPT ever runs — the

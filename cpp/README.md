@@ -241,20 +241,36 @@ device. The 1D `DD_CHECK` under CG: 234/234 inertia MATCH, max rel-err 1e-15.
 
 `dd_solver.hpp` is 2500 lines because it carries every research lever the
 project measured. `dd_solver_simple.hpp` is the same **mathematics** with none
-of them: ~560 lines of code under ~420 lines of comment, **Eigen only** (no HSL,
-no MA97, no MUMPS), and the interface solved by **conjugate gradients**. It
-exists to be read — and, on a machine with no MA57, to be run.
+of them: **Eigen only** (no HSL, no MA97, no MUMPS), and the interface solved
+by **conjugate gradients**. It exists to be read — and, on a machine with no
+MA57, to be run.
+
+> **Update (2026-09-07, later the same day):** after the experiments below
+> settled the question, the file was cut down to the winning configuration and
+> nothing else: `W_k` by `Eigen::SimplicialLDLT`, the interface by
+> ASd-preconditioned CG on the peeled `S_ff` applied matrix-free through the
+> local `S_k` — **`S` is never assembled or factorized** — and `In(S)` always
+> PREDICTED as `In(T)`. The `--inertia exact|predicted|none` and
+> `--interface direct|cg` knobs, the Jacobi preconditioner and
+> `DDS_INERTIA_CHECK` are gone (git history has them); the two subsections
+> below stay as the measured record of *why* this is the configuration that
+> survived. `build.sh` now treats MA57 as optional — without HSL it builds
+> `dd_solve_2d` with `--solver dd` compiled out and `ddsimple` fully working.
 
 What it keeps, because dropping any of it would change the answer:
 
-- the partition → routing → `W_k` → `S_k` → assembled `S` pipeline;
+- the partition → routing → `W_k` → `S_k` pipeline (`S` itself stays
+  matrix-free: `S·y = C·y + Σ_k N_k S_k N_kᵀ y`);
 - the Haynsworth inertia `In(A) = Σ_k In(W_k) + In(S)`, so IPOPT's
   δ_w correction loop works exactly as with `--solver dd`;
-- the **α peel + dual peel** — without them CG cannot run on a tile partition
-  at all, since the promoted corner duals *are* `S`'s negative eigenvalues;
+- the **α peel + dual peel + cross-point peel** — the first two because
+  without them CG cannot run on a tile partition at all (the promoted corner
+  duals *are* `S`'s negative eigenvalues), the third because without it the
+  interface preconditioner is one-level and does not scale in the subdomain
+  count (see the section below);
 - the **ASd** preconditioner (`S_k` restricted to the kept border positions,
-  diagonal replaced by the assembled `diag(S)`) — Jacobi is also implemented and
-  is the honest baseline;
+  diagonal replaced by the assembled `diag(S)`, which is one all-reduce — `S`
+  never needs assembling for it);
 - iterative refinement of every solve against the original triplets.
 
 What it gives up:
@@ -283,13 +299,20 @@ two kinds of unnecessary work. Both are removed, **exactly**:
   against the `B_k` multiplying it back on the left. The backward substitution
   is never performed. (Same identity as `--schur forward` in `dd_solver.hpp`,
   but without MA57's MC64 caveat — Eigen never scales.)
-- **Sparse right-hand side.** The columns of `B_kᵀ` carry a handful of nonzeros
-  each, and a forward substitution propagates column `j` of `L` only through the
-  multiplier `y[j]`. `Ldlt::forward_solve` is the entire implementation: an `if
-  (y[j] == 0.0) continue;` in the outer loop. No reach computation, no
-  elimination tree — the test *is* the pruning, and it is correct for any `y`.
-  Eigen's own sparse-RHS overload does **not** do this: it converts the RHS to
-  dense panels (`solve_sparse_through_dense_panels`) and solves them densely.
+- **Sparse right-hand side, static reach.** The columns of `B_kᵀ` carry a
+  handful of nonzeros each, and a forward substitution propagates column `j` of
+  `L` only through the multiplier `y[j]`, so only the columns reachable from
+  the RHS pattern matter. The pattern is fixed for the whole run, so the reach
+  is too: it is computed once per column from the elimination tree (the union
+  of etree paths from the RHS nonzeros — Gilbert's reach theorem) and the
+  substitution iterates exactly that list (`Ldlt::forward_solve_reach`).
+  Originally this was a pattern-blind `if (y[j] == 0.0) continue;` over all
+  `n_k` columns — correct, but profiled at N=64 the empty sweep visited ~98%
+  zero columns and cost more than the arithmetic, so the "not worth an
+  elimination tree" call flipped once the contraction stopped hiding it.
+  Eigen's own sparse-RHS overload does **neither** pruning: it converts the
+  RHS to dense panels (`solve_sparse_through_dense_panels`) and solves them
+  densely.
 
 The two compose for a reason: pruning can only ever help the forward half (a
 back-substituted vector is dense however sparse the RHS was), and forward-only
@@ -324,7 +347,47 @@ would overstate it by ~30×.
 per block per factorization: rel-err ~1e-12 typical, worst 3e-8 at the most
 ill-conditioned iterates.
 
-### Inertia-free mode (`--inertia none`) — CG that actually avoids the matrix
+**Third use of the same sparsity (2026-09-07, after the cut-down):** the
+`Yᵀ D⁻¹ Y` contraction itself. Done as a dense GEMM it costs `2·n_k·p_k²`
+flops, almost all multiplying zeros — measured at N=32 3×3, `Y` is ~88% zeros
+(Σ nnz(Y) ≈ 38k against `n_k·p_k` ≈ 300k). Contracting by rows instead
+(`S_k = −Σ_r y_rᵀ y_r / d_r` over the nonzero rows, cost `Σ_r nnz(y_r)² ≤
+p_k·nnz(Y)`) is exact, keeps `S_k` dense for the cheap per-iteration GEMV, and
+was worth (cameraman, `--hessian exact`, whole-run wall clock,
+iteration-for-iteration identical):
+
+| run | dense GEMM | row contraction | |
+|---|---|---|---|
+| N=32, 3×3 tiles | 4.42 s | 4.00 s | 1.1× |
+| N=64, 2×2 tiles | 42.8 s | 20.3 s | 2.1× |
+| N=64, 4 strips | 25.7 s | 10.1 s | 2.6× |
+
+**Fourth use (2026-09-07, later still): the reach became a data structure.**
+A phase profile showed that after the row contraction, ~90% of the remaining
+`S_k` time was *dense bookkeeping over the mostly-empty `Y` buffer*: the
+pattern-blind O(`n_k`) sweep per forward solve (1.7% of visited columns
+nonzero at N=64), the O(`n_k·p_k`) row-scan feeding the contraction, and the
+O(`n_k·p_k`) `Mat::Zero` each factorization. Precomputing each column's
+symbolic reach from the elimination tree (static — the patterns never change)
+and holding `Y` compressed on it removes all three at once, exactly:
+
+| run | before | static reach | |
+|---|---|---|---|
+| N=32, 3×3 tiles | 3.96 s | 3.79 s | 1.05× (peel-cache CG dominates there) |
+| N=64, 2×2 tiles | 20.3 s | 16.0 s | 1.27× |
+| N=64, 4 strips | 10.1 s | 8.08 s | 1.25× |
+
+The alternative of never forming `S_k` at all — CG only needs `S·p`, so the
+factored form `−Yᵀ(D⁻¹(Y·p))` with `Y` kept sparse could serve every matvec —
+does *not* win: per iteration it costs `4·nnz(Y)` against the dense GEMV's
+`2·p_k²`, and `nnz(Y) > p_k²` on most tiles (e.g. 3119 vs 1764 on a N=32
+corner tile), so at the measured ~1000 CG iterations per factorization the
+saved contraction is given back with interest; fully matrix-free (no `Y`
+either, one `W_k` back-solve per CG iteration) is ~10× the per-iteration cost
+and loses by more. And the ASd preconditioner consumes `S_k`'s *entries*, not
+its action, so the block must exist anyway.
+
+### Inertia-free mode (`--inertia none`, since removed) — CG that actually avoids the matrix
 
 **The objection this answers.** The point of a Krylov interface solve is to
 never form or factorize the global object. But IPOPT wants `In(A)`, Haynsworth
@@ -395,7 +458,7 @@ anyway, let IPOPT clean it up". At N=32 3×3 that is 1.67M CG iterations.
 run and the insurance for when it may not, and dropping it costs both. Which is
 what the third mode is for.
 
-### Predicted inertia (`--inertia predicted`) — the middle road
+### Predicted inertia (`--inertia predicted`, now the only mode) — the middle road
 
 **Derive `In(S)` instead of computing it.** Haynsworth applies to the peel split
 of `S` exactly as it applied to the arrowhead split of `A`:
@@ -463,6 +526,107 @@ must factorize `S` to know its inertia", but "the peel cache needs a Krylov solv
 that sometimes fails to converge". That is a preconditioning problem — the kind a
 distributed implementation can actually attack.
 
+### The Z-column refusals, diagnosed (2026-09-07, later still)
+
+Per-column telemetry on the refusals found **two failure classes, and neither
+was slow CG convergence**:
+
+1. **A false-alarm zero test on `In(T)`.** `T` mixes the α direction
+   (barrier-scaled, up to ~1e20) with corner-dual directions (~1e-9), so
+   testing eigenvalues against `1e-12 · max|λ|` declared honest tiny
+   eigenvalues "undetermined" — at N=64 4×4 this refused **every**
+   factorization (`|λ|=4e-9` vs scale 1e20) and the run could not start.
+   Inertia is congruence-invariant (Sylvester), so `T` is now diagonally
+   **equilibrated** (`D T D`, `D = diag(|T_ii|^{-1/2})`) before the
+   eigendecomposition, making "small" meaningful per direction.
+2. **Cold-start stalls.** A handful of dual columns stalled at rel=1.0 —
+   *zero* progress for 40 iterations — then solved fine a build later
+   (column 0 alone caused 98 of the 206 refusals at N=32 3×3). Each `Z`
+   column is now **warm-started from its last accepted value**: the systems
+   change slowly (across a δ-retry only the regularization moves), and a
+   nonzero start hands the stalled case a different Krylov space.
+
+Scored by a referee LDLᵀ of the assembled `S` (temporarily reinstated for the
+experiment), the predictions issued under the equilibrated test are **199/200
+correct** at N=32 3×3 — the historical off-by-one rate — so the old test was
+refusing factorizations it could have answered. Measured effect (cameraman,
+exact Hessian):
+
+| run | before | after | its |
+|---|---|---|---|
+| N=16, 2×2 tiles | 0.20 s, 79 it | 0.19 s, 75 it | ✓ |
+| N=32, 3×3 tiles | 3.79 s, 127 it | 6.39 s, 195 it | see below |
+| N=64, 2×2 tiles | 16.0 s, 235 it | 11.4 s, 178 it | ✓ |
+| N=64, 4 strips | 8.08 s, 129 it | 8.14 s, 129 it | = |
+| N=64, 4×4 tiles | **dies at start** (28/28 refused) | runs to the final barrier level | ✓ |
+
+The N=32 3×3 regression is *not* wrong inertia (the referee says the
+predictions are right); the old spurious refusals were acting as accidental
+extra regularization, and that particular trajectory happened to be shorter.
+The honest configuration keeps the correct answers. What remains at N=64
+4×4 is a barrier-tail stall (`inf_du` grinding at the final μ level) — the
+known barrier-advance issue, a separate problem from the refusals.
+
+### The cross-point peel (2026-09-08) — the missing coarse correction
+
+The remaining N=64 4×4 failure was **not** the barrier-advance issue after
+all. Measuring the *sharing degree* of every border unknown — how many
+subdomains actually touch it — showed the interface has a structure the peel
+was ignoring:
+
+| stencil | k | border p | degree 1 | degree 2 | degree 3 | degree 4 | α |
+|---|---|---|---|---|---|---|---|
+| `onesided` | 3 | 261 | 16 | 240 | **4** | — | 1 (deg 9) |
+| `onesided` | 4 | 400 | 36 | 354 | **9** | — | 1 (deg 16) |
+| `averaged` | 3 | 605 | 240 | 352 | — | **12** | 1 (deg 9) |
+| `averaged` | 4 | 892 | 354 | 510 | — | **27** | 1 (deg 16) |
+
+Three facts fall out. The promoted corner duals are **degree 1** — they sit on
+the border for rank reasons, not because they are shared. The genuine **cross
+points** — unknowns touched by ≥3 subdomains — number exactly `(k−1)²`, one
+per interior tile corner, and they were **not peeled**. And the one-sided
+stencil already keeps them at degree 3; `--stencil averaged` is what would
+create degree-4 sharing, at more than double the interface.
+
+Those cross points are, verbatim, the FETI-DP definition of a corner: Farhat,
+Lesoinne, LeTallec, Pierson & Rixen (IJNME 50:1523–1544, 2001) define one as
+"its cross points — that is, the points belonging to more than two subdomains"
+(their D1) and make exactly those primal. In **2D** that is provably enough:
+Mandel & Tezaur (Numer. Math. 88:543–558, 2001) bound the condition number by
+`C(1+log(H/h))²` **independently of the subdomain count** with corner
+constraints alone (edge/face averages are a 3D requirement).
+
+The same conclusion arrives from the optimization side, in the very paper this
+solver's ASd preconditioner comes from. Lueg, Bynum, Laird & Biegler (*Optim.
+Eng.* 27:555–585, 2026, doi:10.1007/s11081-025-10020-1) write that "one-level
+preconditioners … do not scale well with the number of partitions n_P …
+Improved scalability is obtained by two-level methods, which add a coarse grid
+correction term" (their eq. 22), and leave that application to optimization
+Schur complements as future work. Their own PDE test cuts along **time
+breakpoints**, where "any set of two complicating variables are at most shared
+by one partition" — no cross points at all, so ASd was never exercised in the
+tile regime.
+
+Peeling the cross points is the cheapest possible coarse correction: they go
+into `T`, which is already built and already solved exactly, for `(k−1)²`
+extra columns. **On by default since 2026-09-08** (`--no-cross-peel` to A/B):
+
+| run | cross points | peel off | peel on |
+|---|---|---|---|
+| N=64, 4 strips | 0 | 129 it, 7.99 s | **bit-identical** |
+| N=64, 2×2 tiles | 1 | 178 it, 11.4 s | 170 it, 10.6 s |
+| N=32, 3×3 tiles | 4 | 195 it, 6.31 s | 113 it, 3.24 s |
+| N=32, 4×4 tiles | 9 | 2251 it, 160 s | 509 it, 36.8 s |
+| N=64, 4×4 tiles | 9 | **did not converge** | 782 it, 173 s |
+
+Identical PSNR in every row. Two things make this the mechanism rather than a
+lucky tweak: the gain scales with the number of cross points, and **strips are
+bit-identical** because they have none. The peel size becomes
+`|P| = 5(k−1)²+1` (measured 6, 21, 46 at k = 2, 3, 4) — still linear in the
+subdomain count, so `T` is only cheap at modest `k`; `build_peel_sets()`
+carries a guard that declines the cross-point peel outright if it would not
+stay a small fraction of `p`.
+
 One caveat recorded honestly: the `pAp ≤ 0` breakdown flag is reported as
 "non-positive curvature seen", not as proof of indefiniteness. In exact
 arithmetic it would be a one-directional proof, but with ‖A‖ ~ 1e18 a merely tiny
@@ -515,18 +679,19 @@ clang++ -std=c++17 -O2 -I$(brew --prefix eigen)/include/eigen3 -I. \
 ```
 
 Run it exactly like `--solver dd`; it honours `--nsub`, `--partition`,
-`--cg-tol`, `--cg-max-iter`, `--no-alpha-peel`, `--no-dual-peel`,
-`--precond jacobi|asd`, `--inertia exact|predicted|none` and
-`--interface direct|cg`
-(CG is the default here):
+`--cg-tol`, `--cg-max-iter`, `--no-alpha-peel`, `--no-dual-peel` and
+`--no-cross-peel` (the interface is always CG and the inertia always
+predicted — there is nothing else left to select):
 
 ```bash
 ./dd_solve_2d --data ../images/cameraman.png --size 32 \
               --solver ddsimple --nsub 3 --partition strip --hessian exact
 ```
 
-Note the `dd_solve_2d` binary still links MA57, because it also offers
-`--solver dd`; the header itself has no HSL dependency.
+`build.sh` links MA57 into `dd_solve_2d` only when it finds the library
+(`HSLDIR`, default `~/.local/hsl-ma57`); without it the build proceeds with
+`--solver dd` compiled out and `--solver ddsimple` untouched — the header
+itself has no HSL dependency.
 
 ## The signed-MA57 MINRES interface (`--interface minres`, 2026-07-23)
 

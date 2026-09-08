@@ -38,7 +38,13 @@
 
 #include "IpIpoptApplication.hpp"
 #include "IpTNLPAdapter.hpp"
+// The MA57 production solver is optional at build time: without HSL the
+// build defines nothing and --solver dd is rejected at runtime, while
+// --solver ddsimple (and IPOPT's own mumps) still work. build.sh sets
+// DD_HAVE_MA57 iff it found the library.
+#ifdef DD_HAVE_MA57
 #include "dd_solver.hpp"
+#endif
 // The readable, HSL-free twin of dd_solver.hpp (--solver ddsimple): Eigen
 // LDLᵀ blocks + conjugate gradients on the interface. See its header comment.
 #include "dd_solver_simple.hpp"
@@ -296,13 +302,15 @@ int main(int argc, char** argv) {
    std::string partition = "tile";
    bool check = false, nsub_set = false, dual_warm = false, promote = true;
    bool alpha_peel = true, dual_peel = true;
-   // --inertia exact|predicted|none (ddsimple only): where In(S) comes from,
-   // and hence whether S is assembled and factorized at all. See the
-   // dd_solver_simple.hpp header, §7 and §8.
-   std::string inertia = "exact";
-   double neg_curv_tol = 1e-11;
-   // --solver ddsimple defaults to CG (that is the point of it), so we need to
-   // know whether --interface was actually typed.
+   // --no-cross-peel (ddsimple only): stop making the cross points — border
+   // unknowns touched by >=3 subdomains — primal. They are the FETI-DP corner
+   // set; peeling them is on by default because it is what makes tile
+   // partitions scale (see dd_solver_simple.hpp §6a). Use this to A/B.
+   bool cross_peel = true;
+   // --solver ddsimple has no --interface/--inertia knobs left: it is CG on
+   // the peeled interface with the PREDICTED inertia, full stop (see the
+   // dd_solver_simple.hpp header).  We only need to know whether --interface
+   // was actually typed, to reject a contradictory request.
    bool interface_set = false;
 
    for (int i = 1; i < argc; ++i) {
@@ -356,8 +364,7 @@ int main(int argc, char** argv) {
       else if (a == "--t-mu-scale") t_mu_scale = std::stod(next());
       else if (a == "--no-alpha-peel") alpha_peel = false;
       else if (a == "--no-dual-peel") dual_peel = false;
-      else if (a == "--inertia")  inertia = next();
-      else if (a == "--neg-curv-tol") neg_curv_tol = std::stod(next());
+      else if (a == "--no-cross-peel") cross_peel = false;
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
    if (data.empty()) {
@@ -377,26 +384,19 @@ int main(int argc, char** argv) {
                    "Validate with ./mumps_smoke\n"
                    "    and DD_CHECK=1 on any new machine.\n"
                    "  --solver ddsimple: the same decomposition implemented in\n"
-                   "    dd_solver_simple.hpp — Eigen only (no HSL/MUMPS), interface solved\n"
-                   "    by conjugate gradients, written to be READ. Honours --nsub,\n"
-                   "    --partition, --cg-tol, --cg-max-iter, --no-alpha-peel,\n"
-                   "    --no-dual-peel, --precond jacobi|asd and\n"
-                   "    --interface direct|cg (default cg).\n"
-                   "  --inertia exact|predicted|none (needs --solver ddsimple):\n"
-                   "    where In(S) comes from, and so whether the interface matrix S\n"
-                   "    is assembled and factorized at all -- the one serial step in\n"
-                   "    an otherwise parallel scheme.\n"
-                   "      exact      (default) assemble S, factorize, read the pivots\n"
-                   "      predicted  never assemble S; In(S) = In(T) from the tiny\n"
-                   "                 dense peel complement, assuming S_ff is SPD.\n"
-                   "                 Still answers IPOPT, so delta_w works normally.\n"
-                   "                 DDS_INERTIA_CHECK=1 scores it against the truth.\n"
-                   "      none       never assemble S and report no inertia; IPOPT\n"
-                   "                 switches to its curvature test (--neg-curv-tol,\n"
-                   "                 default 1e-11).\n"
-                   "    Both non-exact modes lose the direct fallback; expect them to\n"
-                   "    be SLOWER on a single node -- the interesting output is the\n"
-                   "    iteration count and the CG failure rate.\n"
+                   "    dd_solver_simple.hpp — Eigen only (no HSL/MUMPS), written to be\n"
+                   "    READ. One configuration: the interface matrix S is never\n"
+                   "    assembled or factorized — ASd-preconditioned CG on the peeled\n"
+                   "    interface, In(S) PREDICTED as In(T) from the tiny dense peel\n"
+                   "    complement. Honours --nsub, --partition, --cg-tol,\n"
+                   "    --cg-max-iter, --no-alpha-peel, --no-dual-peel and\n"
+                   "    --no-cross-peel.\n"
+                   "  --no-cross-peel (needs --solver ddsimple): stop making the CROSS\n"
+                   "    POINTS primal. A cross point is a border unknown touched by >=3\n"
+                   "    subdomains -- (k-1)^2 of them on a k x k tile partition. Making\n"
+                   "    them primal is the FETI-DP corner rule and is ON by default: it\n"
+                   "    is a no-op on strips (which have none) and worth 1.7-4.3x on\n"
+                   "    tiles, and N=64 4x4 does not converge without it.\n"
                    "  --interface cg (needs --solver dd): preconditioned CG on the\n"
                    "    interface. On tile partitions the promoted corner duals make\n"
                    "    S indefinite; the DUAL PEEL (on by default) eliminates them as\n"
@@ -426,6 +426,14 @@ int main(int argc, char** argv) {
       std::cerr << "--solver must be mumps|ma57|ma97|dd|ddsimple\n";
       return 2;
    }
+#ifndef DD_HAVE_MA57
+   if (solver == "dd") {
+      std::cerr << "--solver dd needs MA57, and this binary was built without "
+                   "HSL; use --solver ddsimple (Eigen only) or rebuild with "
+                   "HSLDIR set\n";
+      return 2;
+   }
+#endif
    if (partition != "tile" && partition != "strip") {
       std::cerr << "--partition must be tile|strip\n";
       return 2;
@@ -435,46 +443,20 @@ int main(int argc, char** argv) {
       std::cerr << "--interface must be direct|cg|minres\n";
       return 2;
    }
-   if (interface_solver == "cg" && solver == "ddsimple") {
-      // fine: ddsimple implements direct|cg (it has no MINRES route)
-   } else if (interface_solver != "direct" && solver != "dd") {
+   if (solver == "ddsimple" && interface_set && interface_solver != "cg") {
+      std::cerr << "--solver ddsimple only implements --interface cg (its "
+                   "direct route was removed with the assembled S)\n";
+      return 2;
+   }
+   if (solver != "ddsimple" && interface_solver != "direct" && solver != "dd") {
       std::cerr << "--interface " << interface_solver
                 << " needs --solver dd (it replaces the arrowhead's "
                    "interface solve)\n";
       return 2;
    }
-   if (inertia != "exact" && inertia != "predicted" && inertia != "none") {
-      std::cerr << "--inertia must be exact|predicted|none\n";
-      return 2;
-   }
-   if (inertia != "exact") {
-      if (solver != "ddsimple") {
-         std::cerr << "--inertia " << inertia << " needs --solver ddsimple\n";
-         return 2;
-      }
-      if (interface_set && interface_solver == "direct") {
-         std::cerr << "--inertia " << inertia << " cannot be combined with "
-                      "--interface direct: the direct route IS the factorization "
-                      "of S that these modes remove\n";
-         return 2;
-      }
-      // IPOPT REFUSES to run a linear solver that reports no inertia unless its
-      // inertia-free curvature test is switched on, so the two must be set
-      // together. DD_NEG_CURV (read by driver::init_app) is the existing wiring;
-      // an explicit setting always wins. Only --inertia none needs it: the
-      // predicted mode still answers the inertia question.
-      if (inertia == "none" && !std::getenv("DD_NEG_CURV")) {
-         // NOT std::to_string: it formats with %f, so 1e-11 becomes "0.000000"
-         // and IPOPT then refuses to run at all (a zero tolerance means the
-         // curvature test is disabled).
-         char buf[32];
-         std::snprintf(buf, sizeof buf, "%.17g", neg_curv_tol);
-         setenv("DD_NEG_CURV", buf, 0);
-      }
-   }
-   if (precond == "bj" && solver == "ddsimple") {
-      std::cerr << "--precond bj is not implemented in dd_solver_simple.hpp; "
-                   "use jacobi or asd\n";
+   if (solver == "ddsimple" && precond != "asd") {
+      std::cerr << "--precond " << precond << " is not implemented in "
+                   "dd_solver_simple.hpp; ASd is its only preconditioner\n";
       return 2;
    }
    if (nested && solver != "dd") {
@@ -672,6 +654,7 @@ int main(int argc, char** argv) {
    SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
    if (!driver::init_app(app, printlevel, maxiter, solver, hessian)) return 1;
 
+#ifdef DD_HAVE_MA57
    if (solver == "dd") {
       DDArrowheadSolver::config_owner(owner, part.n_sub);
       if (nested) {
@@ -702,54 +685,38 @@ int main(int argc, char** argv) {
                                   : DDArrowheadSolver::WK_MA57);
       DDArrowheadSolver::reset_interface_stats();
    }
+#endif
    // The readable Eigen-only twin (dd_solver_simple.hpp). It takes the SAME
    // owner map as --solver dd, so the two are directly comparable: same
    // partition, same interface, same Haynsworth inertia — only the numerical
    // kernels differ (Eigen LDLᵀ instead of MA57, CG instead of the direct
    // interface back-solve).
-   bool simple_cg = false;
    if (solver == "ddsimple") {
       ddsimple::Arrowhead::Options o;
-      // CG is the whole point of this route, so it is the default here; pass
-      // --interface direct to A/B against the LDLᵀ back-solve of S.
-      simple_cg = interface_set ? (interface_solver == "cg") : true;
-      o.use_cg = simple_cg;
-      // ddsimple implements jacobi|asd (no bj). asd is the default and the only
-      // one that works on a 2D interface — see dd_solver_simple.hpp §6.
-      o.precond = precond == "jacobi" ? ddsimple::Precond::JACOBI
-                                      : ddsimple::Precond::ASD;
-      o.inertia = inertia == "predicted" ? ddsimple::Arrowhead::Options::PREDICTED
-                  : inertia == "none"    ? ddsimple::Arrowhead::Options::NONE
-                                         : ddsimple::Arrowhead::Options::EXACT;
-      if (inertia != "exact") { o.use_cg = true; simple_cg = true; }
       // Border positions with a KKT index >= n are DUAL — the promoted corner
       // duals. They are S's negative eigenvalues, so CG needs them peeled.
       o.n_primal = dual_peel ? mpcc->n : (1 << 30);
       o.alpha_index = alpha_peel ? mpcc->oa : -1;
+      o.peel_cross_points = cross_peel;
       o.cg_tol = cg_tol;
       o.cg_maxit = cg_maxit;
       DDSimpleSolver::config(owner, part.n_sub);
       DDSimpleSolver::config_options(o);
-      if (simple_cg)
-         std::cout << "  interface=cg(" << (precond == "jacobi" ? "jacobi" : "asd")
-                   << (alpha_peel ? ",alpha-peel" : ",no-alpha-peel")
-                   << (dual_peel ? ",dual-peel" : ",no-dual-peel")
-                   << ",tol=" << cg_tol << ",maxit=" << cg_maxit << ")\n";
-      else
-         std::cout << "  interface=direct(eigen ldlt)\n";
-      if (inertia == "predicted")
-         std::cout << "  inertia=PREDICTED: S is never assembled or factorized; "
-                      "In(S) = In(T) from the |P|x|P| peel complement\n";
-      else if (inertia == "none")
-         std::cout << "  inertia=NONE: S is never assembled or factorized and no "
-                      "inertia is reported; IPOPT uses its curvature test "
-                      "(neg_curv_test_tol=" << std::getenv("DD_NEG_CURV") << ")\n";
+      std::cout << "  interface=cg(asd"
+                << (alpha_peel ? ",alpha-peel" : ",no-alpha-peel")
+                << (dual_peel ? ",dual-peel" : ",no-dual-peel")
+                << (cross_peel ? ",cross-peel" : ",no-cross-peel")
+                << ",tol=" << cg_tol << ",maxit=" << cg_maxit << ")\n"
+                << "  inertia=PREDICTED: S is never assembled or factorized; "
+                   "In(S) = In(T) from the |P|x|P| peel complement\n";
    }
    auto optimize = [&]() -> ApplicationReturnStatus {
+#ifdef DD_HAVE_MA57
       if (solver == "dd") {
          SmartPtr<AlgorithmBuilder> b = new CustomSolverBuilder<DDArrowheadSolver>();
          return app->OptimizeNLP(new TNLPAdapter(GetRawPtr(mpcc)), b);
       }
+#endif
       if (solver == "ddsimple") {
          SmartPtr<AlgorithmBuilder> b = new SimpleSolverBuilder();
          return app->OptimizeNLP(new TNLPAdapter(GetRawPtr(mpcc)), b);
@@ -766,17 +733,14 @@ int main(int argc, char** argv) {
                                 c_theta, tol, /*warm_start=*/dual_warm,
                                 /*value_is_alpha=*/false, optimize);
    driver::print_summary(*mpcc, res);
+#ifdef DD_HAVE_MA57
    if (solver == "dd" && interface_solver == "cg")
       driver::print_interface_stats(precond, alpha_peel, cg_tol);
    if (solver == "dd" && interface_solver == "minres")
       driver::print_minres_stats(cg_tol, minres_lag);
-   if (solver == "ddsimple" && simple_cg) {
+#endif
+   if (solver == "ddsimple") {
       const auto& st = DDSimpleSolver::stats();
-      if (st.pred_checked)
-         std::cout << "  predicted inertia: " << (st.pred_checked - st.pred_wrong)
-                   << "/" << st.pred_checked << " correct"
-                   << (st.pred_wrong ? "  (max error " + std::to_string(st.pred_maxerr) + ")" : "")
-                   << "\n";
       if (st.pred_refused || st.indef_before || st.indef_after)
          std::cout << "  prediction refused=" << st.pred_refused
                    << "  non-positive curvature seen: before=" << st.indef_before
@@ -785,8 +749,7 @@ int main(int argc, char** argv) {
       std::cout << "  interface CG: solves=" << st.solves
                 << "  iterations=" << st.iters;
       if (st.solves) std::cout << " (" << (double)st.iters / (double)st.solves << "/solve)";
-      std::cout << "  fallbacks=" << st.fallbacks
-                << "  skipped(S inadmissible)=" << st.skipped
+      std::cout << "  rejected=" << st.rejected
                 << "  peel caches=" << st.cache_builds << "\n";
    }
 

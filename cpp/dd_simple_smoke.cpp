@@ -15,18 +15,16 @@
 //   A. no peel        — is the arrowhead solve the same step a dense LU gives,
 //                       and is Σ_k In(W_k) + In(S) the true number of negative
 //                       eigenvalues (from a dense symmetric eigendecomposition)?
+//                       With no peel the prediction is In(S) = 0, so this also
+//                       checks it on an SPD interface.
 //   B. with the peel  — the border also carries dual unknowns and a dense
 //                       "alpha" column, so S is indefinite and CG can only run
-//                       on the peeled complement.  Same two questions, plus:
-//                       CG must actually carry the solves (no fallbacks).
-//   C. predicted      — problem B with Options::PREDICTED: S is never assembled
-//                       or factorized, and In(S) is predicted as In(T) from the
-//                       tiny dense peel complement.  The prediction is checked
-//                       against the DENSE EIGENVALUE COUNT of the whole matrix,
-//                       which shares no code with it.
-//   D. no inertia     — Options::NONE: nothing is reported at all.  The only
-//                       question left is whether the STEP is still the one a
-//                       dense solve gives.
+//                       on the peeled complement.  S is never assembled: In(S)
+//                       is PREDICTED as In(T) from the tiny dense peel
+//                       complement, and the prediction is checked against the
+//                       DENSE EIGENVALUE COUNT of the whole matrix, which
+//                       shares no code with it.  CG must also actually carry
+//                       the solves (no rejections).
 //
 // The dense references cost O(dim³), so the test problems are deliberately tiny.
 #define DD_SIMPLE_NO_IPOPT
@@ -66,7 +64,7 @@ int reference_negatives(const Eigen::MatrixXd& A) {
 // ---------------------------------------------------------------------------
 //  A.  K subdomains of (nx primal + nc dual), a border of nbp primal unknowns.
 //      S comes out positive definite, so no peel is needed and CG runs on all
-//      of it.  Run twice: once with CG, once with the direct LDLᵀ of S.
+//      of it; the empty-peel prediction In(S) = 0 must match the dense count.
 // ---------------------------------------------------------------------------
 int test_no_peel() {
    const int K = 3, nx = 8, nc = 4, nbp = 5, per = nx + nc;
@@ -101,7 +99,6 @@ int test_no_peel() {
       }
 
       Arrowhead::Options opt;
-      opt.use_cg = (trial % 2 == 0);      // alternate CG / direct
       opt.cg_tol = 1e-12;
       opt.cg_maxit = 2000;
 
@@ -121,10 +118,14 @@ int test_no_peel() {
       const double err = (xv - xref).norm() / xref.norm();
       const double res = (B.A * xv - rhs).norm() / rhs.norm();
       const bool inertia_ok = (ah.negative_eigenvalues() == ref_neg);
-      printf("  trial %d  interface=%-6s  inertia %d vs %d %s  rel-err %.2e  rel-res %.2e\n",
-             trial, opt.use_cg ? "cg" : "direct", ah.negative_eigenvalues(), ref_neg,
-             inertia_ok ? "MATCH" : "MISMATCH", err, res);
+      const Arrowhead::Stats& st = ah.stats();
+      printf("  trial %d  inertia %d vs %d %s  rel-err %.2e  rel-res %.2e  "
+             "cg %ld/%ld carried\n",
+             trial, ah.negative_eigenvalues(), ref_neg,
+             inertia_ok ? "MATCH" : "MISMATCH", err, res,
+             st.solves - st.rejected, st.solves);
       if (!inertia_ok || !ok || !(res < 1e-9)) ++failures;
+      if (st.rejected) { printf("    CG did NOT carry the solves\n"); ++failures; }
    }
    return failures;
 }
@@ -132,12 +133,10 @@ int test_no_peel() {
 // ---------------------------------------------------------------------------
 //  B.  Same idea, but the border also carries nbd DUAL unknowns and a scalar
 //      alpha that couples into every subdomain.  The duals make S indefinite,
-//      so this exercises the admissibility gate, the peel and the CG path that
-//      only exists because of them.
+//      so this exercises the peel, the CG path that only exists because of it,
+//      and the predicted inertia In(S) = In(T).
 // ---------------------------------------------------------------------------
-int test_peel(Arrowhead::Options::InertiaMode mode) {
-   const bool exact = (mode == Arrowhead::Options::EXACT);
-   const bool no_inertia = (mode == Arrowhead::Options::NONE);
+int test_peel() {
    const int K = 4, nx = 10, nc = 5, nbp = 6, nbd = 3;
    const int n_primal = K * nx + nbp + 1;               // ... + the alpha column
    const int dim = n_primal + K * nc + nbd;
@@ -181,8 +180,6 @@ int test_peel(Arrowhead::Options::InertiaMode mode) {
       for (int q = 0; q < nbd; ++q) { B.put(bd(q), bd(q), -1e-6); B.put(bd(q), oa, 0.4 * U(rng)); }
 
       Arrowhead::Options opt;
-      opt.use_cg = true;
-      opt.inertia = mode;
       opt.n_primal = n_primal;      // -> the nbd border duals are peeled
       opt.alpha_index = oa;         // -> so is alpha
       opt.cg_tol = 1e-12;
@@ -193,7 +190,7 @@ int test_peel(Arrowhead::Options::InertiaMode mode) {
       std::copy(B.vv.begin(), B.vv.end(), ah.values());
       if (ah.factorize() != Arrowhead::OK) { printf("  trial %d: factorize FAILED\n", trial); ++failures; continue; }
 
-      const int ref_neg = no_inertia ? -1 : reference_negatives(B.A);
+      const int ref_neg = reference_negatives(B.A);
       double worst_err = 0, worst_res = 0;
       for (int r = 0; r < 3; ++r) {
          Eigen::VectorXd rhs(dim);
@@ -206,17 +203,12 @@ int test_peel(Arrowhead::Options::InertiaMode mode) {
          worst_res = std::max(worst_res, (B.A * xv - rhs).norm() / rhs.norm());
       }
       const Arrowhead::Stats& st = ah.stats();
-      const bool inertia_ok = no_inertia || (ah.negative_eigenvalues() == ref_neg);
-      if (no_inertia)
-         printf("  trial %d  inertia not reported        rel-err %.2e  rel-res %.2e  "
-                "cg %ld/%ld carried, %ld its\n",
-                trial, worst_err, worst_res, st.solves - st.fallbacks, st.solves, st.iters);
-      else
-         printf("  trial %d  inertia %s %d vs dense %d %s  rel-err %.2e  "
-                "rel-res %.2e  cg %ld/%ld carried\n",
-                trial, exact ? "     " : "(pred)", ah.negative_eigenvalues(), ref_neg,
-                inertia_ok ? "MATCH" : "MISMATCH", worst_err, worst_res,
-                st.solves - st.fallbacks, st.solves);
+      const bool inertia_ok = (ah.negative_eigenvalues() == ref_neg);
+      printf("  trial %d  inertia (pred) %d vs dense %d %s  rel-err %.2e  "
+             "rel-res %.2e  cg %ld/%ld carried\n",
+             trial, ah.negative_eigenvalues(), ref_neg,
+             inertia_ok ? "MATCH" : "MISMATCH", worst_err, worst_res,
+             st.solves - st.rejected, st.solves);
       if (!inertia_ok || !(worst_res < 1e-8)) ++failures;
       if (st.indef_before || st.indef_after) {
          printf("    CG saw non-positive curvature in S_ff (before=%ld after=%ld)"
@@ -224,9 +216,9 @@ int test_peel(Arrowhead::Options::InertiaMode mode) {
                 st.indef_before, st.indef_after);
          ++failures;
       }
-      // CG must have done the work: a silent fall-through to the direct solve
-      // would still give the right answer and hide a broken Krylov path.
-      if (st.fallbacks || st.skipped) { printf("    CG did NOT carry the solves\n"); ++failures; }
+      // CG must have done the work: a rejected solve would still hand back its
+      // best iterate, so only the counter can expose a broken Krylov path.
+      if (st.rejected) { printf("    CG did NOT carry the solves\n"); ++failures; }
    }
    return failures;
 }
@@ -234,15 +226,11 @@ int test_peel(Arrowhead::Options::InertiaMode mode) {
 }  // namespace
 
 int main() {
-   printf("A. arrowhead solve + Haynsworth inertia, no peel (SPD interface)\n");
+   printf("A. arrowhead solve + predicted Haynsworth inertia, no peel (SPD interface)\n");
    const int f1 = test_no_peel();
-   printf("B. arrowhead solve + Haynsworth inertia, alpha + dual peel (indefinite S)\n");
-   const int f2 = test_peel(Arrowhead::Options::EXACT);
-   printf("C. the same, PREDICTED inertia: S never assembled, In(S) = In(T)\n");
-   const int f3 = test_peel(Arrowhead::Options::PREDICTED);
-   printf("D. the same, NO inertia reported\n");
-   const int f4 = test_peel(Arrowhead::Options::NONE);
-   const int failures = f1 + f2 + f3 + f4;
+   printf("B. the same, alpha + dual peel (indefinite S): In(S) = In(T), S never assembled\n");
+   const int f2 = test_peel();
+   const int failures = f1 + f2;
    printf(failures ? "\nFAILED: %d check(s)\n" : "\nOK: all checks passed (%d failures)\n",
           failures);
    return failures ? 1 : 0;
