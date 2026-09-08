@@ -676,6 +676,10 @@ IPOPT's derivative checker (`DD_DERIV_TEST=second`): the consensus callbacks
 show exactly the same 7 near-tolerance FD artifacts as the validated
 permutation code, and nothing else.
 
+`--save-solution` writes only the **consensus** variables (the copies equal
+them at any feasible point), so consensus solution files are byte-format
+identical to permutation ones and `python/plot_slurm.py` reads both unchanged.
+
 One caveat recorded honestly: the `pAp ≤ 0` breakdown flag is reported as
 "non-positive curvature seen", not as proof of indefiniteness. In exact
 arithmetic it would be a one-directional proof, but with ‖A‖ ~ 1e18 a merely tiny

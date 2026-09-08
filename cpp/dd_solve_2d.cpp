@@ -202,14 +202,24 @@ static void save_solution(const std::string& fn, const Mpcc2DTNLP& p,
                           const std::vector<double>& x, double t_last, int nsub) {
    std::ofstream out(fn);
    if (!out) { std::cerr << "cannot write " << fn << "\n"; return; }
+   // The consensus formulation carries local copies past the original layout
+   // (see mpcc_2d_consensus_tnlp.hpp). Write only the CONSENSUS variables —
+   // at a feasible point every copy equals the consensus value it links to, so
+   // the leading n_orig entries ARE the original-formulation solution vector.
+   // Truncating here keeps the file format identical for both formulations, so
+   // python/plot_slurm.py and everything downstream read them unchanged (that
+   // reader validates n against N and would otherwise reject a consensus run).
+   const Mpcc2DConsensusTNLP* cons =
+      dynamic_cast<const Mpcc2DConsensusTNLP*>(&p);
+   const int nw = cons ? cons->n_orig : p.n;
    out << std::setprecision(17);
-   out << p.n << " " << hist.size() << " " << t_last << " " << nsub << " "
+   out << nw << " " << hist.size() << " " << t_last << " " << nsub << " "
        << (p.weight_exp ? 1 : 0) << "\n";
    for (const driver::Level& l : hist)
       out << l.t << " " << l.status << " " << l.iters << " " << l.comp_res << " "
           << l.weight << " " << l.obj << " " << l.xi_max << " "
           << (l.converged ? 1 : 0) << "\n";
-   for (int i = 0; i < p.n; ++i) out << x[i] << (i + 1 < p.n ? ' ' : '\n');
+   for (int i = 0; i < nw; ++i) out << x[i] << (i + 1 < nw ? ' ' : '\n');
    // trailing instance block
    out << p.N << " " << (p.averaged ? 1 : 0) << " " << p.sigma_ << "\n";
    for (const std::vector<double>* v : {&p.uclean_, &p.f_})
@@ -433,9 +443,10 @@ int main(int argc, char** argv) {
                    "  generate the data file first:\n"
                    "    uv run python cpp2/dump_data_2d.py --N 16 --nsub 2 "
                    "-o cpp2/data_2d_16.txt\n"
-                   "  and plot the result with:\n"
-                   "    uv run python cpp2/plot_2d.py --solution sol.txt "
-                   "--save-plot sol.png\n";
+                   "  and plot the result with (seven panels per solution):\n"
+                   "    ./dd_solve_2d ... --save-solution runs/sols/sol_TAG.txt\n"
+                   "    (cd ../python && uv sync && uv run python plot_slurm.py "
+                   "../cpp/runs)\n";
       return 2;
    }
    if (solver != "mumps" && solver != "ma57" && solver != "ma97" &&

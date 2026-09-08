@@ -22,6 +22,24 @@ its output. The solving itself is done in C++; these scripts need no IPOPT.
 plotters) are **not** part of this archival package — they live in the project's
 development repository.
 
+## Plotting a local `dd_solve_2d` run
+
+`plot_slurm.py` takes a directory containing a `sols/` subfolder, so a local
+run only needs that layout — no SLURM involved:
+
+```bash
+mkdir -p runs/sols
+./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 3 \
+    --solver ddsimple --hessian exact --save-solution runs/sols/sol_N32_k3.txt
+uv run python plot_slurm.py runs          # -> runs/plots/N32_k3_*.png
+```
+
+Seven panels per solution (noisy, recon, diff, delta, indexsets, residual,
+continuation); `--only TAG` restricts to one, `--diff residual` switches the
+difference panel to `u−f`, `--out DIR` redirects. The solution file is
+self-contained — it carries the instance and the μ-trace — so nothing else is
+needed. Both `--formulation` variants write the same format.
+
 ## Setup
 
 Managed with [uv](https://docs.astral.sh/uv/). From this directory:
