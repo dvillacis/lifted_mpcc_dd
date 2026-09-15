@@ -1,0 +1,1159 @@
+% =============================================================================
+%  dd_solver_simple.tex — the mathematics of cpp/dd_solver_simple.hpp
+%
+%  A self-contained description of the readable domain-decomposition
+%  (arrowhead) linear solver for IPOPT: the arrowhead permutation, the Schur
+%  complement solve, the Haynsworth inertia, the forward-only + sparse-RHS +
+%  row-contraction formation of the local Schur blocks, the FETI-DP-style
+%  peel, ASd-preconditioned conjugate gradients on the interface, and the
+%  predicted inertia In(S) = In(T).
+%
+%  Build:  pdflatex dd_solver_simple.tex  (twice, for references)
+% =============================================================================
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+% ---- notation ---------------------------------------------------------------
+\newcommand{\In}{\operatorname{In}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\Sff}{S_{\mathrm{ff}}}
+\newcommand{\SfP}{S_{\mathrm{fP}}}
+\newcommand{\SPP}{S_{\mathrm{PP}}}
+
+\title{The Arrowhead Domain-Decomposition Linear Solver\\
+       of \code{dd\_solver\_simple.hpp}:\\
+       Mathematics and Design}
+\author{David Villacis}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\code{dd\_solver\_simple.hpp} is a complete, self-contained linear solver for
+IPOPT built only on Eigen: no HSL (MA57/MA97), no MUMPS.  Given a partition of
+the KKT unknowns into $K$ subdomains plus a shared border, it permutes every
+Newton system into bordered block-diagonal (``arrowhead'') form, factorizes
+the subdomain blocks independently by sparse $LDL^{\mathsf T}$, and solves the
+coupling (Schur-complement) system by preconditioned conjugate gradients ---
+\emph{without ever assembling or factorizing the Schur complement}.  The
+inertia that IPOPT requires is delivered by two applications of the Haynsworth
+additivity identity: once across the subdomain blocks, and once more across a
+small ``peel'' split of the interface, so that the only globally coupled
+computation left in the algorithm is the inner product reductions of the
+Krylov iteration.  This note records every piece of mathematics the
+implementation relies on, the failure semantics that make the method safe
+inside IPOPT's regularization loop, and the measurements that selected this
+particular configuration from the larger design space explored in the
+production solver \code{dd\_solver.hpp}.
+\end{abstract}
+
+\tableofcontents
+
+% =============================================================================
+\section{The contract with IPOPT}
+\label{sec:contract}
+
+At every iteration of its interior-point method, IPOPT
+\cite{waechter2006implementation} must solve the primal--dual Newton system.
+After the barrier terms and its own regularization are folded in, this is a
+symmetric indefinite \emph{augmented KKT system}
+\begin{equation}
+  A\,\Delta z \;=\; r,
+  \qquad
+  A \;=\;
+  \begin{bmatrix}
+    H + \Sigma + \delta_w I & J^{\mathsf T}\\[2pt]
+    J & -\delta_c I
+  \end{bmatrix}
+  \in \R^{n_A\times n_A},
+  \label{eq:kkt}
+\end{equation}
+where $H$ is the Lagrangian Hessian, $\Sigma$ the barrier diagonal
+(entries scaling like $z^2/\mu$, which is what drives $\|A\|$ to
+$\sim\!10^{18}$ near convergence), $J$ the constraint Jacobian, and
+$\delta_w,\delta_c \ge 0$ IPOPT's inertia-correction and dual-regularization
+shifts, \emph{already applied} by the time the matrix reaches the linear
+solver.  The matrix is handed over in lower-triangle triplet form
+$(i,j,v)$, one-based, possibly with duplicate entries that must be summed.
+
+The linear solver must return two things:
+\begin{enumerate}
+\item a solution of $A\,\Delta z = r$ (possibly for several right-hand
+      sides against one factorization), and
+\item the \emph{inertia} of $A$ --- specifically $n_-(A)$, the number of
+      negative eigenvalues.
+\end{enumerate}
+Item 2 is not optional.  Writing
+$\In(A) = \bigl(n_+(A),\,n_-(A),\,n_0(A)\bigr)$
+for the numbers of positive, negative, and zero eigenvalues, IPOPT's
+inertia-correction loop accepts a step only when
+$n_-(A) = m$ (the number of constraint rows) and $n_0(A)=0$; otherwise it
+increases $\delta_w$ (and, on singularity, $\delta_c$) and asks for a new
+factorization.  A solver that misreports $n_-$ silently corrupts this loop:
+the filter line search then fights a curvature defect that does not exist.
+A solver that cannot report inertia at all forces IPOPT into its inertia-free
+curvature test \cite{chiang2016inertia} --- a mode this solver deliberately
+does \emph{not} use (Section~\ref{sec:inertia-pred} explains what it uses
+instead, and Section~\ref{sec:measured} records why).
+
+Three status outcomes cover all failure semantics:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\code{SYMSOLVER\_SUCCESS} & factorization and solves usable\\
+\code{SYMSOLVER\_SINGULAR} & factorization unusable; IPOPT raises
+  $\delta_w,\delta_c$ and retries\\
+\code{SYMSOLVER\_WRONG\_INERTIA} & $n_-\ne m$; IPOPT raises $\delta_w$
+  and retries\\
+\bottomrule
+\end{tabular}
+\end{center}
+Both retry paths are \emph{regularization} paths.  A guiding principle of the
+implementation is therefore: report \code{SINGULAR} only for conditions that a
+larger $\delta_w$ can actually cure (a broken-down factorization, an
+undeterminable inertia), and never for conditions it cannot (an iterative
+solve that failed to converge --- see Section~\ref{sec:refine}).
+
+IPOPT owns everything else: the filter line search, the $\mu$-homotopy, the
+restoration phase.  The solver owns only the linear algebra of
+\eqref{eq:kkt}.
+
+% =============================================================================
+\section{The arrowhead form}
+\label{sec:arrowhead}
+
+The caller provides an \emph{owner map}: for every KKT index
+$i \in \{1,\dots,n_A\}$ either a subdomain label $k \in \{1,\dots,K\}$ or the
+marker ``border'' for a \emph{complicating} unknown shared by two or more
+subdomains.  (For the image-reconstruction problems this solver was built for,
+the map comes from a tile or strip partition of the pixel grid; the solver
+itself is agnostic --- it only requires that the map be consistent, in the
+sense of \eqref{eq:noleak} below.)
+
+Let $\Pi$ be the permutation that orders all interior unknowns first, grouped
+by subdomain, and the $p$ border unknowns last.  Then
+\begin{equation}
+  \Pi A \Pi^{\mathsf T}
+  \;=\;
+  \begin{bmatrix}
+    W_1 &        &        & B_1^{\mathsf T}\\
+        & \ddots &        & \vdots\\
+        &        & W_K    & B_K^{\mathsf T}\\
+    B_1 & \cdots & B_K    & C
+  \end{bmatrix},
+  \label{eq:arrow}
+\end{equation}
+with $W_k \in \R^{n_k\times n_k}$ the interior block of subdomain $k$,
+$B_k \in \R^{p\times n_k}$ its coupling to the border, and
+$C \in \R^{p\times p}$ the border--border block.  The block-diagonal shape
+requires that no triplet couple two \emph{different} subdomains directly:
+\begin{equation}
+  \text{owner}(i) = k_1 \ \wedge\ \text{owner}(j) = k_2 \ \wedge\ k_1\ne k_2
+  \;\Longrightarrow\; A_{ij} = 0 ,
+  \label{eq:noleak}
+\end{equation}
+which the implementation verifies while routing the triplets and rejects as a
+``partition leak'' otherwise.
+
+Two remarks on \eqref{eq:arrow}.  First, it is a \emph{pure permutation}: no
+unknowns are duplicated and no linking constraints are introduced (in contrast
+to duplicate-and-link reformulations), so $C$ is genuinely nonzero and the
+$B_k$ carry real Jacobian and Hessian entries.  Second, each $B_k$ is
+extremely sparse: only the border unknowns geometrically adjacent to subdomain
+$k$ appear in it.  Writing $N_k \subseteq \{1,\dots,p\}$ for the set of
+border positions subdomain $k$ actually touches, with $p_k = |N_k|$, the
+matrix $B_k$ has nonzero rows only on $N_k$.  We use the same symbol for the
+selection operator $N_k \in \R^{p_k \times p}$ picking out those positions.
+
+\subsection{Block elimination}
+
+Assume for the moment every $W_k$ is nonsingular (Section~\ref{sec:ldlt}
+handles failure).  Eliminating the interior blocks from \eqref{eq:arrow}
+produces the \emph{interface} (Schur complement) matrix
+\begin{equation}
+  S \;=\; C \;-\; \sum_{k=1}^{K} B_k W_k^{-1} B_k^{\mathsf T}
+  \;\;\in\R^{p\times p},
+  \label{eq:schur}
+\end{equation}
+and the three-stage solve for a right-hand side split as
+$r = (r_1,\dots,r_K,\,r_y)$:
+\begin{align}
+  r_S &= r_y - \sum_{k=1}^{K} B_k W_k^{-1} r_k ,
+  \label{eq:solve-a}\\
+  \Delta y &= S^{-1} r_S ,
+  \label{eq:solve-b}\\
+  \Delta x_k &= W_k^{-1}\bigl(r_k - B_k^{\mathsf T}\,\Delta y\bigr),
+  \qquad k = 1,\dots,K.
+  \label{eq:solve-c}
+\end{align}
+Everything indexed by $k$ is independent across $k$ --- that is the point of
+the decomposition.  Only \eqref{eq:solve-b} is globally coupled, and the
+design question of this whole solver is how to perform
+\eqref{eq:solve-b} \emph{without a global factorization}.
+
+\subsection{Inertia by Haynsworth additivity}
+\label{sec:haynsworth}
+
+\begin{theorem}[Haynsworth inertia additivity \cite{haynsworth1968}]
+\label{thm:haynsworth}
+Let
+$M = \begin{bmatrix} E & F^{\mathsf T}\\ F & G\end{bmatrix}$
+be symmetric with $E$ nonsingular.  Then
+\[
+  \In(M) \;=\; \In(E) \;+\; \In\!\bigl(G - F E^{-1} F^{\mathsf T}\bigr).
+\]
+\end{theorem}
+
+Applied to \eqref{eq:arrow} with
+$E = \diag(W_1,\dots,W_K)$ and Schur complement \eqref{eq:schur},
+\begin{equation}
+  \In(A) \;=\; \sum_{k=1}^{K} \In(W_k) \;+\; \In(S).
+  \label{eq:haynsworth}
+\end{equation}
+The first term is \emph{free}: each $\In(W_k)$ is read off the pivot signs of
+a factorization that must happen anyway, locally and in parallel
+(Section~\ref{sec:ldlt}).  The second term, $\In(S)$, is the one quantity
+that would classically force assembling and factorizing $S$ --- the single
+serial step in an otherwise embarrassingly parallel scheme.
+Section~\ref{sec:inertia-pred} removes it.
+
+\begin{remark}[Why pivot signs, not eigenvalues]
+On these problems $\|A\|$ reaches $\sim\!10^{18}$ through the barrier terms
+$\Sigma$, so the \emph{signs of small eigenvalues} are rounding noise and any
+eigenvalue-counting approach is hopeless.  The pivot signs of an
+$LDL^{\mathsf T}$ factorization, by Sylvester's law of inertia, count
+$n_\pm$ exactly regardless of scaling: $\In(A) = \In(D)$ whenever
+$A = LDL^{\mathsf T}$ with $L$ unit triangular.  Every inertia statement in
+this solver ultimately reduces to a pivot-sign or exact-eigendecomposition
+count of a \emph{well-scaled small} matrix.
+\end{remark}
+
+% =============================================================================
+\section{Subdomain factorization: unpivoted sparse \texorpdfstring{$LDL^{\mathsf T}$}{LDLT}}
+\label{sec:ldlt}
+
+Each $W_k$ is factorized by Eigen's \code{SimplicialLDLT}:
+\begin{equation}
+  W_k \;=\; P_k^{-1}\, L_k D_k L_k^{\mathsf T}\, P_k ,
+  \label{eq:ldlt}
+\end{equation}
+where $P_k$ is a fill-reducing permutation (computed once per sparsity
+pattern; the KKT pattern is constant over a whole run, so the symbolic
+analysis is reused by every Newton step), $L_k$ is \emph{unit} lower
+triangular, and $D_k$ is diagonal.  Eigen applies no scaling, a fact
+Section~\ref{sec:sk} depends on.  The inertia is
+$\In(W_k) = \In(D_k)$, counted from the signs of the pivots.
+
+\code{SimplicialLDLT} does \emph{not} pivot for stability, and this is the
+one real weakness of the Eigen route.  The saving grace is a structural
+property of \eqref{eq:kkt}:
+
+\begin{proposition}[Quasidefiniteness \cite{vanderbei1995symmetric}]
+If $\delta_w > 0$ makes the $(1,1)$ block of \eqref{eq:kkt} positive definite
+and $\delta_c > 0$, then $A$ is symmetric quasidefinite, and \emph{every}
+symmetric permutation of $A$ admits an $LDL^{\mathsf T}$ factorization with
+nonzero pivots.  The same holds for every $W_k$, which inherits the
+saddle-point structure.
+\end{proposition}
+
+IPOPT, however, usually offers a matrix with $\delta_w = \delta_c = 0$ first,
+and there a zero pivot is possible.  The implementation detects breakdown
+exactly (a zero or non-finite entry of $D_k$) and reports
+\code{SINGULAR} --- refusing both the solve and the inertia, since neither is
+meaningful past a broken pivot.  IPOPT responds with $\delta_w,\delta_c > 0$,
+which is \emph{precisely} the regularization that makes the unpivoted
+factorization exist.  The failure mode is therefore self-correcting; its cost
+is a few extra factorizations per run relative to a pivoting Bunch--Kaufman
+code such as MA57, and that is the honest price of dropping HSL.  No
+artificial shift is ever added inside the solver: masking a rank deficiency
+locally would corrupt the inertia signal \eqref{eq:haynsworth} that drives
+IPOPT's $\delta_w$ loop.
+
+% =============================================================================
+\section{Forming the local Schur complements}
+\label{sec:sk}
+
+The dense $p_k \times p_k$ matrices
+\begin{equation}
+  S_k \;=\; -\,B_k W_k^{-1} B_k^{\mathsf T}
+  \label{eq:sk}
+\end{equation}
+(so that $S = C + \sum_k N_k^{\mathsf T} S_k N_k$ in selection-operator form)
+are the workhorses of everything downstream: the interface operator, the
+preconditioner, and the peel all consume them.  Note that $S_k$ is
+\emph{mathematically} dense --- entry $(a,b)$ equals
+$-\,b_a^{\mathsf T} W_k^{-1} b_b$ with $W_k^{-1}$ full, so generically every
+pair of border unknowns touching subdomain $k$ interacts --- hence ``avoid
+storing it densely'' is not an available option; the design question is only
+how cheaply it can be \emph{formed}.  Formed naively, \eqref{eq:sk} costs
+$p_k$ full sparse back-solves (forward, diagonal, backward) with dense
+right-hand sides and dominates the entire factorization.  Three exact
+observations remove most of that cost.
+
+\subsection{Forward-only formation}
+
+Substituting \eqref{eq:ldlt} into \eqref{eq:sk} and using
+$P_k^{-1} = P_k^{\mathsf T}$,
+\begin{equation}
+  B_k W_k^{-1} B_k^{\mathsf T}
+  \;=\; B_k P_k^{-1} L_k^{-\mathsf T} D_k^{-1} L_k^{-1} P_k B_k^{\mathsf T}
+  \;=\; Y_k^{\mathsf T} D_k^{-1} Y_k,
+  \qquad
+  Y_k \;=\; L_k^{-1} P_k B_k^{\mathsf T} \in \R^{n_k\times p_k}.
+  \label{eq:forward-only}
+\end{equation}
+The backward substitution $L_k^{-\mathsf T}$ cancels symbolically against the
+$B_k$ that would multiply it back from the left, so \emph{the backward half
+of the solve is never performed}, and $B_k$ itself disappears from the
+product: $Y_k$ already carries it.  (This identity requires that the
+factorization apply no diagonal scaling between the two triangular halves ---
+true for Eigen, not for MA57 under MC64 scaling.)
+
+\subsection{Sparse-right-hand-side forward substitution}
+\label{sec:sparse-fwd}
+
+Each column of $P_k B_k^{\mathsf T}$ carries only a handful of nonzeros (a
+border unknown couples to a few interior unknowns), and a forward
+substitution propagates column $j$ of $L_k$ only through the multiplier
+$x_j$:\ solving $L_k x = b$ column-by-column in ascending $j$,
+\[
+  x_i \;\leftarrow\; x_i - (L_k)_{ij}\, x_j
+  \quad\text{for all } i > j \text{ with } (L_k)_{ij}\ne 0,
+\]
+a step that contributes \emph{exactly nothing} when $x_j = 0$.  The columns
+of $Y_k$ therefore acquire nonzeros only on the \emph{reach} of the
+right-hand-side pattern --- by Gilbert's theorem \cite{gilbert1988}, the
+union of elimination-tree paths from the pattern's positions to the root.
+Because the KKT pattern is fixed for the whole run, each column's reach is
+\emph{static}: it is computed once per sparsity pattern (walking the etree,
+which the symbolic analysis already built) and the substitution iterates
+exactly that list, ascending --- a valid order since an etree parent always
+carries the larger index.  Measured on the target problems the reach covers
+$2$--$4\%$ of the columns of $L_k$; a pattern-blind implementation that
+instead sweeps all $n_k$ columns testing $x_j = 0$ is algebraically
+identical, but at $N=64$ the empty sweep was profiled at more than the
+arithmetic it guarded, and the same $O(n_k p_k)$ dense-bookkeeping trap
+(scanning and zeroing the mostly-empty $Y_k$ buffer) applies to the
+contraction below --- so $Y_k$ is held \emph{compressed on its reach}
+throughout.  (Eigen's own sparse-RHS solve path does none of this; it
+expands the right-hand side into dense panels.)
+
+\subsection{Row contraction of \texorpdfstring{$Y_k^{\mathsf T} D_k^{-1} Y_k$}{YtDinvY}}
+\label{sec:row-contraction}
+
+The remaining cost of \eqref{eq:forward-only} is the contraction
+$Y_k^{\mathsf T} D_k^{-1} Y_k$.  As a dense GEMM this costs
+$2\,n_k p_k^2$ flops --- almost all of them multiplying the zeros that
+Section~\ref{sec:sparse-fwd} just avoided computing (measured: $Y_k$ is
+$\approx 88\%$ zeros at $N=32$).  Contracting by \emph{rows} instead,
+\begin{equation}
+  S_k \;=\; -\sum_{r=1}^{n_k} \frac{1}{(D_k)_{rr}}\; y_r^{\mathsf T} y_r,
+  \qquad y_r = \text{the $r$-th row of } Y_k \text{ (sparse)},
+  \label{eq:row-contraction}
+\end{equation}
+costs $\sum_r \operatorname{nnz}(y_r)^2 \le p_k \operatorname{nnz}(Y_k)$
+flops, skips only terms that are exactly zero, and produces an exactly
+symmetric $S_k$ by construction (the upper triangle is accumulated and
+mirrored --- exact symmetry is relied on by the inertia count of
+Section~\ref{sec:inertia-pred} and by the preconditioner).  The row
+grouping is read off the same static reach lists by a counting sort, so no
+dense scan of $Y_k$ ever occurs.  Measured whole-run effect of the two
+formation steps (cameraman, exact Hessian, iteration-for-iteration
+identical in every cell):
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+run & dense GEMM & row contraction & + static reach & total\\
+\midrule
+$N=32$, $3\times 3$ tiles & 4.42\,s & 4.00\,s & 3.79\,s & $1.2\times$\\
+$N=64$, $2\times 2$ tiles & 42.8\,s & 20.3\,s & 16.0\,s & $2.7\times$\\
+$N=64$, $4$ strips        & 25.7\,s & 10.1\,s & 8.08\,s & $3.2\times$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{remark}[Why $S_k$ is nevertheless \emph{kept} dense]
+Conjugate gradients only needs the action $p \mapsto S p$, so one could skip
+forming $S_k$ entirely: either apply the factored form
+$-\,Y_k^{\mathsf T}(D_k^{-1}(Y_k\,p))$ each iteration, or go fully
+matrix-free and run one $W_k$ back-solve per iteration with no $Y_k$ at all.
+Measured, both lose.  The factored application costs
+$\approx 4\operatorname{nnz}(Y_k)$ flops per iteration against $2 p_k^2$ for
+the dense matrix--vector product, and $\operatorname{nnz}(Y_k) > p_k^2$ on
+most subdomains; at the observed $\sim\!10^3$ CG iterations per
+factorization the saved contraction is repaid with interest.  The fully
+matrix-free application costs on the order of the union reach of
+$\operatorname{nnz}(L_k)$ per iteration --- roughly $10\times$ the dense
+product --- and loses by more.  Moreover the ASd preconditioner
+(Section~\ref{sec:precond}) consumes the \emph{entries} of $S_k$, not its
+action, so the dense block must exist regardless.  The winning combination
+is \eqref{eq:row-contraction} on static reaches: sparse arithmetic to
+\emph{form} $S_k$, dense arithmetic to \emph{apply} it.
+\end{remark}
+
+A runtime referee is kept for all of this: with
+\code{DDS\_SCHUR\_CHECK=1} every $S_k$ is recomputed by the naive two-sided
+route and compared, per block per factorization (relative error
+$\sim\!10^{-12}$ typical, worst $\sim\!10^{-8}$ at the most ill-conditioned
+iterates).
+
+% =============================================================================
+\section{The interface operator, matrix-free}
+\label{sec:matfree}
+
+$S$ itself is \emph{never assembled}.  Its action is evaluated as the same
+sum an assembly would have performed,
+\begin{equation}
+  S\,y \;=\; C\,y \;+\; \sum_{k=1}^{K} N_k^{\mathsf T}\, S_k\, (N_k\, y),
+  \label{eq:applyS}
+\end{equation}
+with every term local to one subdomain.  This is the distributed algorithm,
+not a simulation of it: each rank owns its dense $S_k$, and the only
+communication per application is one reduction over the border vector.
+(The stricter regime in which even the $S_k$ are not kept, and $S y$ is
+re-derived through $K$ subdomain back-solves per iteration, is measured in
+the production solver as \code{APPLY\_MATFREE}; keeping $S_k$ --- formed once
+per Newton step, locally --- is the normal choice.)
+
+The diagonal of $S$, needed by the preconditioner, is likewise assembled
+without $S$:
+\begin{equation}
+  \diag(S) \;=\; \diag(C) \;+\; \sum_{k=1}^{K} N_k^{\mathsf T}\diag(S_k),
+  \label{eq:diagS}
+\end{equation}
+one all-reduce over a $p$-vector in a distributed setting --- which is
+exactly why the ASd preconditioner is built around it.
+
+% =============================================================================
+\section{The peel: making the interface fit for CG}
+\label{sec:peel}
+
+Conjugate gradients requires a symmetric \emph{positive definite} operator,
+and $S$ is generally not one.  \emph{Three} kinds of border index are
+responsible:
+
+\begin{enumerate}
+\item \textbf{Dual border indices.}  On a $k\times k$ tile partition the
+  driver promotes the cut-corner dual pairs to the border (otherwise the
+  local blocks are structurally rank-deficient).  Empirically the promoted
+  duals are \emph{exactly} the negative eigenvalues of $S$: at every recorded
+  solve, $n_-(S)$ equalled the promoted count.  (Section
+  \ref{sec:why-predictable} explains why.)  So on tile partitions $S$ is
+  indefinite \emph{by construction}, and plain CG can never run on it.
+\item \textbf{The scalar $\alpha$.}  The problem's single global
+  regularization parameter appears in every subdomain, so its row and column
+  of $S$ are dense, wrecking both sparsity and conditioning.
+\item \textbf{The cross points} --- border unknowns touched by three or more
+  subdomains.  Unlike (i) these do not make $S$ indefinite; they make it
+  increasingly \emph{ill-conditioned} as the subdomain count grows, which is a
+  subtler defect and the subject of Section~\ref{sec:crosspoints}.
+\end{enumerate}
+
+The \emph{peel} removes both before the Krylov solve.  Split the border
+index set into the peeled set $\mathrm{P}$ (all three categories above) and
+the kept set $\mathrm{f}$, and partition
+\begin{equation}
+  \begin{bmatrix} \Sff & \SfP\\[2pt] \SfP^{\mathsf T} & \SPP \end{bmatrix}
+  \begin{bmatrix} \Delta y_{\mathrm f}\\[2pt] \Delta y_{\mathrm P}\end{bmatrix}
+  =
+  \begin{bmatrix} r_{\mathrm f}\\[2pt] r_{\mathrm P}\end{bmatrix}.
+  \label{eq:peel-system}
+\end{equation}
+With
+\begin{equation}
+  Z \;=\; \Sff^{-1}\,\SfP
+  \qquad\text{and}\qquad
+  T \;=\; \SPP - \SfP^{\mathsf T} Z
+  \;\;\in\R^{|\mathrm P|\times|\mathrm P|}
+  \label{eq:ZT}
+\end{equation}
+(the dense Schur complement of the split), block elimination of
+\eqref{eq:peel-system} gives
+\begin{align}
+  \Delta y_{\mathrm P} &= T^{-1}\bigl(r_{\mathrm P}
+      - \SfP^{\mathsf T}\, \Sff^{-1} r_{\mathrm f}\bigr),
+  \label{eq:peel-a}\\
+  \Delta y_{\mathrm f} &= \Sff^{-1} r_{\mathrm f} \;-\; Z\,\Delta y_{\mathrm P}.
+  \label{eq:peel-b}
+\end{align}
+The indefinite and dense directions now live entirely inside $T$, and
+$\Sff$ --- the operator CG actually iterates on --- is symmetric positive
+definite whenever the design premise holds.  This is the FETI-DP/BDDC corner
+treatment \cite{farhat2001fetidp,dohrmann2003bddc} in Schur-complement
+clothing.
+
+The size of $\mathrm P$ is set by the cross points.  On a $k\times k$ tile
+partition, measured: there are $(k-1)^2$ interior cross points, each of degree
+exactly three, and $4(k-1)^2$ promoted duals (four per cut-corner cell, since
+the driver promotes two rank-one dual pairs there).  With $\alpha$,
+\begin{equation}
+  |\mathrm P| \;=\; 5(k-1)^2 + 1
+  \qquad\text{(measured: } 6,\,21,\,46 \text{ at } k=2,3,4\text{)},
+  \label{eq:peelsize}
+\end{equation}
+against interfaces of $p = 128,\,261,\,400$.  Strip partitions and 1D problems
+have no cross points and no promoted duals, and there $|\mathrm P| = 1$.
+Equation~\eqref{eq:peelsize} is worth reading carefully: $|\mathrm P|$ grows
+\emph{linearly} with the number of subdomains $k^2$, so $T$ --- which is
+precisely the coarse problem of this scheme, in the FETI-DP sense --- is only
+cheap at modest $k$.  That growth is the classical scalability limit of a
+coarse space solved directly, and it is where the multilevel and
+inexact-coarse-solve literature applies
+\cite{klawonn2007inexact,tu2007three}.  The implementation therefore carries a
+guard that declines the cross-point peel outright if it would not leave
+$|\mathrm P|$ a small fraction of $p$: a partition without a small coarse
+space of this kind is better served by the $\alpha$ and dual peel alone than
+by moving the whole interface into a dense direct solve.
+
+\paragraph{Building the peel cache.}  Once per factorization:
+\begin{enumerate}
+\item $\SfP$ and $\SPP$ are read off by applying \eqref{eq:applyS} to the
+  $|\mathrm P|$ unit vectors of the peeled positions --- no assembly of $S$
+  is needed;
+\item $Z$ is computed one \emph{CG solve per column} of $\SfP$ (every system
+  involving $\Sff$ in this solver, including these, goes through CG --- the
+  honest matrix-free discipline, and also the expensive part).  Each column
+  is \emph{warm-started} from its last accepted value: the systems change
+  slowly along the barrier path --- across a $\delta$-retry only the
+  regularization moves --- and per-column telemetry showed the dominant
+  failure mode was a \emph{cold-start stall} (zero progress from $x_0=0$ for
+  the entire stall window, on a column that solved fine one build later), 
+  which a nonzero start sidesteps by handing CG a different Krylov space;
+\item $T$ is formed densely from \eqref{eq:ZT} and factorized by LU for
+  \eqref{eq:peel-a};
+\item $\In(T)$ is computed for the inertia prediction
+  (Section~\ref{sec:inertia-pred}).
+\end{enumerate}
+The action of $\Sff$ on a vector is obtained for free from
+\eqref{eq:applyS}: embed with zeros on the peeled positions, apply $S$, and
+read back the kept positions.
+
+If any column of $Z$ fails to converge, the cache is declared unbuildable
+and the whole factorization is reported \code{SINGULAR}
+(Section~\ref{sec:inertia-pred} explains why refusal is the correct
+semantics).
+
+% =============================================================================
+\section{Why the cross points must be peeled}
+\label{sec:crosspoints}
+
+Categories (i) and (ii) of Section~\ref{sec:peel} are forced: without them
+$\Sff$ is indefinite or dense and CG cannot run at all.  Category (iii) is
+different --- $S$ restricted to the non-cross-point interface is definite, so
+CG \emph{runs}; it simply converges worse and worse as the subdomain count
+grows.  This section records why that happens and what it costs.
+
+\subsection{The FETI-DP corner rule}
+
+This is not an analogy with domain decomposition; it is the same construction.
+Farhat et al.\ \cite{farhat2001fetidp} define a corner as, in their
+Definition~D1, ``its cross points --- that is, the points belonging to more
+than two subdomains,'' and make exactly those unknowns \emph{primal}: globally
+continuous, eliminated by static condensation into a coarse problem, while the
+rest of the interface is left to the iteration.  Their coarse operator
+\[
+  K^*_{cc} \;=\; K_{cc} \;-\; \sum_s (K^s_{rc}B^s_c)^{\mathsf T}(K^s_{rr})^{-1}(K^s_{rc}B^s_c)
+\]
+is precisely the $T$ of \eqref{eq:ZT}, and their reason for the choice is also
+ours twice over: making the corners primal is what makes each local block
+$K^s_{rr}$ nonsingular, which is exactly the rank deficiency this project's
+driver cures by promoting cut-corner duals.
+
+What makes the rule sufficient \emph{in two dimensions} is a theorem.  Mandel
+and Tezaur \cite{mandel2001convergence} prove that with cross-point
+constraints alone the condition number of the resulting FETI-DP operator is
+bounded by $C(1+\log(H/h))^2$, \emph{independently of the number of
+subdomains}.  The edge and face averages that dominate the BDDC literature are
+a three-dimensional requirement --- in 3D, corners alone lose a factor $H/h$
+\cite{klawonn2002dual} --- and are not needed here.  The corresponding
+statement for the interface \emph{without} a coarse component is the uniform
+diagnosis of the field: convergence degrades with the subdomain count because
+only local information is propagated
+\cite{klawonn2002dual,farhat2001fetidp}.
+
+\subsection{The same conclusion from the optimization side}
+
+The ASd preconditioner of Section~\ref{sec:precond} is taken from Lueg et
+al.\ \cite{lueg2025}, and that paper reaches the identical conclusion about
+its own method: ``it is well known that so-called one-level preconditioners as
+described above do not scale well with the number of partitions $n_P$ \dots
+Improved scalability is obtained by two-level methods, which add a coarse grid
+correction term.''  They give the two-level form
+$M_{2AS}(r) = N_0^{\mathsf T}S_0^{-1}N_0 r + \sum_k N_k S_k^{-1} N_k^{\mathsf T} r$
+with $S_0 = N_0 S N_0^{\mathsf T}$, and leave its application to optimization
+Schur complements as future work.
+
+Their own PDE-constrained test problem does not exercise the difficulty: it
+cuts along breakpoints in time, so that ``any set of two complicating
+variables are at most shared by one partition'' --- a one-dimensional
+interface with \emph{no cross points at all}, where their ASd coincides with
+plain additive Schwarz.  A two-dimensional tile partition is the regime the
+paper identifies as needing the second level, and peeling the cross points is
+the cheapest available form of it: they are placed in $T$, which is already
+built and already solved exactly, so the coarse correction costs
+$(k-1)^2$ extra columns and no new machinery.
+
+\subsection{Measured}
+
+Cameraman, exact Hessians, cross-point peel off versus on.  The solution is
+unchanged in every row (identical PSNR to two decimals):
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+run & cross points & peel off & peel on\\
+\midrule
+$N=64$, 4 strips        & 0 & 129 it, 7.99\,s & \emph{bit-identical}\\
+$N=64$, $2\times2$ tiles & 1 & 178 it, 11.4\,s & 170 it, 10.6\,s\\
+$N=32$, $3\times3$ tiles & 4 & 195 it, 6.31\,s & 113 it, 3.24\,s\\
+$N=32$, $4\times4$ tiles & 9 & 2251 it, 160\,s & 509 it, 36.8\,s\\
+$N=64$, $4\times4$ tiles & 9 & did not converge & 782 it, 173\,s\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two features of this table are the argument.  The benefit scales with the
+number of cross points, from nothing at one to a factor of four at nine; and
+strip partitions, which have no cross points, are \emph{bit-identical} --- the
+mechanism confirming itself rather than a general-purpose improvement that
+happens to help.  The last row is the one that matters most: at $N=64$ with
+$4\times4$ tiles the solver without the cross-point peel does not reach a
+solution at all (it is still grinding on dual infeasibility after ten minutes,
+having reached the final barrier level), and with it the run completes in
+under three minutes.
+
+% =============================================================================
+\section{Preconditioned conjugate gradients on \texorpdfstring{$\Sff$}{Sff}}
+\label{sec:cg}
+
+\subsection{The ASd preconditioner}
+\label{sec:precond}
+
+A Krylov interface solve stands or falls on its preconditioner: with plain
+Jacobi ($M = \diag|\Sff|$) every CG solve on a two-dimensional interface
+stalled in measurement, which is why Jacobi was removed from the
+implementation and only \emph{ASd} (``additive Schur, assembled diagonal'',
+after equations (20)--(21) of the Lueg paper \cite{lueg2025}) remains.
+
+For each subdomain $k$, let $R_k$ select the \emph{kept} border positions
+that subdomain touches (a subset of $N_k$; the rows of $S_k$ belonging to
+peeled positions are dropped).  Form the small dense block
+\begin{equation}
+  M_k \;=\; R_k S_k R_k^{\mathsf T}
+  \quad\text{with its diagonal replaced by}\quad
+  \bigl(\diag S\bigr)\big|_{R_k},
+  \label{eq:asd-block}
+\end{equation}
+using \eqref{eq:diagS}, and set
+\begin{equation}
+  M^{-1} \;=\; \sum_{k=1}^{K} R_k^{\mathsf T} M_k^{-1} R_k .
+  \label{eq:asd}
+\end{equation}
+The diagonal swap is the whole trick: $S_k$ alone describes what subdomain
+$k$ does to the shared border unknowns and badly underestimates their true
+self-coupling, to which every neighbouring subdomain also contributes;
+$\diag(S)$ is the assembled truth, and the one quantity a distributed code
+can share with a single all-reduce.  A singular local block $M_k$ is simply
+skipped --- a preconditioner may be incomplete; if what remains is useless,
+CG's own breakdown guard (below) catches it.
+
+\subsection{The iteration}
+
+\begin{algorithm}[ht]
+\caption{Preconditioned CG with breakdown guards and best-iterate memory}
+\label{alg:cg}
+\begin{algorithmic}[1]
+\State $x \gets 0$;\quad $r \gets b$;\quad $z \gets M^{-1} r$;\quad
+       $\rho \gets r^{\mathsf T} z$;\quad $q \gets z$
+\State $x^\star \gets 0$;\quad $\rho^\star \gets \|b\|$
+       \Comment{best iterate seen, and its residual norm}
+\For{$t = 1,\dots,t_{\max}$}
+  \If{$\|r\| < \rho^\star$} $x^\star \gets x$, $\rho^\star \gets \|r\|$ \EndIf
+  \If{$\|r\| \le \tau \|b\|$ \textbf{or} no improvement for $40$ iterations}
+      \textbf{break} \EndIf
+  \If{$\rho \le 0$} \textbf{break}
+      \Comment{preconditioner not SPD}\EndIf
+  \State $w \gets \Sff\, q$ \Comment{via \eqref{eq:applyS}, embedded}
+  \If{$q^{\mathsf T} w \le 0$} flag \emph{indefinite}; \textbf{break}
+      \Comment{operator not SPD along $q$}\EndIf
+  \State $\alpha \gets \rho / q^{\mathsf T} w$;\quad
+         $x \gets x + \alpha q$;\quad $r \gets r - \alpha w$
+  \State $z \gets M^{-1} r$;\quad $\rho' \gets r^{\mathsf T} z$;\quad
+         $q \gets z + (\rho'/\rho)\, q$;\quad $\rho \gets \rho'$
+\EndFor
+\State \Return $x^\star$ and its relative residual
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:cg} is textbook PCG \cite{hestenes1952} with three
+provisions that turn ``CG assumes SPD'' into a runtime check.  The guard
+$\rho \le 0$ certifies the preconditioner is not positive definite along the
+current residual; the guard $q^{\mathsf T} \Sff q \le 0$ exhibits a direction
+of non-positive curvature.  In exact arithmetic the latter is a
+one-directional \emph{proof} of indefiniteness; in floating point at
+$\|A\| \sim 10^{18}$ a merely tiny $q^{\mathsf T} w$ can round non-positive,
+so the flag over-reports and is treated as \emph{evidence, not certificate}
+(it is counted in the statistics but never acted on --- runs where it fired a
+dozen times still predicted the inertia correctly on $78/79$
+factorizations).  Finally the \emph{best} iterate, not the last, is returned,
+so a stalled solve still hands back something usable.
+
+\subsection{Acceptance, and what happens on rejection}
+\label{sec:accept}
+
+After the peel recombination \eqref{eq:peel-a}--\eqref{eq:peel-b} assembles
+the full $\Delta y$, the answer is judged by the residual of the \emph{full}
+interface system --- not the $\Sff$ subproblem CG actually saw, because the
+peel algebra sits between the two:
+\[
+  \frac{\|r_y - S\,\Delta y\|}{\|r_y\|} \;<\; 10^{-2}
+  \qquad\text{and}\qquad
+  \text{(CG's own relative residual)} \;<\; 10^{-2}.
+\]
+A rejected answer has nowhere to fall back to --- $S$ was never factorized
+--- so it is handed back \emph{anyway}, as the best iterate available, and
+the outer iterative refinement (Section~\ref{sec:refine}) judges it against
+the true matrix.  Reporting \code{SINGULAR} instead would be truthful but
+useless: IPOPT would answer with $\delta_w$, which cannot repair a Krylov
+convergence failure, and the run dies (measured, in the historical
+no-inertia mode: internal error on three of four configurations).  Only a
+solve that produced no iterate at all is reported as failed.
+
+\subsection{Relation to the iterative strategy of Lueg et al., \S 3.1}
+\label{sec:lueg-audit}
+
+The interface solve of this solver is an implementation of the iterative
+strategy of \cite{lueg2025}, \S 3.1 --- PCG on the Schur complement system,
+never forming or factorizing $S$, with a mandatory preconditioner, local step
+recovery by parallel subdomain back-solves (their eq.~11 $=$ our
+\eqref{eq:solve-c}), local inertia read from the pivot signs of the $W_k$
+factorizations, and negative-curvature monitoring inside PCG --- with two
+departures, one deliberate and one forced, and two points on which this
+implementation realizes what their paper lists as future extensions.
+
+\paragraph{Deliberate departure: how $S$ is applied.}
+Their eq.~(12) applies $S\cdot u$ matrix-free, at one $W_k$ back-solve per
+partition per CG iteration, so that not even the local Schur blocks exist.
+Here the $S_k$ are formed once per factorization (Section~\ref{sec:sk}) and
+each application is a dense $p_k\times p_k$ product.  The operator and the
+one-reduction communication pattern are identical; only the local cost model
+differs, and the measurements of Section~\ref{sec:sk} decide it: the
+matrix-free application costs roughly ten times the dense product per
+iteration, and at the observed $10^2$--$10^3$ CG iterations per factorization
+the formation cost is repaid twenty-fold.  Two further facts tilt the trade.
+Their own preconditioners (eqs.~17 and 20--21) require the local Schur blocks
+regardless, and their cost model for formation --- $p_k$ full back-solves per
+partition --- is exactly what the forward-only, static-reach route of
+Section~\ref{sec:sk} removes.
+
+\paragraph{Forced departure: the peel.}
+Their premise ``$S$ is positive definite through inertia correction'' is a
+structural fact of their formulation: the complicating variables are
+primal-only and appear only in linear linking constraints, so no dual ever
+reaches their border (and their corner block is zero, where our
+pure-permutation $C$ is not).  In the present formulation the border carries
+promoted corner duals --- $S$ is indefinite by construction --- plus $\alpha$
+and the cross points, so \S 3.1 is inapplicable to $S$ itself.  The peel of
+Section~\ref{sec:peel} is the adaptation that restores their premise:
+$\Sff$ plays the role their $S$ plays, and CG runs there.
+
+\paragraph{Inertia checks.}
+For the iterative mode their \S 3.5 offers two ways to check
+$\In(S) = (p,0,0)$: monitoring $p^{\mathsf T} S p \ge 0$ inside PCG (``this
+is not a rigorous check,'' their words), and a conservative per-block test
+$\In(S_k) = (p_k, 0, 0)$.  The first is precisely the $pAp$ guard of
+Algorithm~\ref{alg:cg}, retained here as guard and telemetry.  The second is
+inapplicable in this setting: our $S_k$ carry dual contributions and are
+indefinite by design.  The prediction of Section~\ref{sec:inertia-pred}
+replaces both with an exact count.
+
+\paragraph{Their future work, implemented here.}
+Their implementation notes record that the absence of a filter line search
+and of iterative refinement forced PCG to a $10^{-9}$ relative residual, name
+both as ``sensible extensions,'' and flag the interplay of iterative
+tolerance with step quality as future research.  This solver has both --- it
+sits inside IPOPT's filter line search, and Section~\ref{sec:refine} is the
+refinement --- which is what lets the acceptance threshold sit at $10^{-2}$;
+the tolerance sweep reported in Section~\ref{sec:measured} is the experiment
+their future-work paragraph describes.  One element of their \S 3.5 is
+genuinely not adopted: \emph{localized} regularization
+($\delta^k_H, \delta^k_C$ adjusted only in the offending partition) is
+unavailable to a solver behind IPOPT's linear-solver interface, where the
+regularization arrives already applied globally and the contract is limited
+to reporting \code{SINGULAR} or wrong inertia.
+
+\subsection{Removing the forced departure: the consensus formulation}
+\label{sec:consensus}
+
+The peel is an adaptation to a premise failure, and the failure is
+formulation-induced --- so it can be removed at the source.  The companion
+class \code{mpcc\_2d\_consensus\_tnlp.hpp} rebuilds the same MPCC in Lueg's
+duplicate-and-link form: every constraint row is assigned wholly to one tile,
+every variable referenced by rows of two or more tiles (the border $u$ nodes,
+the cut-line $q$ components, and $\alpha$ --- never $r,\delta,\theta$, which
+are strictly cell-local) receives one local copy per referencing tile, and
+the original index becomes a consensus variable appearing only in the linear
+linking rows $v_k - v = 0$.  The reformulation is exact: IPOPT's monolithic
+solver run on both formulations agrees on $\alpha^\star$ to six digits.  The
+solver of this paper is untouched --- it consumes the new problem through the
+same injected owner map, and its partition-leak check doubles as an audit of
+the construction.
+
+Structurally, the premise of \S 3.1 is thereby restored: rows are never cut,
+so the rank deficiencies that forced corner-dual promotion cannot arise, no
+dual reaches the border, and $S$ is positive definite once inertia correction
+succeeds; $\alpha$'s dense row collapses to $K$ linking couplings.  The dual
+peel becomes vacuous, while the cross points survive as consensus variables
+of degree three and are still handled by the (now purely primal) peel.
+Measured, with the cross-point peel active in both columns:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+run & permutation & consensus\\
+\midrule
+$N=16$, $2\times2$ tiles & 0.19\,s, 53 it & 0.13\,s, 56 it\\
+$N=32$, $3\times3$ tiles & 3.16\,s, 113 it & 1.26\,s, 80 it\\
+$N=32$, $4\times4$ tiles & 35.5\,s, 509 it & \textbf{2.06\,s, 84 it}\\
+$N=64$, $2\times2$ tiles & 10.6\,s, 170 it & 6.60\,s, 139 it\\
+$N=64$, $4\times4$ tiles & 172\,s, 782 it & \textbf{13.0\,s, 128 it}\\
+$N=64$, $4$ strips & 8.05\,s, 129 it & 8.05\,s, 136 it\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Identical reconstructions in every row.  The headline is the flatness of the
+consensus column in the tile count ($80 \to 84$ at $N=32$, $139 \to 128$ at
+$N=64$, against $113 \to 509$ and $170 \to 782$ for the permutation form):
+with the formulation-induced indefiniteness gone, the decomposition scales
+the way the theory of Section~\ref{sec:crosspoints} says it should.  The
+price is a larger NLP (one copy per shared variable per tile plus as many
+linking rows, $O(kN)$), a different barrier trajectory --- runs match the
+monolithic reference in solution, not iteration-for-iteration --- and one
+benign departure from strict Lueg form: the objective stays on the consensus
+variables, contributing a positive semidefinite diagonal to $C$, which can
+only help the definiteness of $S$.
+
+% =============================================================================
+\section{The predicted inertia}
+\label{sec:inertia-pred}
+
+\subsection{Haynsworth, a second time}
+
+The classical objection to a Krylov interface solve inside IPOPT is that the
+inertia \eqref{eq:haynsworth} still needs $\In(S)$, which classically comes
+only from a factorization of $S$ --- so $S$ would be assembled and factorized
+anyway, the direct back-solve would then be nearly free, and CG would be
+strictly overhead.  The resolution is to \emph{derive} $\In(S)$ from
+something already at hand.  Theorem~\ref{thm:haynsworth} applies to the peel
+split \eqref{eq:peel-system} exactly as it applied to the arrowhead:
+\begin{equation}
+  \In(S) \;=\; \In(\Sff) \;+\; \In(T),
+  \qquad T = \SPP - \SfP^{\mathsf T}\, \Sff^{-1}\, \SfP,
+  \label{eq:haynsworth2}
+\end{equation}
+and $T$ is \emph{already built} --- it is the peel cache of
+Section~\ref{sec:peel}, of size $|\mathrm P| \le$ a few dozen, so $\In(T)$
+costs a dense symmetric eigendecomposition of a tiny matrix: nothing.
+The entire prediction is therefore the single assumption
+\begin{equation}
+  \In(\Sff) \;=\; (\,|\mathrm f|,\,0,\,0\,),
+  \qquad\text{i.e.\ } \Sff \succ 0.
+  \label{eq:premise}
+\end{equation}
+What makes \eqref{eq:premise} the right assumption to bet on is that it is
+\emph{also exactly what CG requires}: the peel exists precisely to make
+$\Sff$ definite.  The scheme is self-consistent --- the interface operator is
+usable exactly when the reported inertia is right --- and the reported total
+is
+\begin{equation}
+  n_-(A) \;=\; \sum_{k=1}^K n_-(W_k) \;+\; n_-(T).
+  \label{eq:reported}
+\end{equation}
+
+Three implementation details keep \eqref{eq:reported} trustworthy.  First,
+$\In(T)$ is computed by an exact dense \emph{symmetric eigendecomposition},
+deliberately not by a dense $LDL^{\mathsf T}$: Eigen's dense \code{LDLT} is a
+pivoted Cholesky for semidefinite matrices, not Bunch--Kaufman, and its pivot
+signs are unreliable on indefinite input (the production solver measured
+$485$--$491$ reported negatives where the truth was $512$).  Second, $T$ is
+diagonally \emph{equilibrated} before the eigendecomposition:
+$T \to DTD$ with $D = \diag(|T_{ii}|^{-1/2})$ is a congruence, so
+$\In(DTD) = \In(T)$ by Sylvester's law, while the eigenvalue scales become
+comparable --- necessary because $T$ mixes the $\alpha$ direction
+(barrier-scaled, up to $\sim\!10^{20}$) with corner-dual directions
+($\sim\!10^{-9}$), and a zero test against the \emph{global} eigenvalue scale
+mistakes honest tiny eigenvalues for noise (measured: at $N=64$, $4\times4$
+tiles it refused every factorization this way, and the run could not start;
+a referee $LDL^{\mathsf T}$ of the assembled $S$ scored the equilibrated
+test's predictions $199/200$ correct).  Third, an eigenvalue of the
+equilibrated matrix with $|\lambda| < 10^{-12}\max_i|\lambda_i|$ still means
+$\In(T)$ is not well determined, and the prediction is refused.
+
+\subsection{Refusing to predict}
+
+If the peel cache cannot be built --- a CG solve for a column of $Z$ fails
+to converge, or $T$ has an undeterminable eigenvalue --- \emph{no prediction
+is issued and the factorization is reported \code{SINGULAR}}.  This is the
+safety property of the whole design: a prediction the solver cannot stand
+behind would corrupt IPOPT's $\delta_w$ loop silently, whereas
+\code{SINGULAR} merely costs a re-factorization at a larger $\delta_w$ ---
+a failure IPOPT knows how to cure.
+
+\subsection{Why \texorpdfstring{$n_-(S)$}{n-(S)} is predictable at all}
+\label{sec:why-predictable}
+
+Write $n_-(A) = m + \nu$, where $m$ is the number of dual unknowns and $\nu$
+the negative-curvature excess of the reduced Hessian --- the quantity IPOPT
+drives to zero with $\delta_w$.  Each $W_k$ is itself a saddle-point matrix,
+so $n_-(W_k) = m_k + \nu_k$ with $m_k$ its interior duals.  Every dual row is
+either owned by one subdomain or promoted to the border, so
+$\sum_k m_k = m - p_{\mathrm{dual}}$, where $p_{\mathrm{dual}}$ is the
+number of promoted (peeled) border duals.  Substituting into
+\eqref{eq:haynsworth},
+\begin{equation}
+  n_-(S) \;=\; p_{\mathrm{dual}} \;+\; \nu \;-\; \sum_{k=1}^{K}\nu_k ,
+  \label{eq:nu-count}
+\end{equation}
+which explains the measured fact that $n_-(S)$ equals the promoted-dual count
+whenever the local and global curvature counts agree
+($\nu = \sum_k \nu_k$, e.g.\ both zero at accepted steps).  The
+$\In(T)$ route \eqref{eq:haynsworth2} is used in practice because it needs no
+such assumption about $\nu$: $T$ sees whatever the corner duals actually
+contribute.
+
+% =============================================================================
+\section{Iterative refinement and the outer solve}
+\label{sec:refine}
+
+Every solve of the full system runs the arrowhead recursion
+\eqref{eq:solve-a}--\eqref{eq:solve-c} inside a few sweeps of iterative
+refinement measured against the \emph{original input triplets}:
+\begin{equation}
+  \text{repeat up to 3 times:}\quad
+  \rho = b - A x
+  \;\;\text{(triplet matvec)},\qquad
+  x \gets x + \mathcal{A}^{-1}\rho,
+  \label{eq:refine}
+\end{equation}
+where $\mathcal{A}^{-1}$ denotes one arrowhead solve, stopping early at
+relative residual $10^{-11}$ and always returning the \emph{best} iterate
+seen.  This is not a luxury.  Near-singular pivots --- IPOPT's own
+$\delta_c = 10^{-8}\mu^{1/4}$ on the dual directions, for instance --- lose
+about ten digits through the Schur recursion (measured: relative residual
+$\sim\!0.1$ unrefined against $\sim\!10^{-12}$ refined).  Because the
+residual in \eqref{eq:refine} is evaluated straight from the input triplets,
+refinement checks the \emph{decomposition itself}, not merely the arithmetic
+inside it; it is also the safety net that absorbs the accepted-anyway CG
+iterates of Section~\ref{sec:accept}.  Returning one's best answer at a nasty
+iterate and letting the globalization cope is exactly what a monolithic
+sparse solver does too.  The solve reports failure upward only if the
+residual never once evaluated finite.
+
+\subsection{Life cycle}
+
+\begin{center}
+\begin{tabular}{lp{10.2cm}}
+\toprule
+\code{set\_structure} & once per sparsity pattern: number the unknowns,
+  route every triplet to its block ($W_k$, $B_k$, or $C$), detect partition
+  leaks \eqref{eq:noleak}, build the peel sets, run the symbolic analysis of
+  every $W_k$.\\[3pt]
+\code{factorize} & every Newton step: (1) factorize all $W_k$
+  \eqref{eq:ldlt}, accumulate $\sum_k \In(W_k)$ --- any breakdown
+  $\Rightarrow$ \code{SINGULAR}; (2) form all $S_k$ by
+  \eqref{eq:forward-only}--\eqref{eq:row-contraction}; (3) assemble $C$ and
+  $\diag(S)$ \eqref{eq:diagS}; (4) build the peel cache
+  ($\SfP$, $\SPP$, $Z$, $T$, $\In(T)$) and the ASd blocks --- failure
+  $\Rightarrow$ refusal $\Rightarrow$ \code{SINGULAR}; report
+  \eqref{eq:reported}.  Steps 1--2 are independent per subdomain.\\[3pt]
+\code{solve} & per right-hand side: refinement loop \eqref{eq:refine} around
+  the arrowhead recursion; the interface step \eqref{eq:solve-b} is
+  Algorithm~\ref{alg:cg} plus the peel recombination
+  \eqref{eq:peel-a}--\eqref{eq:peel-b}.\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Constants}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+quantity & value & role\\
+\midrule
+\code{cg\_tol} & $10^{-10}$ & CG target relative residual\\
+\code{cg\_maxit} & $500$ & CG iteration cap\\
+stall window & $40$ & iterations without improvement before giving up\\
+acceptance & $10^{-2}$ & max relative residual (CG and full interface)\\
+peel-column acceptance & $10^{-2}$ & max relative residual for a $Z$ column\\
+refinement target & $10^{-11}$ & early exit of \eqref{eq:refine}\\
+refinement sweeps & $3$ & maximum corrections\\
+$\In(T)$ threshold & $10^{-12}\,\|\lambda\|_{\max}$ & below: refuse to
+  predict\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =============================================================================
+\section{What the measurements decided}
+\label{sec:measured}
+
+The single configuration described above --- CG-only interface, ASd-only
+preconditioning, predicted-only inertia --- is the surviving point of a
+larger design space measured in this codebase (the production solver
+\code{dd\_solver.hpp} retains the rest: MA57/MA97/MUMPS backends, a direct
+and a MINRES interface route, lagged Schur caching, a nested second level).
+The decisive measurements, all on the cameraman image with exact Hessians:
+
+\paragraph{Correctness against a monolithic reference.}  Against IPOPT's own
+MUMPS on identical instances, the decomposition changes the answer not at
+all: identical $\alpha^\star$ to six digits and identical PSNR at every
+size/partition tested; the $\sim\!15\%$ extra IPOPT iterations are the
+unpivoted $LDL^{\mathsf T}$ asking for regularization MA57 would not have
+needed (Section~\ref{sec:ldlt}).
+
+\paragraph{The preconditioner is everything.}  With ASd, CG carried every
+interface solve on strips and nearly all on tiles; with Jacobi on a
+$2\times 2$ tile interface, CG carried \emph{none} ($0/50$).  Hence Jacobi's
+removal.
+
+\paragraph{The three inertia modes} (historical; \emph{exact} assembled and
+factorized $S$, \emph{none} reported no inertia and used the curvature test
+of \cite{chiang2016inertia}, \emph{predicted} is Section~\ref{sec:inertia-pred}):
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+run & exact & predicted & none\\
+\midrule
+$N=16$, 2 strips        & 50 it, 0.11\,s & 50 it, 0.09\,s & 71 it, 0.11\,s\\
+$N=16$, $2\times2$ tiles & 50 it, 0.10\,s & 80 it, 0.21\,s & 108 it, 0.24\,s\\
+$N=32$, 3 strips        & 75 it, 1.49\,s & 80 it, 1.48\,s & 115 it, 1.83\,s\\
+$N=32$, $3\times3$ tiles & 75 it, 1.72\,s & 125 it, 4.51\,s & 1051 it, 63.3\,s\\
+\bottomrule
+\end{tabular}
+\end{center}
+All modes reach the same solution (PSNR identical to two decimals).  Scored
+against a referee factorization of $S$, the prediction was correct on
+$78/79$, $99/99$, $111/117$ and $132/133$ factorizations respectively, and
+every mismatch was off by exactly one.  On strips the prediction is
+\emph{free} --- same iterations and wall clock as exact inertia, with the one
+serial factorization gone --- which is the result the design was after.  What
+still costs on tiles is not wrong predictions but \emph{refusals}: peel-cache
+columns whose CG solve does not converge.  At $N=64$ with $4\times4$ tiles the
+refusals become total (every factorization refused; the run cannot start), so
+the remaining obstacle of the approach is preconditioning the peel-column
+solves --- a tractable, distributed-friendly problem --- and no longer ``we
+must factorize $S$ to know its inertia.''
+
+\paragraph{Formation of $S_k$.}  Forward-only + sparse-RHS
+(Sections \ref{sec:sk}--\ref{sec:sparse-fwd}) gave $1.65$--$1.8\times$
+whole-run speedups over the naive route at $N=32$--$64$; the row contraction
+(Section~\ref{sec:row-contraction}) a further $1.1$--$2.6\times$.
+
+\paragraph{Validation gates.}  A standalone smoke test
+(\code{dd\_simple\_smoke.cpp}, pure Eigen, no IPOPT) checks the arrowhead
+solve against a dense LU and the predicted inertia \eqref{eq:reported}
+against a dense symmetric eigendecomposition, on synthetic arrowhead KKT
+matrices with and without the peel.  \code{DDS\_SCHUR\_CHECK=1} referees
+every $S_k$ at runtime; \code{DDS\_DEBUG=1} prints partition and CG
+diagnostics.
+
+% =============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{waechter2006implementation}
+A.~W\"achter and L.~T. Biegler,
+\emph{On the implementation of an interior-point filter line-search
+algorithm for large-scale nonlinear programming},
+Mathematical Programming 106 (2006) 25--57.
+
+\bibitem{haynsworth1968}
+E.~V. Haynsworth,
+\emph{Determination of the inertia of a partitioned Hermitian matrix},
+Linear Algebra and its Applications 1 (1968) 73--81.
+
+\bibitem{vanderbei1995symmetric}
+R.~J. Vanderbei,
+\emph{Symmetric quasidefinite matrices},
+SIAM Journal on Optimization 5 (1995) 100--113.
+
+\bibitem{chiang2016inertia}
+N.-Y. Chiang and V.~M. Zavala,
+\emph{An inertia-free filter line-search algorithm for large-scale nonlinear
+programming},
+Computational Optimization and Applications 64 (2016) 327--354.
+
+\bibitem{gilbert1988}
+J.~R. Gilbert and T.~Peierls,
+\emph{Sparse partial pivoting in time proportional to arithmetic
+operations},
+SIAM Journal on Scientific and Statistical Computing 9 (1988) 862--874.
+
+\bibitem{mandel2001convergence}
+J.~Mandel and R.~Tezaur,
+\emph{On the convergence of a dual-primal substructuring method},
+Numerische Mathematik 88 (2001) 543--558.
+
+\bibitem{klawonn2002dual}
+A.~Klawonn, O.~B. Widlund, and M.~Dryja,
+\emph{Dual-primal FETI methods for three-dimensional elliptic problems with
+heterogeneous coefficients},
+SIAM Journal on Numerical Analysis 40 (2002) 159--179.
+
+\bibitem{klawonn2007inexact}
+A.~Klawonn and O.~Rheinbach,
+\emph{Inexact FETI-DP methods},
+International Journal for Numerical Methods in Engineering 69 (2007)
+284--307.
+
+\bibitem{tu2007three}
+X.~Tu,
+\emph{Three-level BDDC in three dimensions},
+SIAM Journal on Scientific Computing 29 (2007) 1759--1780.
+
+\bibitem{hestenes1952}
+M.~R. Hestenes and E.~Stiefel,
+\emph{Methods of conjugate gradients for solving linear systems},
+Journal of Research of the National Bureau of Standards 49 (1952) 409--436.
+
+\bibitem{farhat2001fetidp}
+C.~Farhat, M.~Lesoinne, P.~LeTallec, K.~Pierson, and D.~Rixen,
+\emph{FETI-DP: a dual--primal unified FETI method I},
+International Journal for Numerical Methods in Engineering 50 (2001)
+1523--1544.
+
+\bibitem{dohrmann2003bddc}
+C.~R. Dohrmann,
+\emph{A preconditioner for substructuring based on constrained energy
+minimization},
+SIAM Journal on Scientific Computing 25 (2003) 246--258.
+
+\bibitem{lueg2025}
+L.~R. Lueg, M.~L. Bynum, C.~D. Laird, and L.~T. Biegler,
+\emph{Domain decomposition preconditioners for Schur complement systems
+arising in structured nonlinear optimization problems},
+Optimization and Engineering 27 (2026) 555--585
+(published online 2 September 2025), \texttt{doi:10.1007/s11081-025-10020-1}.
+The ASd preconditioner used here is their equation (21); the two-level
+correction discussed in Section~\ref{sec:crosspoints} is their equation (22).
+
+\end{thebibliography}
+
+\end{document}

@@ -85,12 +85,27 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
   //                               to "monotone will not advance".
   //   DD_BARRIER_TOL=<f>          raise the gate. At f=1000 the N=1024 stall
   //                               above clears immediately (gate 0.15 > 0.095).
-  // Both default to the validated behaviour.
+  // Both default to the validated behaviour HERE; the 2D driver raises the
+  // gate to 1000 for --formulation consensus runs specifically (measured wins
+  // at N=32/N=128/N=256 there), because a global flip 14x-regressed the
+  // permutation form at N=32 — see dd_solve_2d.cpp.
   {
     const char *ms = std::getenv("DD_MU_STRATEGY");
     app->Options()->SetStringValue("mu_strategy", ms ? ms : "monotone");
     if (const char *bt = std::getenv("DD_BARRIER_TOL"))
       app->Options()->SetNumericValue("barrier_tol_factor", std::atof(bt));
+    // GENTLER MONOTONE CUTS. The other way monotone gets stuck is not at the
+    // gate but at the shock AFTER a cut: mu+ = min(kappa*mu, mu^theta)
+    // (defaults 0.2, 1.5) can cut 20-80x in one step, and with t = c*mu slaved
+    // to it the complementarity constraint tightens by the same factor at
+    // once — measured at N=256 that drove inf_du to 1.8e5 for hundreds of
+    // iterations (1.2e8x above the gate, where DD_BARRIER_TOL cannot reach).
+    // Raising kappa toward 1 / lowering theta toward 1 makes each cut (and
+    // each t shock) small: more levels, each cheap.
+    if (const char *ld = std::getenv("DD_MU_LINEAR_DECREASE"))
+      app->Options()->SetNumericValue("mu_linear_decrease_factor", std::atof(ld));
+    if (const char *sp = std::getenv("DD_MU_SUPERLINEAR_POWER"))
+      app->Options()->SetNumericValue("mu_superlinear_decrease_power", std::atof(sp));
   }
   // HESSIAN (--hessian exact|limited-memory, default limited-memory).
   //
@@ -302,7 +317,7 @@ RunResult run_mu_coupled(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
   p.c_theta_live_ = c_theta;
   p.t_ = std::max(t_min, t_mu_scale * mu0);
   p.eps_theta_ = c_theta * p.t_;
-  p.mu_progress_every_ = (print_level == 0) ? 25 : 0;
+  p.mu_progress_every_ = (print_level == 0) ? 1 : 0;
   p.mu_stall_iters_ = 0;
   p.mu_stall_warned_ = false;
   p.mu_hist_.clear();
@@ -385,6 +400,11 @@ inline void print_summary(const Ipopt::MpccTNLPBase &p, const RunResult &r) {
             << psnr(p.uclean_, r.best_x.data(), p.n_state) << " dB\n";
 }
 
+// The two printers below read Ipopt::DDArrowheadSolver, so they only exist
+// when the including .cpp pulled in dd_solver.hpp (the MA57 production
+// solver) first.  An Eigen-only build (--solver ddsimple, no HSL) compiles
+// this header without them.
+#ifdef DD_SOLVER_HPP
 // End-of-run telemetry for the CG interface solve (--interface cg). Printed
 // even when the run does not converge — the skip/fallback counts are exactly
 // what diagnoses an interface the iteration cannot handle.
@@ -479,6 +499,7 @@ inline void print_minres_stats(double tol, int lag) {
             << " s over " << DDArrowheadSolver::omp_threads()
             << " OpenMP thread(s)\n";
 }
+#endif  // DD_SOLVER_HPP
 
 // The five evaluation checksums of --self-check, reproducible from Python in a
 // few lines. Catches a mis-ported derivative BEFORE IPOPT ever runs — the
