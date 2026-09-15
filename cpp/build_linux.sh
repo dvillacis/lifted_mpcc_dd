@@ -16,6 +16,14 @@
 #     need IPOPT rebuilt without it.
 #   * Eigen via `pkg-config eigen3` (conda-forge package: `eigen`), falling back
 #     to $CONDA_PREFIX/include/eigen3, then /usr/include/eigen3.
+#   * zlib (-lz), which compresses the .npz files --save-solution writes
+#     (npz_writer.hpp). Unlike on macOS this is NOT free on an HPC node:
+#     the conda toolchain compiles against its own sysroot, so a system
+#     /usr/include/zlib.h is invisible and a node without zlib-devel has
+#     none anyway. Hence -isystem $CONDA_PREFIX/include below and
+#     `conda install -c conda-forge zlib` in the env. To drop the
+#     dependency instead, build with -DNPZ_NO_ZLIB (archives are then
+#     stored rather than deflated, but still valid .npz).
 #   * an HSL block solver as a SHARED library. HSL is not on conda-forge
 #     (license), so this stays a separate install. Two backends:
 #       - MA57 (the validated reference): $HSLDIR/lib/libhsl_ma57.so, with
@@ -178,6 +186,7 @@ fi
 # shellcheck disable=SC2086  # HSL_EXTRA_LIBS is deliberately word-split
 exec "$CXX" -std=c++17 -O2 \
   $EIGEN_CFLAGS -I"$ROOT" -I"$ROOT/third_party" $(pkg-config --cflags ipopt) \
+  -isystem "$CONDA_PREFIX/include" \
   "${HSL_DEFS[@]}" "${OMPFLAGS[@]}" \
   "$@" \
   -L"$HSL_LIBDIR" -l"$HSL_LIB" -Wl,-rpath,"$HSL_LIBDIR" \
