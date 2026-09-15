@@ -6,6 +6,11 @@
 //   --solver dd --nsub k  the DD arrowhead solver — k×k tiles, every Newton system
 //                         factorized and solved by Σ_k W_k + the interface S, every
 //                         inertia query answered by Haynsworth
+//   --solver ddsimple     the SAME decomposition in dd_solver_simple.hpp: Eigen
+//                         only (no HSL, no MUMPS), interface solved by CG, and
+//                         written to be read. Use it to understand the method or
+//                         on a machine without MA57; --solver dd stays the
+//                         production route.
 //
 // The 2D sibling of dd_solve_1d.cpp; see that file for the design. Two things are
 // 2D-specific:
@@ -23,6 +28,7 @@
 //
 // Data, warm start and a reference owner map come from dump_data_2d.py.
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -32,12 +38,27 @@
 
 #include "IpIpoptApplication.hpp"
 #include "IpTNLPAdapter.hpp"
+// The MA57 production solver is optional at build time: without HSL the
+// build defines nothing and --solver dd is rejected at runtime, while
+// --solver ddsimple (and IPOPT's own mumps) still work. build.sh sets
+// DD_HAVE_MA57 iff it found the library.
+#ifdef DD_HAVE_MA57
 #include "dd_solver.hpp"
+#endif
+// The readable, HSL-free twin of dd_solver.hpp (--solver ddsimple): Eigen
+// LDLᵀ blocks + conjugate gradients on the interface. See its header comment.
+#include "dd_solver_simple.hpp"
 #include "driver_common.hpp"
 #include "mpcc_2d_tnlp.hpp"
+// The consensus (duplicate-and-link) reformulation — Lueg's structure imposed
+// on the same MPCC, selected by --formulation consensus. Same solutions; a
+// different KKT sparsity in which the border is purely primal.
+#include "mpcc_2d_consensus_tnlp.hpp"
 // struct Partition2D — the tile/strip cell ownership and the anchor rule, now
 // shared with dd_solve_dataset.cpp (which partitions each training pair with it).
 #include "partition_2d.hpp"
+// Dependency-free NumPy .npz writer — the structured solution format.
+#include "npz_writer.hpp"
 
 using namespace Ipopt;
 
@@ -178,19 +199,99 @@ static std::vector<int> kkt_owner2(const Mpcc2DTNLP &p, const Partition2D &part,
 // the data costs a few KB and means plot_2d.py needs nothing else — which matters
 // most on the image route, where there is no .txt instance to point at and
 // re-decoding the PNG in Python would silently plot a DIFFERENT noise realization.
-static void save_solution(const std::string& fn, const Mpcc2DTNLP& p,
+// ---------------------------------------------------------------------------
+//  SOLUTION OUTPUT.  Two formats, chosen by the extension of --save-solution:
+//
+//    .npz  (default, recommended)  a NumPy archive of NAMED, SHAPED arrays —
+//          self-describing, exact (raw IEEE-754), ~3x smaller than the text
+//          form, and readable by np.load / MATLAB / Julia / R.
+//    .txt  the original positional token stream, kept so existing result
+//          directories and any external scripts keep working.
+//
+//  Both carry the same content: the solution, the instance it was solved on,
+//  the per-level continuation history and the μ-trace — self-contained, so a
+//  plot needs nothing but this one file.
+// ---------------------------------------------------------------------------
+static void save_solution_npz(const std::string& fn, const Mpcc2DTNLP& p,
+                              const std::vector<driver::Level>& hist,
+                              const std::vector<double>& x, double t_last,
+                              int nsub) {
+   // The consensus formulation carries local copies past the original layout;
+   // the leading n_orig entries are the consensus values, which at a feasible
+   // point equal every copy — i.e. exactly the original-formulation solution.
+   const Mpcc2DConsensusTNLP* cons = dynamic_cast<const Mpcc2DConsensusTNLP*>(&p);
+   const int nw = cons ? cons->n_orig : p.n;
+   const size_t mu = (size_t)p.m_u, mq = (size_t)p.m_q, nc = (size_t)p.nc;
+   const size_t Nn = (size_t)p.N;
+
+   npz::Writer w(fn);
+   if (!w.ok()) { std::cerr << "cannot write " << fn << "\n"; return; }
+
+   // -- what this run was ------------------------------------------------
+   w.scalar_i("N", p.N);
+   w.scalar_i("nsub", nsub);
+   w.scalar_i("n_var", nw);
+   w.scalar_d("sigma", p.sigma_);
+   w.scalar_d("t_last", t_last);
+   w.scalar_i("weight_exp", p.weight_exp ? 1 : 0);
+   w.scalar_i("averaged", p.averaged ? 1 : 0);
+   w.scalar_i("consensus", cons ? 1 : 0);
+
+   // -- the instance (so the file is self-contained) ---------------------
+   w.array_d("u_clean", p.uclean_.data(), {Nn, Nn});
+   w.array_d("f", p.f_.data(), {Nn, Nn});
+
+   // -- the solution, as SHAPED, NAMED fields rather than one flat vector --
+   w.array_d("u", x.data() + p.ou, {Nn, Nn});
+   w.array_d("qx", x.data() + p.oqx, {nc, nc});
+   w.array_d("qy", x.data() + p.oqy, {nc, nc});
+   w.array_d("r", x.data() + p.oR, {nc, nc});
+   w.array_d("delta", x.data() + p.oD, {nc, nc});
+   w.array_d("theta", x.data() + p.oTh, {nc, nc});
+   w.scalar_d("alpha", x[p.oa]);
+   w.scalar_d("weight", p.Q(x[p.oa]));
+   // the raw primal vector too: authoritative, and what a warm start needs
+   w.array_d("x", x.data(), {(size_t)nw});
+
+   // -- the continuation history, one row per level ----------------------
+   std::vector<double> lv;
+   lv.reserve(hist.size() * 8);
+   for (const driver::Level& l : hist) {
+      lv.push_back(l.t); lv.push_back((double)l.status); lv.push_back((double)l.iters);
+      lv.push_back(l.comp_res); lv.push_back(l.weight); lv.push_back(l.obj);
+      lv.push_back(l.xi_max); lv.push_back(l.converged ? 1.0 : 0.0);
+   }
+   w.array_d("levels", lv.data(), {hist.size(), 8});
+   // and the in-solve μ-trace of the μ-coupled route
+   w.array_d("mu_trace", p.mu_hist_.data(), {p.mu_hist_.size() / 5, 5});
+
+   (void)mu; (void)mq;
+   if (!w.close()) std::cerr << "failed writing " << fn << "\n";
+}
+
+static void save_solution_txt(const std::string& fn, const Mpcc2DTNLP& p,
                           const std::vector<driver::Level>& hist,
                           const std::vector<double>& x, double t_last, int nsub) {
    std::ofstream out(fn);
    if (!out) { std::cerr << "cannot write " << fn << "\n"; return; }
+   // The consensus formulation carries local copies past the original layout
+   // (see mpcc_2d_consensus_tnlp.hpp). Write only the CONSENSUS variables —
+   // at a feasible point every copy equals the consensus value it links to, so
+   // the leading n_orig entries ARE the original-formulation solution vector.
+   // Truncating here keeps the file format identical for both formulations, so
+   // python/plot_slurm.py and everything downstream read them unchanged (that
+   // reader validates n against N and would otherwise reject a consensus run).
+   const Mpcc2DConsensusTNLP* cons =
+      dynamic_cast<const Mpcc2DConsensusTNLP*>(&p);
+   const int nw = cons ? cons->n_orig : p.n;
    out << std::setprecision(17);
-   out << p.n << " " << hist.size() << " " << t_last << " " << nsub << " "
+   out << nw << " " << hist.size() << " " << t_last << " " << nsub << " "
        << (p.weight_exp ? 1 : 0) << "\n";
    for (const driver::Level& l : hist)
       out << l.t << " " << l.status << " " << l.iters << " " << l.comp_res << " "
           << l.weight << " " << l.obj << " " << l.xi_max << " "
           << (l.converged ? 1 : 0) << "\n";
-   for (int i = 0; i < p.n; ++i) out << x[i] << (i + 1 < p.n ? ' ' : '\n');
+   for (int i = 0; i < nw; ++i) out << x[i] << (i + 1 < nw ? ' ' : '\n');
    // trailing instance block
    out << p.N << " " << (p.averaged ? 1 : 0) << " " << p.sigma_ << "\n";
    for (const std::vector<double>* v : {&p.uclean_, &p.f_})
@@ -287,6 +388,21 @@ int main(int argc, char** argv) {
    std::string partition = "tile";
    bool check = false, nsub_set = false, dual_warm = false, promote = true;
    bool alpha_peel = true, dual_peel = true;
+   // --no-cross-peel (ddsimple only): stop making the cross points — border
+   // unknowns touched by >=3 subdomains — primal. They are the FETI-DP corner
+   // set; peeling them is on by default because it is what makes tile
+   // partitions scale (see dd_solver_simple.hpp §6a). Use this to A/B.
+   bool cross_peel = true;
+   // --formulation permutation|consensus: decompose the monolithic KKT by pure
+   // permutation (default, the validated route), or rebuild the NLP in Lueg's
+   // duplicate-and-link form so every complicating variable is primal and
+   // appears only in linear linking rows (see mpcc_2d_consensus_tnlp.hpp).
+   std::string formulation = "permutation";
+   // --solver ddsimple has no --interface/--inertia knobs left: it is CG on
+   // the peeled interface with the PREDICTED inertia, full stop (see the
+   // dd_solver_simple.hpp header).  We only need to know whether --interface
+   // was actually typed, to reject a contradictory request.
+   bool interface_set = false;
 
    for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -323,7 +439,7 @@ int main(int argc, char** argv) {
       else if (a == "--stencil")  stencil = next();
       else if (a == "--normalize") normalize = next();
       else if (a == "--partition") partition = next();
-      else if (a == "--interface") interface_solver = next();
+      else if (a == "--interface") { interface_solver = next(); interface_set = true; }
       else if (a == "--precond")  precond = next();
       else if (a == "--wk-backend") wk_backend = next();
       else if (a == "--cg-tol")   cg_tol = std::stod(next());
@@ -339,11 +455,14 @@ int main(int argc, char** argv) {
       else if (a == "--t-mu-scale") t_mu_scale = std::stod(next());
       else if (a == "--no-alpha-peel") alpha_peel = false;
       else if (a == "--no-dual-peel") dual_peel = false;
+      else if (a == "--no-cross-peel") cross_peel = false;
+      else if (a == "--formulation") formulation = next();
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
    if (data.empty()) {
       std::cerr << "usage: dd_solve_2d --data <cpp2/data_2d_N.txt|image.png> "
-                   "[--size N] [--solver mumps|ma57|ma97|dd] [--nsub k]\n"
+                   "[--size N] [--solver mumps|ma57|ma97|dd|ddsimple] "
+                   "[--nsub k]\n"
                    "                   [--self-check] [--save-solution FILE] "
                    "[--save-dd FILE] [--partition tile|strip]\n"
                    "                   [--interface direct|cg|minres] "
@@ -356,6 +475,27 @@ int main(int argc, char** argv) {
                    "    of the factorization instead of p_k backsolves. "
                    "Validate with ./mumps_smoke\n"
                    "    and DD_CHECK=1 on any new machine.\n"
+                   "  --solver ddsimple: the same decomposition implemented in\n"
+                   "    dd_solver_simple.hpp — Eigen only (no HSL/MUMPS), written to be\n"
+                   "    READ. One configuration: the interface matrix S is never\n"
+                   "    assembled or factorized — ASd-preconditioned CG on the peeled\n"
+                   "    interface, In(S) PREDICTED as In(T) from the tiny dense peel\n"
+                   "    complement. Honours --nsub, --partition, --cg-tol,\n"
+                   "    --cg-max-iter, --no-alpha-peel, --no-dual-peel and\n"
+                   "    --no-cross-peel.\n"
+                   "  --formulation permutation|consensus (default permutation):\n"
+                   "    permutation decomposes the monolithic KKT in place; consensus\n"
+                   "    rebuilds the NLP in Lueg's duplicate-and-link form (one local\n"
+                   "    copy per shared variable per tile + linear linking rows), so\n"
+                   "    the border is purely primal: no promoted duals, S SPD after\n"
+                   "    inertia correction. Same solutions (checked vs mumps); needs\n"
+                   "    --solver ddsimple or mumps.\n"
+                   "  --no-cross-peel (needs --solver ddsimple): stop making the CROSS\n"
+                   "    POINTS primal. A cross point is a border unknown touched by >=3\n"
+                   "    subdomains -- (k-1)^2 of them on a k x k tile partition. Making\n"
+                   "    them primal is the FETI-DP corner rule and is ON by default: it\n"
+                   "    is a no-op on strips (which have none) and worth 1.7-4.3x on\n"
+                   "    tiles, and N=64 4x4 does not converge without it.\n"
                    "  --interface cg (needs --solver dd): preconditioned CG on the\n"
                    "    interface. On tile partitions the promoted corner duals make\n"
                    "    S indefinite; the DUAL PEEL (on by default) eliminates them as\n"
@@ -375,15 +515,29 @@ int main(int argc, char** argv) {
                    "  generate the data file first:\n"
                    "    uv run python cpp2/dump_data_2d.py --N 16 --nsub 2 "
                    "-o cpp2/data_2d_16.txt\n"
-                   "  and plot the result with:\n"
-                   "    uv run python cpp2/plot_2d.py --solution sol.txt "
-                   "--save-plot sol.png\n";
+                   "  --save-solution FILE: .npz (recommended) writes a NumPy\n"
+                   "    archive of named, shaped arrays; .txt writes the legacy\n"
+                   "    positional text. Both are self-contained (solution +\n"
+                   "    instance + continuation history + mu-trace).\n"
+                   "  and plot the result with (seven panels per solution):\n"
+                   "    ./dd_solve_2d ... --save-solution runs/sols/sol_TAG.npz\n"
+                   "    (cd ../python && uv sync && uv run python plot_slurm.py "
+                   "../cpp/runs)\n";
       return 2;
    }
-   if (solver != "mumps" && solver != "ma57" && solver != "ma97" && solver != "dd") {
-      std::cerr << "--solver must be mumps|ma57|ma97|dd\n";
+   if (solver != "mumps" && solver != "ma57" && solver != "ma97" &&
+       solver != "dd" && solver != "ddsimple") {
+      std::cerr << "--solver must be mumps|ma57|ma97|dd|ddsimple\n";
       return 2;
    }
+#ifndef DD_HAVE_MA57
+   if (solver == "dd") {
+      std::cerr << "--solver dd needs MA57, and this binary was built without "
+                   "HSL; use --solver ddsimple (Eigen only) or rebuild with "
+                   "HSLDIR set\n";
+      return 2;
+   }
+#endif
    if (partition != "tile" && partition != "strip") {
       std::cerr << "--partition must be tile|strip\n";
       return 2;
@@ -393,10 +547,38 @@ int main(int argc, char** argv) {
       std::cerr << "--interface must be direct|cg|minres\n";
       return 2;
    }
-   if (interface_solver != "direct" && solver != "dd") {
+   if (solver == "ddsimple" && interface_set && interface_solver != "cg") {
+      std::cerr << "--solver ddsimple only implements --interface cg (its "
+                   "direct route was removed with the assembled S)\n";
+      return 2;
+   }
+   if (solver != "ddsimple" && interface_solver != "direct" && solver != "dd") {
       std::cerr << "--interface " << interface_solver
                 << " needs --solver dd (it replaces the arrowhead's "
                    "interface solve)\n";
+      return 2;
+   }
+   if (formulation != "permutation" && formulation != "consensus") {
+      std::cerr << "--formulation must be permutation|consensus\n";
+      return 2;
+   }
+   if (formulation == "consensus") {
+      if (solver != "ddsimple" && solver != "mumps") {
+         std::cerr << "--formulation consensus supports --solver ddsimple (the "
+                      "decomposition) and mumps (the monolithic equivalence "
+                      "reference)\n";
+         return 2;
+      }
+      if (check || !save_data.empty() || !save_dd.empty()) {
+         std::cerr << "--formulation consensus does not support --self-check/"
+                      "--save-data/--save-dd (they assume the permutation "
+                      "layout)\n";
+         return 2;
+      }
+   }
+   if (solver == "ddsimple" && precond != "asd") {
+      std::cerr << "--precond " << precond << " is not implemented in "
+                   "dd_solver_simple.hpp; ASd is its only preconditioner\n";
       return 2;
    }
    if (nested && solver != "dd") {
@@ -506,8 +688,10 @@ int main(int argc, char** argv) {
       std::cerr << "an image input needs --size N (the target side length)\n";
       return 2;
    }
-   SmartPtr<Mpcc2DTNLP> mpcc =
-      new Mpcc2DTNLP(data, iopt, weight == "exp", stencil == "averaged");
+   const bool consensus = (formulation == "consensus");
+   SmartPtr<Mpcc2DTNLP> mpcc = consensus
+      ? new Mpcc2DConsensusTNLP(data, iopt, weight == "exp", stencil == "averaged")
+      : new Mpcc2DTNLP(data, iopt, weight == "exp", stencil == "averaged");
    mpcc->w_max_ = wmax;
    mpcc->reg_alpha_ = reg_alpha;
    if (!nsub_set && mpcc->file_nsub > 0) nsub = mpcc->file_nsub;
@@ -531,7 +715,18 @@ int main(int argc, char** argv) {
    Partition2D part(mpcc->N, nsub, partition == "strip");
    std::vector<int> col_owner;
    int n_promoted = 0;
-   std::vector<int> owner = kkt_owner(*mpcc, part, promote, &col_owner, &n_promoted);
+   std::vector<int> owner;
+   if (consensus) {
+      // Duplicate-and-link: rebuild the NLP so every complicating variable is
+      // primal and linear-only, then read the owner map off the construction.
+      // No corner promotion is needed — rows are never cut, so the rank
+      // deficiencies that forced it cannot arise.
+      Mpcc2DConsensusTNLP* c = static_cast<Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc));
+      c->init_consensus(part);
+      owner = c->kkt_owner_consensus();
+   } else {
+      owner = kkt_owner(*mpcc, part, promote, &col_owner, &n_promoted);
+   }
 
    std::cout << "2D lifted TV-MPCC (staggered, C++)  N=" << mpcc->N
              << "  nodes=" << mpcc->m_u << "  cells=" << mpcc->m_q
@@ -542,10 +737,16 @@ int main(int argc, char** argv) {
              << "  Q(a) = " << (mpcc->weight_exp ? "e^a" : "a")
              << (mpcc->has_ha ? "  (+ row ha: a >= 0)" : "  (a boxed)")
              << "   init=" << init << "   solver=" << solver;
-   if (solver == "dd") {
+   if (solver == "dd" || solver == "ddsimple") {
       if (part.striped) std::cout << "  partition=" << nsub << " strips";
       else std::cout << "  nsub=" << nsub << "x" << nsub << " tiles";
-      if (n_promoted) std::cout << "  +" << n_promoted << " promoted corner duals";
+      if (consensus) {
+         const Mpcc2DConsensusTNLP* c =
+            static_cast<const Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc));
+         std::cout << "  formulation=consensus (+" << c->n_link
+                   << " copies/links, no promoted duals)";
+      }
+      else if (n_promoted) std::cout << "  +" << n_promoted << " promoted corner duals";
       else if (!promote) std::cout << "  (corner promotion OFF)";
       if (wk_backend == "mumps") std::cout << "  wk-backend=mumps(schur)";
    }
@@ -593,7 +794,52 @@ int main(int argc, char** argv) {
 
    SmartPtr<IpoptApplication> app = IpoptApplicationFactory();
    if (!driver::init_app(app, printlevel, maxiter, solver, hessian)) return 1;
+   // Barrier-advance gate, formulation-scoped default (2026-09-08).  For
+   // CONSENSUS runs the monotone gate defaults to 1000: measured 80→29 its at
+   // N=32 3×3, 332→138 at N=128 4×4, and it is what lets N=256 advance past
+   // the level the default gate stalled on — same α*/PSNR each time.  NOT
+   // flipped for the permutation form: the same gate 14×-regressed it at
+   // N=32 (113→1603 its).  DD_BARRIER_TOL always wins when set, and
+   // DD_BARRIER_TOL=10 reproduces the pre-flip consensus tables.
+   if (consensus && !std::getenv("DD_BARRIER_TOL"))
+      app->Options()->SetNumericValue("barrier_tol_factor", 1000.0);
+   // Gentler monotone cuts, formulation-scoped for the same reason as the gate
+   // above.  μ⁺ = min(κ_μ·μ, μ^θ_μ) at IPOPT's (0.2, 1.5) can cut μ by two
+   // orders in ONE step, and because t = c·μ is slaved to it the
+   // complementarity constraint tightens by the same factor at once.  Measured
+   // at N=32 4×4 consensus that put μ at 1.5e-4 before the first Newton step
+   // and threw the run into restoration for 17 iterations (inf_pr 1.4e-3 → 1.0,
+   // inf_du → 1.0e+03).  At (0.7, 1.1) the first cut lands at 7.0e-4 and
+   // inf_du peaks at 4.5 instead.
+   //
+   // What that buys, measured, same α*/PSNR at each size:
+   //     consensus N=32   status 1 → 0 (Succeeded), 59 → 123 its
+   //     consensus N=64   360 → 149 its, 1.18M → 423k CG its, 9122 → 2480 solves
+   // and in BOTH the §8 falsification counter "non-positive curvature ... after"
+   // goes to 0 — no inertia is handed to IPOPT while this run holds evidence
+   // that S_ff is indefinite there.  N=32 pays 2× the iterations for that.
+   //
+   // NOT flipped for the permutation form, which it destroys: 243 → 3000 its
+   // (max-iter, status -1) at N=32.  The two env vars always win when set, and
+   // DD_MU_LINEAR_DECREASE=0.2 DD_MU_SUPERLINEAR_POWER=1.5 reproduces the
+   // pre-flip consensus tables.  Other points measured at N=32 consensus and
+   // rejected: (0.5,1.2) → -2, (0.9,1.05) → the worse local solution
+   // (obj 2.346 vs 2.200), (0.7,1.5) → -3 at 1670 its, (0.2,1.1) → obj 2.344.
+   if (consensus && !std::getenv("DD_MU_LINEAR_DECREASE"))
+      app->Options()->SetNumericValue("mu_linear_decrease_factor", 0.7);
+   if (consensus && !std::getenv("DD_MU_SUPERLINEAR_POWER"))
+      app->Options()->SetNumericValue("mu_superlinear_decrease_power", 1.1);
+   // DD_DERIV_TEST=first|second: run IPOPT's derivative checker against the
+   // TNLP callbacks — the validation gate for a new formulation's eval code.
+   if (const char* dt = std::getenv("DD_DERIV_TEST")) {
+      app->Options()->SetStringValue(
+         "derivative_test", std::string(dt) == "first" ? "first-order"
+                                                       : "second-order");
+      app->Options()->SetNumericValue("derivative_test_perturbation", 1e-7);
+      app->Options()->SetIntegerValue("print_level", 4);
+   }
 
+#ifdef DD_HAVE_MA57
    if (solver == "dd") {
       DDArrowheadSolver::config_owner(owner, part.n_sub);
       if (nested) {
@@ -624,9 +870,40 @@ int main(int argc, char** argv) {
                                   : DDArrowheadSolver::WK_MA57);
       DDArrowheadSolver::reset_interface_stats();
    }
+#endif
+   // The readable Eigen-only twin (dd_solver_simple.hpp). It takes the SAME
+   // owner map as --solver dd, so the two are directly comparable: same
+   // partition, same interface, same Haynsworth inertia — only the numerical
+   // kernels differ (Eigen LDLᵀ instead of MA57, CG instead of the direct
+   // interface back-solve).
+   if (solver == "ddsimple") {
+      ddsimple::Arrowhead::Options o;
+      // Border positions with a KKT index >= n are DUAL — the promoted corner
+      // duals. They are S's negative eigenvalues, so CG needs them peeled.
+      o.n_primal = dual_peel ? mpcc->n : (1 << 30);   // consensus: updated n
+      o.alpha_index = alpha_peel ? mpcc->oa : -1;
+      o.peel_cross_points = cross_peel;
+      o.cg_tol = cg_tol;
+      o.cg_maxit = cg_maxit;
+      DDSimpleSolver::config(owner, part.n_sub);
+      DDSimpleSolver::config_options(o);
+      std::cout << "  interface=cg(asd"
+                << (alpha_peel ? ",alpha-peel" : ",no-alpha-peel")
+                << (dual_peel ? ",dual-peel" : ",no-dual-peel")
+                << (cross_peel ? ",cross-peel" : ",no-cross-peel")
+                << ",tol=" << cg_tol << ",maxit=" << cg_maxit << ")\n"
+                << "  inertia=PREDICTED: S is never assembled or factorized; "
+                   "In(S) = In(T) from the |P|x|P| peel complement\n";
+   }
    auto optimize = [&]() -> ApplicationReturnStatus {
+#ifdef DD_HAVE_MA57
       if (solver == "dd") {
          SmartPtr<AlgorithmBuilder> b = new CustomSolverBuilder<DDArrowheadSolver>();
+         return app->OptimizeNLP(new TNLPAdapter(GetRawPtr(mpcc)), b);
+      }
+#endif
+      if (solver == "ddsimple") {
+         SmartPtr<AlgorithmBuilder> b = new SimpleSolverBuilder();
          return app->OptimizeNLP(new TNLPAdapter(GetRawPtr(mpcc)), b);
       }
       return app->OptimizeTNLP(GetRawPtr(mpcc));
@@ -641,14 +918,41 @@ int main(int argc, char** argv) {
                                 c_theta, tol, /*warm_start=*/dual_warm,
                                 /*value_is_alpha=*/false, optimize);
    driver::print_summary(*mpcc, res);
+#ifdef DD_HAVE_MA57
    if (solver == "dd" && interface_solver == "cg")
       driver::print_interface_stats(precond, alpha_peel, cg_tol);
    if (solver == "dd" && interface_solver == "minres")
       driver::print_minres_stats(cg_tol, minres_lag);
+#endif
+   if (solver == "ddsimple") {
+      const auto& st = DDSimpleSolver::stats();
+      if (st.pred_refused || st.indef_before || st.indef_after)
+         std::cout << "  prediction refused=" << st.pred_refused
+                   << "  non-positive curvature seen: before=" << st.indef_before
+                   << " (no prediction issued)  after=" << st.indef_after
+                   << " (prediction already given)\n";
+      std::cout << "  interface CG: solves=" << st.solves
+                << "  iterations=" << st.iters;
+      if (st.solves) std::cout << " (" << (double)st.iters / (double)st.solves << "/solve)";
+      std::cout << "  rejected=" << st.rejected
+                << "  peel caches=" << st.cache_builds << "\n";
+      if (st.pc_blocks_indef)
+         std::cout << "  ASd preconditioner: indefinite blocks (LDLT, not LLT)="
+                   << st.pc_blocks_indef << "  positions affected="
+                   << st.pc_positions_indef
+                   << "  singular blocks skipped=" << st.pc_blocks_singular
+                   << "\n";
+      // The §10 tally: silent unless something actually warned during the run.
+      ddsimple::Warnings::get().report(std::cout);
+   }
 
    if (!res.best_x.empty()) {
       if (!save_sol.empty()) {
-         save_solution(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
+         if (save_sol.size() > 4 &&
+             save_sol.compare(save_sol.size() - 4, 4, ".txt") == 0)
+            save_solution_txt(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
+         else
+            save_solution_npz(save_sol, *mpcc, res.hist, res.best_x, res.best_t, nsub);
          std::cout << "  wrote " << save_sol << "\n";
       }
       if (!save_dd.empty())

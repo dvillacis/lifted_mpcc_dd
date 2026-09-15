@@ -57,7 +57,45 @@ def index_sets(r, w, eps):
 
 # --- the self-contained --save-solution file (see plot_2d.load_solution) ------
 def parse_solution(path):
-    """Parse a ``dd_solve_2d --save-solution`` file into a decoded dict.
+    """Decode a ``dd_solve_2d --save-solution`` file (``.npz`` or ``.txt``).
+
+    ``.npz`` is the structured format: named, shaped arrays written straight
+    from the solver (see ``cpp/npz_writer.hpp``), so decoding is a lookup
+    rather than an offset calculation. ``.txt`` is the original positional
+    token stream, still read here so existing result directories keep working.
+    """
+    if path.endswith(".npz"):
+        return _parse_solution_npz(path)
+    return _parse_solution_txt(path)
+
+
+def _parse_solution_npz(path):
+    """Decode the structured format. Every field is named and already shaped."""
+    d = np.load(path)
+    N = int(d["N"])
+    w_exp = bool(int(d["weight_exp"]))
+    a = float(d["alpha"])
+    lv = d["levels"]
+    history = [dict(t=float(r[0]), status=int(r[1]), iters=int(r[2]),
+                    comp_res=float(r[3]), weight=float(r[4]), obj=float(r[5]),
+                    xi_max=float(r[6]), converged=bool(int(r[7]))) for r in lv]
+    mu_trace = d["mu_trace"] if d["mu_trace"].size else None
+    return dict(
+        N=N, nc=N - 1, m_u=N * N, m_q=(N - 1) ** 2, sigma=float(d["sigma"]),
+        stencil="averaged" if int(d["averaged"]) else "onesided",
+        weight_mode="exp" if w_exp else "linear",
+        alpha=a, weight=float(d["weight"]),
+        # flat for the node fields, 2-D for the cell fields — the shapes the
+        # panels below expect, matching the text decoder exactly
+        u_clean=d["u_clean"].ravel(), f=d["f"].ravel(), u=d["u"].ravel(),
+        r=d["r"], delta=d["delta"], qx=d["qx"], qy=d["qy"],
+        t_last=float(d["t_last"]), nsub=int(d["nsub"]),
+        history=history, mu_trace=mu_trace,
+    )
+
+
+def _parse_solution_txt(path):
+    """Parse the legacy text format into the same dict.
 
     Layout: header (n_var, n_lev, t_last, nsub, w_flag), then n_lev per-level
     rows of 8, then x, then the trailing instance block (N, s_flag, σ, u_clean,
@@ -360,18 +398,30 @@ def main():
     sols_dir = os.path.join(args.slurmdir, "sols")
     if not os.path.isdir(sols_dir):
         raise SystemExit(f"no sols/ subfolder in {args.slurmdir!r}")
-    files = sorted(glob.glob(os.path.join(sols_dir, "sol_*.txt")))
+    # .npz is the current format, .txt the legacy one; a directory may hold
+    # both, and when a tag exists in both the structured file wins.
+    files = sorted(glob.glob(os.path.join(sols_dir, "sol_*.npz")) +
+                   glob.glob(os.path.join(sols_dir, "sol_*.txt")))
     if args.only:
         files = [f for f in files
-                 if os.path.basename(f) == f"sol_{args.only}.txt"]
+                 if os.path.basename(f) in (f"sol_{args.only}.npz",
+                                            f"sol_{args.only}.txt")]
+    seen, keep = set(), []
+    for f in sorted(files, key=lambda p: (p.rsplit(".", 1)[0],
+                                          p.endswith(".txt"))):
+        tag = os.path.basename(f).rsplit(".", 1)[0]
+        if tag not in seen:
+            seen.add(tag)
+            keep.append(f)
+    files = keep
     if not files:
-        raise SystemExit(f"no matching sol_*.txt in {sols_dir!r}")
+        raise SystemExit(f"no matching sol_*.npz or sol_*.txt in {sols_dir!r}")
 
     out_dir = args.out or os.path.join(args.slurmdir, "plots")
     os.makedirs(out_dir, exist_ok=True)
 
     for path in files:
-        tag = os.path.basename(path)[len("sol_"):-len(".txt")]
+        tag = os.path.basename(path)[len("sol_"):].rsplit(".", 1)[0]
         sol = parse_solution(path)
 
         def out(name):
