@@ -23,7 +23,12 @@
 //                            ANY edit to this file.
 //      DDS_SCHUR_CHECK=1     every S_k re-derived by the naive two-sided route
 //                            and compared, per block per factorization
-//      DDS_DEBUG=1           partition / CG / refusal diagnostics
+//      DDS_DEBUG=1           partition / CG / refusal diagnostics (implies
+//                            DDS_WARN=all)
+//      DDS_WARN=all|off      §10 warnings: every occurrence, or none at all.
+//                            The default prints the first of each kind and
+//                            counts the rest; Warnings::get().report(os)
+//                            prints the tally (dd_solve_2d does, per run)
 //
 //  CONTENTS                                                     (code map)
 //      §1  the IPOPT contract                                    ─ adapter
@@ -36,6 +41,7 @@
 //      §7  ASd-preconditioned conjugate gradients                ─ Precond, cg
 //      §8  the predicted inertia                                 ─ peel cache
 //      §9  refinement and failure semantics                      ─ solve
+//      §10 what a run warns about, and why it is only a warning  ─ Warnings
 //
 // -----------------------------------------------------------------------------
 //  §1  WHAT IPOPT ASKS OF A LINEAR SOLVER
@@ -403,7 +409,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -416,6 +425,103 @@ using SpMat = Eigen::SparseMatrix<double>;
 using Trip = Eigen::Triplet<double>;
 using Vec = Eigen::VectorXd;
 using Mat = Eigen::MatrixXd;
+
+// =============================================================================
+//  Warnings (§10) — the one place a run says out loud that something went wrong.
+//
+//  Everything reported here is RECOVERABLE BY CONSTRUCTION, which is why these
+//  events used to be visible only under DDS_DEBUG: an unpivoted LDLᵀ breakdown
+//  becomes SYMSOLVER_SINGULAR and IPOPT answers it by raising δ_w (§4), and a CG
+//  answer that fails the acceptance test is still handed back for §9's
+//  refinement to judge.  Recoverable is not the same as harmless, though: a run
+//  that converges only because IPOPT kept regularizing around a saturating
+//  interface solve looks, from the outside, exactly like one that never
+//  struggled.  These warnings are the difference.
+//
+//  They fire PER NEWTON STEP, so printing every one would bury the output.
+//  Hence: the FIRST of each kind is printed in full, all of them are counted,
+//  and report() prints the tally once at the end of the run.
+//      DDS_WARN=all   print every occurrence (DDS_DEBUG implies it)
+//      DDS_WARN=off   print nothing; the counters and report() still work
+//
+//  Not thread-safe, and does not need to be: every call site is serial code —
+//  the two OpenMP loops (§4 factorization, §2.2/2.4 solves) report their
+//  failures from the serial pass that follows.
+// =============================================================================
+enum class Warn {
+   LdltSymbolic,   // Eigen's analyzePattern failed: the structure is unusable
+   LdltNumeric,    // W_k breakdown: Eigen info() != Success, or a zero/NaN pivot
+   CoarseNotSpd,   // the DDS_COARSE Galerkin matrix is not SPD (term left off)
+   PrecondNotSpd,  // an ASd block is indefinite (used anyway, via LDLT)
+   CgPeelColumn,   // a Z column of the peel cache did not converge → SINGULAR
+   CgRejected,     // the interface answer failed the §7 acceptance test
+   CgUnusable,     // ... and there was no iterate at all to fall back on
+   StepResidual,   // the refined step is still poor against the true triplets
+   N_KINDS
+};
+
+inline const char* warn_kind(Warn w) {
+   switch (w) {
+      case Warn::LdltSymbolic: return "symbolic analysis failed";
+      case Warn::LdltNumeric:  return "W_k factorization broke down";
+      case Warn::CoarseNotSpd: return "coarse Galerkin matrix not SPD";
+      case Warn::PrecondNotSpd: return "ASd preconditioner block not SPD";
+      case Warn::CgPeelColumn: return "peel column did not converge";
+      case Warn::CgRejected:   return "interface CG answer rejected";
+      case Warn::CgUnusable:   return "interface solve produced nothing usable";
+      case Warn::StepResidual: return "step residual above tolerance";
+      default:                 return "unknown";
+   }
+}
+
+class Warnings {
+public:
+   static Warnings& get() { static Warnings w; return w; }
+
+   void add(Warn w, const std::string& detail) {
+      const int i = (int)w;
+      const bool first = (count_[i]++ == 0);
+      if (mode_ == Off || (mode_ == First && !first)) return;
+      std::cerr << "[dds] WARNING: " << warn_kind(w) << " — " << detail;
+      if (mode_ == First)
+         std::cerr << "\n              (further occurrences of this warning are"
+                      " counted, not printed; DDS_WARN=all shows them all)";
+      std::cerr << "\n";
+   }
+
+   long count(Warn w) const { return count_[(int)w]; }
+   long total() const {
+      long t = 0;
+      for (int i = 0; i < (int)Warn::N_KINDS; ++i) t += count_[i];
+      return t;
+   }
+   void reset() {
+      for (int i = 0; i < (int)Warn::N_KINDS; ++i) count_[i] = 0;
+   }
+
+   // End-of-run tally, one entry per kind that fired.  Prints NOTHING when the
+   // run produced no warnings, so a clean run's output stays clean.
+   void report(std::ostream& os, const char* prefix = "  ") const {
+      if (total() == 0) return;
+      os << prefix << "warnings:";
+      for (int i = 0; i < (int)Warn::N_KINDS; ++i)
+         if (count_[i]) os << "  " << warn_kind((Warn)i) << "=" << count_[i];
+      os << "\n";
+   }
+
+private:
+   Warnings() {
+      const char* w = std::getenv("DDS_WARN");
+      const std::string v = w ? w : "";
+      if (v == "off" || v == "0") mode_ = Off;
+      else if (v == "all" || std::getenv("DDS_DEBUG")) mode_ = All;
+   }
+   enum Mode { Off, First, All };
+   Mode mode_ = First;
+   long count_[(int)Warn::N_KINDS] = {0};
+};
+
+inline void warn(Warn w, const std::string& detail) { Warnings::get().add(w, detail); }
 
 // =============================================================================
 //  Ldlt — sparse symmetric LDLᵀ (§4), plus the raw pieces §5 needs.
@@ -432,6 +538,7 @@ public:
    bool analyze(const SpMat& A) {
       f_.analyzePattern(A);
       analyzed_ = (f_.info() == Eigen::Success);
+      if (!analyzed_) why_ = "Eigen analyzePattern() did not return Success";
       return analyzed_;
    }
 
@@ -440,16 +547,30 @@ public:
    bool factorize(const SpMat& A) {
       ok_ = false;
       n_neg_ = 0;
+      why_.clear();
       if (!analyzed_ && !analyze(A)) return false;
       f_.factorize(A);
-      if (f_.info() != Eigen::Success) return false;
+      // Eigen's own complaint, verbatim in spirit: NumericalIssue is what
+      // SimplicialLDLT reports when the unpivoted factorization cannot be
+      // completed.  Kept as a string so the caller can say WHICH block and why.
+      if (f_.info() != Eigen::Success) {
+         why_ = (f_.info() == Eigen::NumericalIssue)
+                   ? "Eigen SimplicialLDLT reported NumericalIssue"
+                   : "Eigen SimplicialLDLT reported info() != Success";
+         return false;
+      }
       // Inertia = signs of D (Sylvester, §3).  A zero or non-finite pivot
       // means the unpivoted factorization has broken down: the solve would
       // return garbage and the inertia would be meaningless, so both are
       // refused.
       const Vec& d = f_.vectorD();
       for (int i = 0; i < d.size(); ++i) {
-         if (!std::isfinite(d[i]) || d[i] == 0.0) return false;
+         if (!std::isfinite(d[i]) || d[i] == 0.0) {
+            std::ostringstream m;
+            m << "pivot D[" << i << "] = " << d[i] << " (zero or non-finite)";
+            why_ = m.str();
+            return false;
+         }
          if (d[i] < 0.0) ++n_neg_;
       }
       ok_ = true;
@@ -467,6 +588,8 @@ public:
 
    int negative_eigenvalues() const { return n_neg_; }
    bool ok() const { return ok_; }
+   // Why the last factorize()/analyze() said no — empty when it said yes.
+   const std::string& why() const { return why_; }
 
    // ---- the pieces of the factorization the S_k formation (§5) needs ------
    //
@@ -524,6 +647,7 @@ private:
    Impl f_;
    bool analyzed_ = false, ok_ = false;
    int n_neg_ = 0;
+   std::string why_;     // Eigen's complaint about the last refusal (§10)
 };
 
 // =============================================================================
@@ -545,21 +669,93 @@ private:
 //  (a single all-reduce over a p-vector), which is exactly why Lueg picks it —
 //  and why factorize() assembles diag(S) without assembling S.
 //
-//  A singular local block is simply skipped: a preconditioner is allowed to be
-//  incomplete, and if what remains is useless, CG's rz-breakdown guard catches
-//  it and the solve is rejected.
+//  EVERY M_k IS FACTORIZED BY A SYMMETRIC FACTORIZATION, NEVER INVERTED.  This
+//  is the single most consequential line in the file, so here is the evidence.
+//
+//  CG does not merely need M⁻¹ to be positive definite; it needs it to be
+//  SYMMETRIC.  The three-term recurrence derives its conjugacy from
+//  <r_i, M⁻¹ r_j> being an inner product, and an M⁻¹ that is symmetric only to
+//  1e-9 is not one.  The search directions stop being conjugate, the residual
+//  stops descending, and CG grinds to its stall guard having achieved nothing.
+//
+//  An explicit M.inverse() — and PartialPivLU, which is what Eigen's inverse()
+//  actually runs for a general matrix — computes the action through an
+//  UNSYMMETRIC route, so round-off lands asymmetrically.  Measured on symmetric
+//  indefinite blocks at cond(M) ~ 3e7:
+//
+//      ‖X − Xᵀ‖/‖X‖    inverse()   PartialPivLU     LDLT
+//         mb =  20       5.1e-10       5.1e-10     2.3e-15
+//         mb = 120       1.6e-09       1.6e-09     1.8e-13
+//
+//  LDLT keeps it because P L D Lᵀ Pᵀ is applied as a MIRRORED sequence, so the
+//  operator is symmetric by construction rather than by luck.  Four to five
+//  orders of magnitude, and the real blocks are worse conditioned than 3e7.
+//
+//  What that asymmetry cost, N=32/4x4, versus this arrangement:
+//
+//                            IPOPT its   CG its   rejected   wall
+//      inverse(), all blocks       865    8.85M      63     102 s   permutation
+//      LLT + LU on indefinite      940    9.49M       0     172 s
+//      LLT + LDLT  (this code)     243    2.03M       0      36 s
+//
+//  Same solution to six figures in all three (α* 0.06448, obj 2.345, PSNR
+//  23.39); 2.8x faster than the inverse, with 4.4x fewer CG iterations.  Under
+//  the consensus formulation the same swap ran 74 → 59 IPOPT iterations and
+//  dropped rejections 529 → 375.
+//
+//  Cholesky is tried FIRST because attempting it is also the SPD test — the
+//  only cheap evidence this file has that §8's premise still holds — and it is
+//  half the flops of LDLT when it succeeds.  A block that fails it is NOT
+//  refused: measured, dropping an indefinite M_k outright cost 74 → 105 IPOPT
+//  iterations, and patching the gap with a Jacobi diagonal cost 74 → 200 and
+//  ended in Error_In_Step_Computation.  An indefinite M_k is wrong, but it is
+//  wrong densely — it still approximates S_ff⁻¹ where it matters, whereas a
+//  dropped block leaves its positions with NO action at all.  So it is recorded
+//  (Warn::PrecondNotSpd) and used, and if the AGGREGATE ever goes indefinite,
+//  that is what CG's rz guard is for.
+//
+//  A block LDLT cannot take either is genuinely singular and IS skipped — there
+//  is no unsymmetric fallback, because reintroducing one would reintroduce the
+//  table above.  That counter read 0 across every run measured.
+//
+//  NOTE, because it looks like a contradiction: build_peel_cache() refuses to
+//  use Eigen's dense LDLT and reaches for a symmetric eigendecomposition
+//  instead, on the grounds that Eigen's LDLT is a pivoted Cholesky rather than
+//  Bunch–Kaufman and its PIVOT SIGNS are unreliable on indefinite input.  That
+//  objection is real and it does not apply here.  It is an objection to reading
+//  INERTIA off D — counting how many pivots are negative — which this code
+//  never does.  Here LDLT is only ever asked to APPLY M⁻¹, and a preconditioner
+//  is not required to be accurate; it is required to be symmetric and cheap.
+//  Sign-unreliable pivots cost some preconditioner quality, which CG absorbs as
+//  iterations.  An unsymmetric operator costs CG its conjugacy, which it does
+//  not absorb at all.  Never route an inertia count through this factorization.
 // =============================================================================
 class Precond {
 public:
    // nf = number of kept border positions (the dimension CG works in).
    // Sk / Nk / keptpos describe the local Schur blocks and how their rows map
    // onto kept positions; diagS_kept is diag(S) gathered on the kept positions.
-   void build(int nf, const std::vector<Mat>& Sk,
+   // What one build found, for §10's telemetry.  Neither number is a failure:
+   // an indefinite block is still used (see the header comment), it just says
+   // the SPD premise is not holding everywhere on this interface.
+   struct Info {
+      long blocks_refused = 0;   // local M_k that failed the Cholesky test
+      long positions_indef = 0;  // DISTINCT kept positions such a block covers
+                                 // (they overlap between subdomains, so this
+                                 // is a set size, never a sum of block sizes)
+      long blocks_singular = 0;  // ... and that LDLT could not take either
+   };
+
+   Info build(int nf, const std::vector<Mat>& Sk,
               const std::vector<std::vector<int>>& Nk,
               const std::vector<int>& keptpos, const Vec& diagS_kept) {
       nf_ = nf;
-      Minv_.assign(Nk.size(), Mat());
+      llt_.assign(Nk.size(), Eigen::LLT<Mat>());
+      ldlt_.assign(Nk.size(), Eigen::LDLT<Mat>());
+      spd_.assign(Nk.size(), 0);
       idx_.assign(Nk.size(), {});
+      Info info;
+      std::vector<char> hit(nf, 0);     // distinct positions under a bad block
       for (size_t k = 0; k < Nk.size(); ++k) {
          std::vector<int> loc, gl;          // loc: row in S_k;  gl: kept position
          for (int a = 0; a < (int)Nk[k].size(); ++a) {
@@ -572,11 +768,29 @@ public:
          for (int i = 0; i < mb; ++i)
             for (int j = 0; j < mb; ++j) M(i, j) = Sk[k](loc[i], loc[j]);
          for (int i = 0; i < mb; ++i) M(i, i) = diagS_kept[gl[i]];   // the swap
-         const Mat Mi = M.inverse();
-         if (!Mi.allFinite()) continue;     // singular local block -> skip it
-         Minv_[k] = Mi;
+         if (!M.allFinite()) continue;   // nothing to factorize; skip it
+         // The SPD test and the SPD factorization are one computation.
+         Eigen::LLT<Mat> f(M);
+         if (f.info() == Eigen::Success) {
+            llt_[k] = std::move(f);
+            spd_[k] = 1;
+         } else {
+            // Indefinite: keep the block, but keep the SYMMETRY too.
+            ++info.blocks_refused;
+            for (int i = 0; i < mb; ++i) hit[gl[i]] = 1;
+            Eigen::LDLT<Mat> h(M);
+            if (h.info() != Eigen::Success || !h.vectorD().allFinite() ||
+                h.vectorD().cwiseAbs().minCoeff() <= 0.0) {
+               ++info.blocks_singular;      // genuinely singular: skip it
+               continue;
+            }
+            ldlt_[k] = std::move(h);
+            spd_[k] = 0;
+         }
          idx_[k] = gl;
       }
+      for (int i = 0; i < nf; ++i) info.positions_indef += hit[i];
+      return info;
    }
 
    // z ← M⁻¹ r
@@ -588,14 +802,18 @@ public:
          if (mb == 0) continue;
          Vec rk(mb);
          for (int i = 0; i < mb; ++i) rk[i] = r[idx[i]];
-         const Vec zk = Minv_[k] * rk;
+         // Vec, not auto: the two Solve<> expression types do not unify.
+         const Vec zk = spd_[k] ? Vec(llt_[k].solve(rk))    // L Lᵀ zk = rk
+                                : Vec(ldlt_[k].solve(rk));  // P L D Lᵀ Pᵀ
          for (int i = 0; i < mb; ++i) z[idx[i]] += zk[i];   // ADDITIVE
       }
    }
 
 private:
    int nf_ = 0;
-   std::vector<Mat> Minv_;                  // the small dense block inverses
+   std::vector<Eigen::LLT<Mat>> llt_;       // SPD blocks: Cholesky
+   std::vector<Eigen::LDLT<Mat>> ldlt_;     // indefinite blocks: symmetric LDLᵀ
+   std::vector<char> spd_;                  // which of the two holds block k
    std::vector<std::vector<int>> idx_;      // their kept-position lists
 };
 
@@ -622,8 +840,8 @@ struct CgResult {
    bool indefinite = false;   // pAp <= 0 was observed
 };
 
-template <class ApplyA>
-inline CgResult cg_solve(ApplyA&& applyA, const Precond& P, const Vec& b, Vec& x,
+template <class ApplyA, class Prec>
+inline CgResult cg_solve(ApplyA&& applyA, const Prec& P, const Vec& b, Vec& x,
                          double tol, int maxit, const Vec* x0 = nullptr) {
    const int n = (int)b.size();
    const double bnorm = std::max(b.norm(), 1e-300);
@@ -648,7 +866,26 @@ inline CgResult cg_solve(ApplyA&& applyA, const Precond& P, const Vec& b, Vec& x
    double best_rel = 1.0;
    Vec best = Vec::Zero(n);
    int best_it = 0, it = 0;
-   const int stall = 40;   // give up after this many iterations with no gain
+   // Give up after this many iterations with NO improvement in the best
+   // residual seen.  It is not a convergence tolerance and it must not be set
+   // near sqrt(kappa): CG's residual 2-norm is not monotone, and on an
+   // operator this preconditioner leaves at kappa ~ 2e3 the first genuine
+   // descent does not appear until roughly sqrt(2e3) ~ 45 iterations.  A guard
+   // at 40 therefore fired EXACTLY where CG was about to start converging, and
+   // handed back the zero iterate.  Measured (N=32 4x4 consensus, dense
+   // eigendecomposition of the assembled S_ff): cond(S_ff) 1e7-1e10,
+   // cond(M^-1 S_ff) 1.9e3-2.8e3, so sqrt ~ 43-52 against a guard of 40.
+   //
+   // Raising it, same alpha*/PSNR throughout (40 -> 100 -> 300):
+   //     consensus N=32   rejected 316 -> 24 -> 24,  solves 837 -> 607 -> 607
+   //     consensus N=64   rejected 2137 -> 934 -> 87, solves 2480 -> 1325 -> 511
+   //                      status -3 -> 1 -> 1,        its 149 -> 104 -> 82
+   //     permutation N=32 0 rejected at every setting (it never hits the guard)
+   // N=32 saturates by 100 (100/200/400 bit-identical), but N=64 does NOT —
+   // it keeps improving to 300, which is the point: the guard has to clear
+   // sqrt(kappa), and kappa grows with the problem.  Hence 300 rather than the
+   // N=32 plateau.  cg_maxit stays the real ceiling.
+   const int stall = 300;
    for (; it < maxit; ++it) {
       const double rel = r.norm() / bnorm;
       if (rel < best_rel) { best_rel = rel; best = x; best_it = it; }
@@ -700,6 +937,23 @@ public:
       int cg_maxit = 500;
    };
 
+   // Above this, a refined step is reported as poor (§9/§10).  Not a rejection
+   // threshold — the step is still returned, because IPOPT has nothing better
+   // to do with a SINGULAR here than raise δ_w and ask for the same thing again.
+   //
+   // That is not a guess, it is the architecture, and withholding the step was
+   // tried: SYMSOLVER_SINGULAR is legal only at FACTORIZATION time.  IPOPT's
+   // δ_w loop guards the first SolveOnce for a new matrix, but once the
+   // factorization is accepted IPOPT runs its own iterative refinement against
+   // it, and a solve that fails there aborts the algorithm outright —
+   //     INTERNAL_ABORT, IpPDFullSpaceSolver.cpp:263,
+   //     "SolveOnce returns false during iterative refinement"
+   // — measured at consensus N=32 for every threshold from 1e-2 to 1e1, where
+   // withholding a SINGLE step was enough to end the run (-199, or -2 without
+   // leaving the seeded level).  Refusing a bad step has to happen in
+   // factorize(), not here.
+   static constexpr double kStepResidualWarn = 1e-8;
+
    struct Stats {
       long solves = 0;        // interface solves attempted
       long iters = 0;         // CG iterations summed over all of them
@@ -716,6 +970,11 @@ public:
       //           as a hint, not a verdict.
       long indef_before = 0, indef_after = 0;
       long pred_refused = 0;  // factorizations where we declined to predict
+      // ASd preconditioner health (§7).  An indefinite block is USED anyway,
+      // via LDLT (dropping it measured worse — see the Precond header), so the
+      // first two are telemetry on the §8 SPD premise, not a failure count.
+      // pc_blocks_singular IS a failure: that block was skipped entirely.
+      long pc_blocks_indef = 0, pc_positions_indef = 0, pc_blocks_singular = 0;
    };
 
    // --------------------------------------------------------------------
@@ -783,9 +1042,13 @@ public:
       }
       for (int k = 0; k < nsub_; ++k) {
          if (!ok[k]) {
-            if (std::getenv("DDS_DEBUG"))
-               std::cerr << "[dds] W_" << k << " (dim " << dimk_[k]
-                         << ") factorization failed → SINGULAR\n";
+            // Expected on occasion and self-correcting (§4) — but silence here
+            // is how a run that regularized its way out of trouble on every
+            // second Newton step passes for a clean one.
+            std::ostringstream m;
+            m << "W_" << k << " (dim " << dimk_[k] << "): " << ldlt_[k]->why()
+              << "; reporting SINGULAR, IPOPT answers by raising δ_w";
+            warn(Warn::LdltNumeric, m.str());
             return SINGULAR;
          }
          n_neg_ += ldlt_[k]->negative_eigenvalues();   // the Σ_k In(W_k) of (3.1)
@@ -965,7 +1228,22 @@ public:
          if (!solve_arrowhead(r.data())) break;  // r ← A⁻¹r, the correction
          for (int i = 0; i < dim_; ++i) x[i] += r[i];
       }
-      if (!std::isfinite(best_res)) return false;   // rhs left as the RHS
+      if (!std::isfinite(best_res)) {              // rhs left as the RHS
+         warn(Warn::StepResidual,
+              "refinement residual is not finite; no step returned (SINGULAR)");
+         return false;
+      }
+      // The last honest check in the file: this is the residual of the step
+      // actually handed to IPOPT, measured against the ORIGINAL triplets (§9).
+      // Refinement targets 1e-11 and normally lands far below the threshold
+      // below, so a warning here means the decomposition — not the arithmetic
+      // around it — is what IPOPT is being asked to trust.
+      if (best_res > kStepResidualWarn) {
+         std::ostringstream m;
+         m << "step returned with ‖b − Ax‖/‖b‖ = " << best_res << " after 3 "
+              "refinement sweeps (warn above " << kStepResidualWarn << ")";
+         warn(Warn::StepResidual, m.str());
+      }
       std::copy(best.begin(), best.end(), rhs);
       return true;
    }
@@ -1060,7 +1338,9 @@ private:
          fill_from_triplets(W_[k], wtrip_[k]);       // zeros: pattern only
          fill_from_triplets(B_[k], btrip_[k]);       // zeros: pattern for the reach
          if (!ldlt_[k]->analyze(W_[k])) {
-            std::cerr << "[dds] symbolic analysis of W_" << k << " failed\n";
+            std::ostringstream m;
+            m << "W_" << k << " (dim " << dimk_[k] << "): " << ldlt_[k]->why();
+            warn(Warn::LdltSymbolic, m.str());
             return false;
          }
          // Symbolic reach of every column of P_k B_kᵀ (§5(b)): walk each
@@ -1154,6 +1434,37 @@ private:
       for (size_t j = 0; j < peel_.size(); ++j) peelpos_[peel_[j]] = (int)j;
       for (int j = 0; j < p_; ++j)
          if (peelpos_[j] < 0) { keptpos_[j] = (int)kept_.size(); kept_.push_back(j); }
+
+      // Edge groups for the DDS_COARSE experiment: kept positions bucketed by
+      // the set of tiles touching them (pattern-only, computed once).
+      coarse_grp_.assign(kept_.size(), -1);
+      n_coarse_ = 0;
+      if (const char* cs = std::getenv("DDS_COARSE")) {
+         const int nseg = std::max(1, std::atoi(cs));   // segments per edge
+         std::vector<std::vector<int>> touch(p_);
+         for (int k = 0; k < nsub_; ++k)
+            for (int j : Nk_[k]) touch[j].push_back(k);
+         // bucket kept positions by touching-tile set = one bucket per edge,
+         // then split each bucket into nseg contiguous segments (border
+         // positions ascend with KKT index, which tracks the grid, so
+         // contiguous-in-bucket is contiguous-along-the-edge)
+         std::map<std::vector<int>, std::vector<int>> edges;
+         for (size_t a = 0; a < kept_.size(); ++a) {
+            std::vector<int>& t = touch[kept_[a]];
+            std::sort(t.begin(), t.end());
+            edges[t].push_back((int)a);
+         }
+         for (auto& kv : edges) {
+            const std::vector<int>& mem = kv.second;
+            const int m = std::min<int>(nseg, (int)mem.size());
+            for (size_t i = 0; i < mem.size(); ++i)
+               coarse_grp_[mem[i]] = n_coarse_ + (int)(i * m / mem.size());
+            n_coarse_ += m;
+         }
+         if (std::getenv("DDS_DEBUG"))
+            std::cerr << "[dds] coarse space: " << n_coarse_ << " groups ("
+                      << edges.size() << " edges x " << nseg << " segments)\n";
+      }
    }
 
    // A triplet routed into one of the blocks: (row, col) in that block's own
@@ -1292,8 +1603,9 @@ private:
    bool solve_interface(const Vec& ry, Vec& dy) {
       if (interface_cg(ry, dy)) return true;
       if (dy.size() == p_ && dy.allFinite()) return true;
-      if (std::getenv("DDS_DEBUG"))
-         std::cerr << "[dds-cg] interface solve produced nothing usable\n";
+      warn(Warn::CgUnusable,
+           "not even a best iterate survived; this arrowhead solve fails and "
+           "IPOPT is told SINGULAR");
       return false;
    }
 
@@ -1316,7 +1628,43 @@ private:
       // assembled in factorize() without assembling S.
       Vec dkept(nf);
       for (int a = 0; a < nf; ++a) dkept[a] = diagS_[kept_[a]];
-      pc_.build(nf, Sk_, Nk_, keptpos_, dkept);
+      const Precond::Info pci = pc_.build(nf, Sk_, Nk_, keptpos_, dkept);
+      stats_.pc_blocks_indef += pci.blocks_refused;
+      stats_.pc_positions_indef += pci.positions_indef;
+      stats_.pc_blocks_singular += pci.blocks_singular;
+      if (pci.blocks_refused) {
+         std::ostringstream m;
+         m << pci.blocks_refused << " of " << nsub_ << " local blocks failed "
+              "Cholesky (" << pci.positions_indef << " of " << nf
+           << " kept positions); factorized by LDLT and used anyway"
+           << (pci.blocks_singular
+                  ? ", except " + std::to_string(pci.blocks_singular) +
+                        " singular even for LDLT and skipped"
+                  : "");
+         warn(Warn::PrecondNotSpd, m.str());
+      }
+
+      // Coarse Galerkin matrix S0 = B0ᵀ S_ff B0 — n_coarse_ APPLICATIONS of
+      // S_ff, no solves.  Refused (coarse term simply off) if not SPD.
+      coarse_ok_ = false;
+      if (n_coarse_ > 0) {
+         Mat S0 = Mat::Zero(n_coarse_, n_coarse_);
+         Vec e(nf), w;
+         for (int g = 0; g < n_coarse_; ++g) {
+            e.setZero();
+            for (int i = 0; i < nf; ++i) if (coarse_grp_[i] == g) e[i] = 1.0;
+            apply_Sff_into(e, w);
+            for (int i = 0; i < nf; ++i)
+               if (coarse_grp_[i] >= 0) S0(coarse_grp_[i], g) += w[i];
+         }
+         S0 = 0.5 * (S0 + S0.transpose());
+         coarse_llt_.compute(S0);
+         coarse_ok_ = (coarse_llt_.info() == Eigen::Success);
+         if (!coarse_ok_)
+            warn(Warn::CoarseNotSpd,
+                 "Eigen LLT of S0 did not return Success; the coarse term is "
+                 "off for this factorization (CG falls back to one-level ASd)");
+      }
 
       t_neg_ = 0;
       if (nP == 0) { peel_ok_ = true; return true; }   // In(T) of a 0×0 block
@@ -1344,20 +1692,24 @@ private:
       // mode — CG stalling at rel=1 with no progress at all on a column it
       // solved fine one build later — by handing it a different Krylov space.
       auto applyA = [this](const Vec& v, Vec& out) { apply_Sff_into(v, out); };
+      const TwoLevel P2{&pc_, this};
       Z_.resize(nf, nP);
       if (Zwarm_.rows() != nf || Zwarm_.cols() != nP) Zwarm_ = Mat::Zero(nf, nP);
       for (int j = 0; j < nP; ++j) {
          Vec z;
          const Vec w0 = Zwarm_.col(j);
-         const CgResult r = cg_solve(applyA, pc_, Vec(SfP_.col(j)), z,
+         const CgResult r = cg_solve(applyA, P2, Vec(SfP_.col(j)), z,
                                      opt_.cg_tol, opt_.cg_maxit, &w0);
          stats_.iters += r.iters;
          if (r.indefinite) ++stats_.indef_before;
          if (!(r.rel < 1e-2) || !z.allFinite()) {
-            if (std::getenv("DDS_DEBUG"))
-               std::cerr << "[dds-cg] peel column " << j << " did not converge"
-                            " (rel=" << r.rel << (r.indefinite
-                                ? ", S_ff PROVED indefinite)" : ")") << "\n";
+            std::ostringstream m;
+            m << "column " << j << " of " << nP << " stopped at rel=" << r.rel
+              << " after " << r.iters << " iterations"
+              << (r.indefinite ? " (pAp <= 0: S_ff is PROVED indefinite here)" : "")
+              << (z.allFinite() ? "" : " (non-finite iterate)")
+              << "; no peel cache ⇒ no predicted inertia ⇒ SINGULAR";
+            warn(Warn::CgPeelColumn, m.str());
             return false;                       // peel_ok_ stays false
          }
          Z_.col(j) = z;
@@ -1428,7 +1780,8 @@ private:
 
       Vec g;                                    // g = S_ff⁻¹ r_f
       auto applyA = [this](const Vec& v, Vec& out) { apply_Sff_into(v, out); };
-      const CgResult r = cg_solve(applyA, pc_, rf, g, opt_.cg_tol, opt_.cg_maxit);
+      const TwoLevel P2{&pc_, this};
+      const CgResult r = cg_solve(applyA, P2, rf, g, opt_.cg_tol, opt_.cg_maxit);
       const double rel = r.rel;
       stats_.iters += r.iters;
       // A pAp <= 0 event is evidence against the §8 premise that S_ff is SPD.
@@ -1460,6 +1813,13 @@ private:
       const double true_rel = (ry - Sdy).norm() / std::max(ry.norm(), 1e-300);
       if (!(rel < 1e-2) || !(true_rel < 1e-2) || !dy.allFinite()) {
          ++stats_.rejected;
+         std::ostringstream m;
+         m << "S_ff rel=" << rel << ", full-interface rel=" << true_rel
+           << " after " << r.iters << " CG iterations (accept < 1e-2)"
+           << (r.indefinite ? ", pAp <= 0 seen" : "")
+           << (dy.allFinite() ? "" : ", non-finite iterate")
+           << "; handed back anyway for §9 refinement to judge";
+         warn(Warn::CgRejected, m.str());
          return false;
       }
       return true;
@@ -1505,6 +1865,33 @@ private:
    int n_peel_dual_ = 0;                   // how many peeled entries are duals
    int n_peel_cross_ = 0;                  // ... and how many are cross points
    Precond pc_;                            // the ASd preconditioner
+   // ---- EXPERIMENT (DDS_COARSE=1): two-level additive coarse correction ---
+   //  One indicator vector per interface EDGE (kept border positions grouped
+   //  by the set of tiles that touch them), plus the ASd term:
+   //      M2⁻¹ r = B0 (B0ᵀ S_ff B0)⁻¹ B0ᵀ r  +  M_ASd⁻¹ r
+   //  — Lueg's eq. (22) with the partition-of-unity basis.  Unlike the peel,
+   //  the coarse GALERKIN matrix needs only APPLICATIONS of S_ff (cheap
+   //  GEMVs), never S_ff⁻¹ solves — which is why this can work where the
+   //  stride-peel experiment failed (its Z columns each cost a CG solve on
+   //  the very operator that is saturating).
+   std::vector<int> coarse_grp_;           // kept position -> edge group (-1 none)
+   int n_coarse_ = 0;
+   Eigen::LLT<Mat> coarse_llt_;
+   bool coarse_ok_ = false;
+   struct TwoLevel {
+      const Precond* base;
+      const Arrowhead* A;
+      void apply(const Vec& r, Vec& z) const {
+         base->apply(r, z);
+         if (!A->coarse_ok_) return;
+         Vec rc = Vec::Zero(A->n_coarse_);
+         for (int i = 0; i < (int)A->coarse_grp_.size(); ++i)
+            if (A->coarse_grp_[i] >= 0) rc[A->coarse_grp_[i]] += r[i];
+         const Vec zc = A->coarse_llt_.solve(rc);
+         for (int i = 0; i < (int)A->coarse_grp_.size(); ++i)
+            if (A->coarse_grp_[i] >= 0) z[i] += zc[A->coarse_grp_[i]];
+      }
+   };
    Mat SfP_, Z_;                           // S_fP and Z = S_ff⁻¹ S_fP
    Mat Zwarm_;                             // last accepted Z columns (warm starts)
    Eigen::PartialPivLU<Mat> Tlu_;          // the dense peel complement T, factorized

@@ -789,6 +789,41 @@ predicted — there is nothing else left to select):
               --solver ddsimple --nsub 3 --partition strip --hessian exact
 ```
 
+### What a run warns about (`DDS_WARN`, 2026-09-11)
+
+Two classes of trouble are **recoverable by construction**, and used to be
+visible only under `DDS_DEBUG`: an unpivoted `SimplicialLDLT` breakdown (Eigen
+returns `NumericalIssue`, or a pivot of `D` is zero/non-finite) becomes
+`SYMSOLVER_SINGULAR` and IPOPT answers by raising δ_w, and a CG answer that
+fails the §7 acceptance test is handed back anyway for the §9 refinement to
+judge. Recoverable is not harmless: a run that converged only because IPOPT
+kept regularizing around a saturating interface solve looks, from the outside,
+exactly like one that never struggled. Both now warn on `stderr`:
+
+| warning | fired when |
+|---------|-----------|
+| `symbolic analysis failed` | Eigen's `analyzePattern` refused a `W_k` (fatal) |
+| `W_k factorization broke down` | Eigen `info() != Success`, or a zero/non-finite pivot → SINGULAR |
+| `coarse Galerkin matrix not SPD` | `DDS_COARSE` only: the coarse term is switched off for that factorization |
+| `peel column did not converge` | a `Z` column stopped above `rel = 1e-2` → no prediction → SINGULAR |
+| `interface CG answer rejected` | the full-interface residual missed `1e-2`; the best iterate is returned regardless |
+| `interface solve produced nothing usable` | not even a best iterate survived |
+| `step residual above tolerance` | the refined step still has `‖b − Ax‖/‖b‖ > 1e-8` against the original triplets |
+
+They fire per Newton step, so the **first of each kind is printed in full, the
+rest are counted**, and `dd_solve_2d` prints the tally next to the interface-CG
+line at the end of a run (silent when nothing warned):
+
+```
+  interface CG: solves=623  iterations=28302 (45.43/solve)  rejected=235  peel caches=191
+  warnings:  W_k factorization broke down=3  peel column did not converge=54  interface CG answer rejected=235  step residual above tolerance=60
+```
+
+`DDS_WARN=all` prints every occurrence (`DDS_DEBUG` implies it); `DDS_WARN=off`
+prints none — the counters and the tally still work. The counts cross-check the
+existing telemetry exactly: rejected answers equal `rejected`, peel-column
+failures equal `prediction refused`.
+
 `build.sh` links MA57 into `dd_solve_2d` only when it finds the library
 (`HSLDIR`, default `~/.local/hsl-ma57`); without it the build proceeds with
 `--solver dd` compiled out and `--solver ddsimple` untouched — the header

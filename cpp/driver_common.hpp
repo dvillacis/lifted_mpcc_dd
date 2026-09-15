@@ -317,7 +317,7 @@ RunResult run_mu_coupled(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
   p.c_theta_live_ = c_theta;
   p.t_ = std::max(t_min, t_mu_scale * mu0);
   p.eps_theta_ = c_theta * p.t_;
-  p.mu_progress_every_ = (print_level == 0) ? 25 : 0;
+  p.mu_progress_every_ = (print_level == 0) ? 1 : 0;
   p.mu_stall_iters_ = 0;
   p.mu_stall_warned_ = false;
   p.mu_hist_.clear();

@@ -803,6 +803,32 @@ int main(int argc, char** argv) {
    // DD_BARRIER_TOL=10 reproduces the pre-flip consensus tables.
    if (consensus && !std::getenv("DD_BARRIER_TOL"))
       app->Options()->SetNumericValue("barrier_tol_factor", 1000.0);
+   // Gentler monotone cuts, formulation-scoped for the same reason as the gate
+   // above.  μ⁺ = min(κ_μ·μ, μ^θ_μ) at IPOPT's (0.2, 1.5) can cut μ by two
+   // orders in ONE step, and because t = c·μ is slaved to it the
+   // complementarity constraint tightens by the same factor at once.  Measured
+   // at N=32 4×4 consensus that put μ at 1.5e-4 before the first Newton step
+   // and threw the run into restoration for 17 iterations (inf_pr 1.4e-3 → 1.0,
+   // inf_du → 1.0e+03).  At (0.7, 1.1) the first cut lands at 7.0e-4 and
+   // inf_du peaks at 4.5 instead.
+   //
+   // What that buys, measured, same α*/PSNR at each size:
+   //     consensus N=32   status 1 → 0 (Succeeded), 59 → 123 its
+   //     consensus N=64   360 → 149 its, 1.18M → 423k CG its, 9122 → 2480 solves
+   // and in BOTH the §8 falsification counter "non-positive curvature ... after"
+   // goes to 0 — no inertia is handed to IPOPT while this run holds evidence
+   // that S_ff is indefinite there.  N=32 pays 2× the iterations for that.
+   //
+   // NOT flipped for the permutation form, which it destroys: 243 → 3000 its
+   // (max-iter, status -1) at N=32.  The two env vars always win when set, and
+   // DD_MU_LINEAR_DECREASE=0.2 DD_MU_SUPERLINEAR_POWER=1.5 reproduces the
+   // pre-flip consensus tables.  Other points measured at N=32 consensus and
+   // rejected: (0.5,1.2) → -2, (0.9,1.05) → the worse local solution
+   // (obj 2.346 vs 2.200), (0.7,1.5) → -3 at 1670 its, (0.2,1.1) → obj 2.344.
+   if (consensus && !std::getenv("DD_MU_LINEAR_DECREASE"))
+      app->Options()->SetNumericValue("mu_linear_decrease_factor", 0.7);
+   if (consensus && !std::getenv("DD_MU_SUPERLINEAR_POWER"))
+      app->Options()->SetNumericValue("mu_superlinear_decrease_power", 1.1);
    // DD_DERIV_TEST=first|second: run IPOPT's derivative checker against the
    // TNLP callbacks — the validation gate for a new formulation's eval code.
    if (const char* dt = std::getenv("DD_DERIV_TEST")) {
@@ -910,6 +936,14 @@ int main(int argc, char** argv) {
       if (st.solves) std::cout << " (" << (double)st.iters / (double)st.solves << "/solve)";
       std::cout << "  rejected=" << st.rejected
                 << "  peel caches=" << st.cache_builds << "\n";
+      if (st.pc_blocks_indef)
+         std::cout << "  ASd preconditioner: indefinite blocks (LDLT, not LLT)="
+                   << st.pc_blocks_indef << "  positions affected="
+                   << st.pc_positions_indef
+                   << "  singular blocks skipped=" << st.pc_blocks_singular
+                   << "\n";
+      // The §10 tally: silent unless something actually warned during the run.
+      ddsimple::Warnings::get().report(std::cout);
    }
 
    if (!res.best_x.empty()) {
