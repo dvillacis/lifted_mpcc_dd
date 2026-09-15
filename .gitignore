@@ -54,3 +54,5 @@ python/*.png
 !images/*.png
 !python/images/*.png
 !cpp/data/*.txt
+
+runs/sols
