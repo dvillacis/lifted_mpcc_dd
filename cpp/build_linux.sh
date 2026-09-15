@@ -24,8 +24,11 @@
 #     `conda install -c conda-forge zlib` in the env. To drop the
 #     dependency instead, build with -DNPZ_NO_ZLIB (archives are then
 #     stored rather than deflated, but still valid .npz).
-#   * an HSL block solver as a SHARED library. HSL is not on conda-forge
-#     (license), so this stays a separate install. Two backends:
+#   * an HSL block solver as a SHARED library — OPTIONAL. HSL is not on
+#     conda-forge (license), so this stays a separate install, and a machine
+#     without it still builds dd_solve_2d: --solver dd is compiled out while
+#     --solver ddsimple (Eigen only, the DEFAULT) and IPOPT's own mumps/ma97
+#     keep working. Two backends when it IS present:
 #       - MA57 (the validated reference): $HSLDIR/lib/libhsl_ma57.so, with
 #         $CONDA_PREFIX/lib tried first if HSLDIR is unset.
 #       - MA97 (HSL_SOLVER=ma97, or auto-picked when only libhsl_ma97.so is
@@ -33,7 +36,9 @@
 #         compiles with -DDD_USE_MA97 and links libhsl_ma97.so instead. The
 #         library must export the C interface (ma97_*_d symbols — checked with
 #         nm when available); note libhsl_ma97.so does NOT contain MA57.
-#     Force the choice with HSL_SOLVER=ma57|ma97 (default: auto, MA57 first).
+#     Force the choice with HSL_SOLVER=ma57|ma97|none (default: auto — MA57
+#     first, then MA97, then none). Naming ma57/ma97 explicitly is a hard
+#     error when that library is missing; auto just falls through to none.
 #     The library's BLAS/LAPACK/gfortran deps normally ride along as DT_NEEDED
 #     entries of the .so; if yours was linked without them, list the extras in
 #     HSL_EXTRA_LIBS, e.g. HSL_EXTRA_LIBS="-lopenblas -lgfortran".
@@ -121,10 +126,18 @@ if [ "${OMP:-0}" = "1" ]; then
   OMPFLAGS=(-fopenmp)
 fi
 
-# HSL block-solver backend. Neither MA57 nor MA97 is a conda package; search
-# $HSLDIR/lib (if set), then the env's lib/, then the standalone MA57 prefix.
-# HSL_SOLVER forces the backend; the default is auto (MA57 first — the
-# validated reference — then MA97).
+# HSL block-solver backend — OPTIONAL since the ddsimple simplification.
+# Neither MA57 nor MA97 is a conda package; search $HSLDIR/lib (if set), then
+# the env's lib/, then the standalone MA57 prefix. HSL_SOLVER forces the
+# choice: ma57, ma97, none (HSL-free), or auto (the default — MA57 first, the
+# validated reference, then MA97, then none).
+#
+# Without HSL the build simply defines no DD_HAVE_MA57: dd_solve_2d.cpp
+# compiles out --solver dd, while --solver ddsimple (Eigen only, the default)
+# and IPOPT's own mumps/ma97 still work. Note the OTHER targets — dd_solve.cpp,
+# dd_solve_1d.cpp, dd_solve_dataset.cpp — #include dd_solver.hpp
+# unconditionally and so will FAIL TO LINK without HSL. That is expected; build
+# them on a machine that has it.
 find_hsl() {  # $1 = library basename without lib/.so
   for d in ${HSLDIR:+"$HSLDIR/lib"} "$CONDA_PREFIX/lib" "$HOME/.local/hsl-ma57/lib"; do
     if [ -f "$d/lib$1.so" ]; then echo "$d"; return 0; fi
@@ -133,6 +146,7 @@ find_hsl() {  # $1 = library basename without lib/.so
 }
 HSL_SOLVER="${HSL_SOLVER:-auto}"
 HSL_DEFS=()
+HSL_LIBS=()
 case "$HSL_SOLVER" in
   auto)
     if HSL_LIBDIR="$(find_hsl hsl_ma57)"; then HSL_SOLVER=ma57
@@ -140,37 +154,49 @@ case "$HSL_SOLVER" in
       HSL_SOLVER=ma97
       echo "note: no libhsl_ma57.so found — building the MA97 backend (-DDD_USE_MA97)" >&2
     else
-      echo "error: no HSL block solver found (searched \${HSLDIR}/lib," >&2
-      echo "       $CONDA_PREFIX/lib, ~/.local/hsl-ma57/lib for" >&2
-      echo "       libhsl_ma57.so / libhsl_ma97.so)." >&2
-      echo "       Install one and/or set HSLDIR to its prefix (the one holding" >&2
-      echo "       lib/), or copy the .so into $CONDA_PREFIX/lib. A static-only" >&2
-      echo "       .a also works if you add its Fortran/BLAS dependencies via" >&2
-      echo "       HSL_EXTRA_LIBS." >&2
-      exit 1
+      HSL_SOLVER=none
+      echo "note: no HSL block solver found (searched \${HSLDIR}/lib," >&2
+      echo "      $CONDA_PREFIX/lib, ~/.local/hsl-ma57/lib for" >&2
+      echo "      libhsl_ma57.so / libhsl_ma97.so) — building WITHOUT it:" >&2
+      echo "      --solver dd is disabled; --solver ddsimple (the default) and" >&2
+      echo "      IPOPT's own mumps/ma97 still work. Set HSLDIR to a prefix" >&2
+      echo "      holding lib/libhsl_ma57.so or lib/libhsl_ma97.so to enable it." >&2
     fi ;;
   ma57|ma97)
+    # An EXPLICIT request stays a hard error: silently dropping the backend
+    # someone asked for by name would produce a binary that rejects --solver dd
+    # at runtime with no hint as to why.
     if ! HSL_LIBDIR="$(find_hsl "hsl_$HSL_SOLVER")"; then
       echo "error: libhsl_$HSL_SOLVER.so not found (searched \${HSLDIR}/lib," >&2
       echo "       $CONDA_PREFIX/lib, ~/.local/hsl-ma57/lib)" >&2
       exit 1
     fi ;;
-  *) echo "error: HSL_SOLVER must be ma57, ma97 or auto" >&2; exit 1 ;;
+  none) ;;   # explicit opt-out: HSL-free even on a machine that has it
+  *) echo "error: HSL_SOLVER must be ma57, ma97, none or auto" >&2; exit 1 ;;
 esac
-HSL_LIB="hsl_$HSL_SOLVER"
-if [ "$HSL_SOLVER" = "ma97" ]; then
-  HSL_DEFS=(-DDD_USE_MA97)
-  # MA97 + OpenMP (OMP=1): dd_solver.hpp automatically applies the SPLIT model
-  # — serial factorize loop (concurrent ma97_factor heap-corrupts; measured,
-  # gdb'd and not curable by env vars, 2026-07-23), parallel backsolve loops
-  # (validated by ma97_smoke_par phase B; they carry 97.5% of the S_k cost).
-  # The wrapper calls MA97's C interface; a Fortran-only build lacks it.
-  if command -v nm >/dev/null 2>&1 && \
-     ! nm -D --defined-only "$HSL_LIBDIR/lib$HSL_LIB.so" 2>/dev/null | grep -qw ma97_analyse_coord_d; then
-    echo "error: $HSL_LIBDIR/lib$HSL_LIB.so does not export ma97_analyse_coord_d —" >&2
-    echo "       it was built without the C interface (hsl_ma97_ciface); rebuild" >&2
-    echo "       hsl_ma97 with it (IPOPT's own ma97 route requires it too)" >&2
-    exit 1
+if [ "$HSL_SOLVER" != "none" ]; then
+  HSL_LIB="hsl_$HSL_SOLVER"
+  # -DDD_HAVE_MA57 is the gate dd_solve_2d.cpp uses to compile in --solver dd
+  # (it #includes dd_solver.hpp only under it). Despite the name it means "an
+  # HSL BLOCK SOLVER is linked", not MA57 specifically — dd_solver.hpp picks
+  # MA57 or MA97 internally via DD_USE_MA97. Without it --solver dd is rejected
+  # at runtime with "built without HSL" even though HSL is on the link line.
+  HSL_DEFS=(-DDD_HAVE_MA57)
+  HSL_LIBS=(-L"$HSL_LIBDIR" -l"$HSL_LIB" -Wl,-rpath,"$HSL_LIBDIR")
+  if [ "$HSL_SOLVER" = "ma97" ]; then
+    HSL_DEFS+=(-DDD_USE_MA97)
+    # MA97 + OpenMP (OMP=1): dd_solver.hpp automatically applies the SPLIT model
+    # — serial factorize loop (concurrent ma97_factor heap-corrupts; measured,
+    # gdb'd and not curable by env vars, 2026-07-23), parallel backsolve loops
+    # (validated by ma97_smoke_par phase B; they carry 97.5% of the S_k cost).
+    # The wrapper calls MA97's C interface; a Fortran-only build lacks it.
+    if command -v nm >/dev/null 2>&1 && \
+       ! nm -D --defined-only "$HSL_LIBDIR/lib$HSL_LIB.so" 2>/dev/null | grep -qw ma97_analyse_coord_d; then
+      echo "error: $HSL_LIBDIR/lib$HSL_LIB.so does not export ma97_analyse_coord_d —" >&2
+      echo "       it was built without the C interface (hsl_ma97_ciface); rebuild" >&2
+      echo "       hsl_ma97 with it (IPOPT's own ma97 route requires it too)" >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -189,7 +215,7 @@ exec "$CXX" -std=c++17 -O2 \
   -isystem "$CONDA_PREFIX/include" \
   "${HSL_DEFS[@]}" "${OMPFLAGS[@]}" \
   "$@" \
-  -L"$HSL_LIBDIR" -l"$HSL_LIB" -Wl,-rpath,"$HSL_LIBDIR" \
+  "${HSL_LIBS[@]}" \
   ${HSL_EXTRA_LIBS:-} \
   -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" \
   -Wl,-rpath-link,"$CONDA_PREFIX/lib" -Wl,--allow-shlib-undefined \

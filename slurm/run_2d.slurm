@@ -1,13 +1,18 @@
 #!/bin/bash
 # 2D staggered DD sweep on the mariposa image — RUNS PREBUILT BINARIES ONLY
-# (compile beforehand with ./build_all_ma57_omp.sh; validate once per machine
-# per that script's header). Each size N runs the PNG route (C++ hybrid-CP warm
-# start, area-downsample loader) under four solvers: IPOPT-ma57 monolithic
-# reference, DD direct interface, DD CG, DD MINRES. Logs, solution/arrowhead
-# dumps, a summary, and (best-effort) the plots land in <repo>/results/slurm_<jobid>/.
+# (compile beforehand: `OMP=1 ./build_linux.sh dd_solve_2d.cpp -o dd_solve_2d`
+# is enough for the default HSL-free sweep; ./build_all_ma57_omp.sh builds every
+# target and needs HSL. Validate once per machine per that script's header). Each size N runs the PNG route (C++ hybrid-CP warm
+# start, area-downsample loader) under two HSL-FREE solvers by default: the
+# IPOPT-mumps monolithic reference and dd_solver_simple.hpp (--solver ddsimple).
+# WITH_HSL=1 adds the four HSL arms — IPOPT-ma57 monolithic, DD direct
+# interface, DD CG, DD MINRES — which need a build that found an HSL block
+# solver. Logs, solution/arrowhead dumps, a summary, and (best-effort) the plots
+# land in <repo>/results/slurm_<jobid>/.
 #
 #   sbatch run_2d.slurm                      # from cpp/ on the cluster
 #   REPO=/path/to/lifted-mpcc-dd sbatch run_2d.slurm
+#   WITH_HSL=1 sbatch run_2d.slurm           # add the --solver ma57/dd arms
 #
 # Notes:
 #   * The PNG route's noise draw differs from Python (std::mt19937 vs NumPy
@@ -53,6 +58,7 @@ BIN=./dd_solve_2d                               # prebuilt (build_all_ma57_omp.s
 # (IMG/IMGTAG resolved below, after the repo root is known)
 NS=(32 48 64 80 96 128)                         # image sizes to sweep
 KS=( 8  8  8  8  8   8)                         # nsub per size (edit per-entry)
+WITH_HSL="${WITH_HSL:-0}"                       # 1 = also run the --solver ma57/dd arms
 
 # --- 1. Environment ----------------------------------------------------------
 source /opt/ohpc/pub/apps/conda/etc/profile.d/conda.sh
@@ -106,7 +112,7 @@ if [ -z "${IMG:-}" ]; then
 fi
 IMG="${IMG:-../images/cameraman.png}"
 IMGTAG="$(basename "$IMG")"; IMGTAG="${IMGTAG%.*}"
-[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma57_omp.sh"; exit 1; }
+[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_linux.sh dd_solve_2d.cpp -o dd_solve_2d"; exit 1; }
 # IPOPT's OWN --solver ma57 reference run dlopen()s MA57 at RUNTIME via its
 # hsllib option, unlike the DD runs which link it at build time through an
 # rpath. So the reference can fail on a node where the DD runs are perfectly
@@ -114,16 +120,20 @@ IMGTAG="$(basename "$IMG")"; IMGTAG="${IMGTAG%.*}"
 # ~/.local/hsl-ma57/lib, then the bare soname. Warn rather than abort: a sweep
 # whose DD numbers are good but whose baseline is missing is still worth having,
 # and IPOPT prints its own DYNAMIC_LIBRARY_FAILURE into the ma57 log.
-_ma57_found=""
-for _c in "$HSLLIB" "$HSLDIR/lib/libhsl_ma57.so" "$HOME/.local/hsl-ma57/lib/libhsl_ma57.so"; do
-  [ -n "$_c" ] && [ -f "$_c" ] && { _ma57_found="$_c"; break; }
-done
-if [ -n "$_ma57_found" ]; then
-  echo "MA57 for the monolithic reference: $_ma57_found"
-else
-  echo "warning: no libhsl_ma57.so found via HSLLIB / \$HSLDIR/lib / ~/.local/hsl-ma57/lib."
-  echo "         The DD runs are unaffected (they link it directly); the --solver ma57"
-  echo "         baseline will fail. Set HSLLIB=/path/to/libhsl_ma57.so to fix."
+# Only under WITH_HSL=1 — the default sweep never asks for MA57, so on an
+# HSL-free node this check would be pure noise.
+if [ "$WITH_HSL" = "1" ]; then
+  _ma57_found=""
+  for _c in "$HSLLIB" "$HSLDIR/lib/libhsl_ma57.so" "$HOME/.local/hsl-ma57/lib/libhsl_ma57.so"; do
+    [ -n "$_c" ] && [ -f "$_c" ] && { _ma57_found="$_c"; break; }
+  done
+  if [ -n "$_ma57_found" ]; then
+    echo "MA57 for the monolithic reference: $_ma57_found"
+  else
+    echo "warning: no libhsl_ma57.so found via HSLLIB / \$HSLDIR/lib / ~/.local/hsl-ma57/lib."
+    echo "         The DD runs are unaffected (they link it directly); the --solver ma57"
+    echo "         baseline will fail. Set HSLLIB=/path/to/libhsl_ma57.so to fix."
+  fi
 fi
 [ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
 
@@ -183,11 +193,23 @@ for i in "${!NS[@]}"; do
   tag="${IMGTAG}_N${n}_k${k}"
   common=(--data "$IMG" --size "$n" --nsub "$k" --init cp)
 
-  run_timed "$tag" ma57 "$RUN/logs/${tag}_ma57.log" -- $BIN "${common[@]}" --solver ma57
-  run_timed "$tag" dd "$RUN/logs/${tag}_dd.log" -- $BIN "${common[@]}" --solver dd \
-      --save-solution "$RUN/sols/sol_${tag}.txt" --save-dd "$RUN/sols/dd_${tag}.txt"
-  run_timed "$tag" dd_cg "$RUN/logs/${tag}_dd_cg.log" -- $BIN "${common[@]}" --solver dd --interface cg
-  run_timed "$tag" dd_minres "$RUN/logs/${tag}_dd_minres.log" -- $BIN "${common[@]}" --solver dd --interface minres
+  # HSL-free by default: the monolithic baseline is IPOPT's own MUMPS (conda's
+  # libipopt ships it) and the decomposition is dd_solver_simple.hpp. ddsimple
+  # also carries --save-solution, so the plots below are produced either way.
+  run_timed "$tag" mumps "$RUN/logs/${tag}_mumps.log" -- $BIN "${common[@]}" --solver mumps
+  run_timed "$tag" ddsimple "$RUN/logs/${tag}_ddsimple.log" -- $BIN "${common[@]}" --solver ddsimple \
+      --save-solution "$RUN/sols/sol_${tag}.npz"
+  # The HSL arms. --solver dd exists only when the build found libhsl_ma57/ma97
+  # (build_linux.sh defines DD_HAVE_MA57 iff it did), --solver ma57 additionally
+  # needs IPOPT's own MA57, and --interface cg|minres are dd_solver.hpp knobs
+  # that ddsimple does not have — it is ASd-preconditioned CG by construction.
+  if [ "$WITH_HSL" = "1" ]; then
+    run_timed "$tag" ma57 "$RUN/logs/${tag}_ma57.log" -- $BIN "${common[@]}" --solver ma57
+    run_timed "$tag" dd "$RUN/logs/${tag}_dd.log" -- $BIN "${common[@]}" --solver dd \
+        --save-dd "$RUN/sols/dd_${tag}.txt"
+    run_timed "$tag" dd_cg "$RUN/logs/${tag}_dd_cg.log" -- $BIN "${common[@]}" --solver dd --interface cg
+    run_timed "$tag" dd_minres "$RUN/logs/${tag}_dd_minres.log" -- $BIN "${common[@]}" --solver dd --interface minres
+  fi
   # Plot THIS solution now, not at the end of the job: a sweep at this size can
   # be killed by walltime or the OOM killer partway through, and figures for the
   # cases that did finish are worth having. --only keeps it to the one tag, so
@@ -195,7 +217,7 @@ for i in "${!NS[@]}"; do
   MPLBACKEND=Agg python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" --only "$tag" \
       >> "$RUN/logs/plots.log" 2>&1 \
     && echo "  plot k=$k  -> $RUN/plots" \
-    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
+    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.npz is still on disk)"
   echo "  done $tag  ($(date +%T))"
 done
 

@@ -1,7 +1,8 @@
 #!/bin/bash
-# 2D staggered DD at N=512 — RUNS PREBUILT BINARIES ONLY (build first with
-# ./build_all_ma57_omp.sh from cpp/, and validate once per machine per that
-# script's header).
+# 2D staggered DD at N=512 — RUNS PREBUILT BINARIES ONLY. Build first from cpp/:
+#   OMP=1 ./build_linux.sh dd_solve_2d.cpp -o dd_solve_2d    # HSL-free, enough
+#   ./build_all_ma57_omp.sh                                  # all targets, needs HSL
+# (validate once per machine per build_all_ma57_omp.sh's header).
 #
 #   sbatch slurm/run_2d_N512.slurm              # from anywhere in the checkout
 #   PILOT=1  sbatch slurm/run_2d_N512.slurm     # 12 Newton steps, sizing probe
@@ -11,7 +12,10 @@
 #
 # DD ONLY (2026-08-20): the monolithic ma57 baseline was removed from this
 # script — at this size it is a separate, memory-heavy experiment that deserves
-# its own job if ever wanted. This script measures the DD route.
+# its own job if ever wanted. This script measures the DD route, via
+# --solver ddsimple (dd_solver_simple.hpp: Eigen blocks + ASd-preconditioned CG
+# on the interface, no HSL). Swap in --solver dd below for the HSL-backed
+# dd_solver.hpp path on a machine whose build found libhsl_ma57/ma97.
 #
 # BARRIER ADVANCE. Monotone mu only cuts once E_mu <= f*mu, and the gate is a
 # max-norm over an O(N^2) degenerate set, so the stall scales with N (measured:
@@ -115,7 +119,7 @@ if [ -z "${IMG:-}" ]; then
 fi
 IMG="${IMG:-../images/cameraman.png}"
 IMGTAG="$(basename "$IMG")"; IMGTAG="${IMGTAG%.*}"
-[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma57_omp.sh"; exit 1; }
+[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_linux.sh dd_solve_2d.cpp -o dd_solve_2d"; exit 1; }
 [ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
 
 # Source must be at least N x N or the loader upsamples and the "512" is fake.
@@ -184,8 +188,8 @@ for k in $KS; do
   tag="${IMGTAG}_N${N}_k${k}"
   common=(--data "$IMG" --size "$N" --nsub "$k" --init cp "${EXTRA[@]}")
 
-  run_timed "$tag" dd "$RUN/logs/${tag}_dd.log" -- \
-      $BIN "${common[@]}" --solver dd --save-solution "$RUN/sols/sol_${tag}.txt"
+  run_timed "$tag" ddsimple "$RUN/logs/${tag}_ddsimple.log" -- \
+      $BIN "${common[@]}" --solver ddsimple --save-solution "$RUN/sols/sol_${tag}.npz"
   # Plot THIS solution now, not at the end of the job: a sweep at this size can
   # be killed by walltime or the OOM killer partway through, and figures for the
   # cases that did finish are worth having. --only keeps it to the one tag, so
@@ -193,7 +197,7 @@ for k in $KS; do
   MPLBACKEND=Agg python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" --only "$tag" \
       >> "$RUN/logs/plots.log" 2>&1 \
     && echo "  plot k=$k  -> $RUN/plots" \
-    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
+    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.npz is still on disk)"
 done
 
 # --- 4. Summary + plots ------------------------------------------------------

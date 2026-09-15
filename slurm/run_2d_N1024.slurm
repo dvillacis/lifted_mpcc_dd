@@ -1,7 +1,9 @@
 #!/bin/bash
 # 2D staggered DD at N=1024 — the largest instance in this package, and the one
-# where the DD route is supposed to earn its keep. RUNS PREBUILT BINARIES ONLY
-# (./build_all_ma57_omp.sh from cpp/ first).
+# where the DD route is supposed to earn its keep. RUNS PREBUILT BINARIES ONLY;
+# build first from cpp/ with `OMP=1 ./build_linux.sh dd_solve_2d.cpp -o
+# dd_solve_2d` (HSL-free, enough for this script) or ./build_all_ma57_omp.sh
+# (all targets, needs HSL).
 #
 #   PILOT=1 sbatch slurm/run_2d_N1024.slurm     # DO THIS FIRST — 12 Newton steps
 #   IMG=/path/to/big.png sbatch slurm/run_2d_N1024.slurm
@@ -22,6 +24,9 @@
 #    script. dim ~ 17.3M: a monolithic MA57 factorization of that is exactly
 #    the fill/memory wall this package exists to route around — attempting it
 #    is a separate, memory-heavy experiment that deserves its own job.
+#    The DD route here is --solver ddsimple (dd_solver_simple.hpp: Eigen blocks
+#    + ASd-preconditioned CG on the interface, no HSL). Swap in --solver dd for
+#    the HSL-backed dd_solver.hpp path where the build found libhsl_ma57/ma97.
 #
 # 2b. BARRIER ADVANCE — this is the size where the monotone stall was recorded:
 #    inf_du plateaued at 9.5e-2, 62x above the default f=10 gate, for 200+
@@ -120,7 +125,7 @@ if [ -z "${IMG:-}" ]; then
 fi
 IMG="${IMG:-../images/cameraman.png}"
 IMGTAG="$(basename "$IMG")"; IMGTAG="${IMGTAG%.*}"
-[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_all_ma57_omp.sh"; exit 1; }
+[ -x "$BIN" ] || { echo "error: $BIN missing — build first: ./build_linux.sh dd_solve_2d.cpp -o dd_solve_2d"; exit 1; }
 [ -f "$IMG" ] || { echo "error: $IMG missing"; exit 1; }
 
 python - "$IMG" "$N" "$ALLOW_UPSAMPLE" <<'EOF' || exit 1
@@ -193,8 +198,10 @@ for k in $KS; do
 
   # DD_TIME prints the phase split every 25 factorizations: at this size that is
   # the number that matters (is S-fact overtaking schur, as the model predicts?).
-  DD_TIME=1 run_timed "$tag" dd "$RUN/logs/${tag}_dd.log" -- \
-      $BIN "${common[@]}" --solver dd --save-solution "$RUN/sols/sol_${tag}.txt"
+  # It is read by dd_solver.hpp only, so it is inert under --solver ddsimple —
+  # kept for the --solver dd runs an HSL-enabled build can still do by hand.
+  DD_TIME=1 run_timed "$tag" ddsimple "$RUN/logs/${tag}_ddsimple.log" -- \
+      $BIN "${common[@]}" --solver ddsimple --save-solution "$RUN/sols/sol_${tag}.npz"
   # Plot THIS solution now, not at the end of the job: a sweep at this size can
   # be killed by walltime or the OOM killer partway through, and figures for the
   # cases that did finish are worth having. --only keeps it to the one tag, so
@@ -202,7 +209,7 @@ for k in $KS; do
   MPLBACKEND=Agg python ../python/plot_slurm.py "$RUN" --out "$RUN/plots" --only "$tag" \
       >> "$RUN/logs/plots.log" 2>&1 \
     && echo "  plot k=$k  -> $RUN/plots" \
-    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.txt is still on disk)"
+    || echo "  plot k=$k  FAILED (see logs/plots.log; sol_${tag}.npz is still on disk)"
 done
 
 # --- 4. Summary + plots ------------------------------------------------------

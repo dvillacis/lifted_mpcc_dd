@@ -353,7 +353,11 @@ static void self_check(Mpcc2DTNLP& p, const std::vector<int>& owner,
 }
 
 int main(int argc, char** argv) {
-   std::string data, solver = "ma57", init = "file", save_sol, save_dd, save_data;
+   // --solver defaults to ddsimple: the Eigen-only twin is the one route that
+   // needs no HSL and no MUMPS, so the default works on every machine the
+   // binary builds on (HSL is optional — see build_linux.sh). --solver dd is
+   // the HSL-backed production path and must be asked for by name.
+   std::string data, solver = "ddsimple", init = "file", save_sol, save_dd, save_data;
    std::string interface_solver = "direct", precond = "asd";
    std::string wk_backend = "ma57";
    double t0 = 1.0, tmin = 1e-4, factor = 0.85, tol = 1e-8, c_theta = 1.0;
@@ -461,7 +465,8 @@ int main(int argc, char** argv) {
    }
    if (data.empty()) {
       std::cerr << "usage: dd_solve_2d --data <cpp2/data_2d_N.txt|image.png> "
-                   "[--size N] [--solver mumps|ma57|ma97|dd|ddsimple] "
+                   "[--size N] [--solver mumps|ma57|ma97|dd|ddsimple "
+                   "(default ddsimple)] "
                    "[--nsub k]\n"
                    "                   [--self-check] [--save-solution FILE] "
                    "[--save-dd FILE] [--partition tile|strip]\n"
