@@ -91,6 +91,17 @@ public:
    double t_mu_scale_ = 0.0;      // 0 = off (the geometric drivers)
    double t_floor_ = 0.0;
    double c_theta_live_ = 0.0;    // keeps eps_theta_ = c_θ·t in sync
+   // RATE LIMIT on the t-ratchet: the smallest ratio t⁺/t allowed in one
+   // iteration (0 = no limit, the historical behaviour).  t is slaved to μ, so
+   // a single monotone μ cut drags t down by the SAME factor at once — and
+   // IPOPT's first cut is large: measured at N=256 consensus, μ goes 0.1 →
+   // 6.98e-4 before the first Newton step, tightening complementarity 143x in
+   // one step.  The run enters restoration at it=2 with inf_du = 1.0e+03 and
+   // never recovers; by it=20 it is still 1.8e+02 against a μ gate of 0.698,
+   // so μ cannot advance and the solve stalls.  Limiting how fast t may fall
+   // decouples the complementarity schedule from μ's jumps without changing
+   // where t ends up: t still converges to max(t_floor, c·μ) once μ settles.
+   double t_rate_ = 0.0;
    int mu_progress_every_ = 0;    // live rows under print_level 0 (0 = silent)
    int mu_stall_iters_ = 0;
    bool mu_stall_warned_ = false;
@@ -124,13 +135,87 @@ public:
    double prev_comp_ = 1e300, prev_t_ = 0.0;
    std::vector<double> prev_x_;
 
+   // THE SCHOLTES LEVEL GATE (docs/inf_du_stall).  How accurately is one
+   // relaxed level worth solving?
+   //
+   // A relaxed NLP at parameter t approximates the MPCC only to within the
+   // relaxation's own error, so a termination gate that shrinks faster than
+   // that error spends iterations on the relaxation rather than on the
+   // problem.  The scale the geometry hands back is sqrt(t): on the strongly
+   // active set the relaxed row sits at r(1−δ) = t, where its own gradient is
+   //
+   //     ‖∇_(r,δ) [ r(1−δ) ]‖ = ‖(1−δ, −r)‖ ≥ sqrt(2t),
+   //
+   // with equality at the knee r = 1−δ = sqrt(t) — and measured at N=64,
+   // t=1e-4, the active cells sit ON that floor (min 1.408e-2, 5th pct
+   // 1.436e-2, against sqrt(2t) = 1.41e-2), a factor ~70 below the O(1) rows
+   // of the state system.  The multiplier block those rows carry is
+   // conditioned like 1/sqrt(t), which is where the forty-iteration dual
+   // plateau lives.  The gate is therefore
+   //
+   //     inf_pr ≤ κ·sqrt(t),  inf_du ≤ κ·sqrt(t),  μ ≤ κ·sqrt(t)
+   //
+   // tested only once t has descended to level_gate_t_ (the level being
+   // reported: t_min for the μ-coupled single solve, this level's t for the
+   // geometric continuation), only in RegularMode, and satisfied for
+   // level_gate_hits_ consecutive callbacks.  Firing returns false, which
+   // IPOPT turns into User_Requested_Stop — finalize_solution still runs, so
+   // the iterate is kept.
+   //
+   // WHY HERE AND NOT IN IPOPT'S OPTIONS.  The obvious implementation is
+   // acceptable_tol = κ·sqrt(t), and it is wrong: acceptable_tol also governs
+   // the RESTORATION phase's convergence test, so loosening it lets
+   // restoration "converge" at a point that is still infeasible for the
+   // original problem and IPOPT reports that as a local-infeasibility
+   // certificate.  Measured, N=64 4×4 consensus, monolithic mumps:
+   //
+   //     acceptable_tol = t     = 1e-4   status 1, 141 it, t=1e-4,    α*=0.067484
+   //     acceptable_tol = √t    = 1e-2   status 2, 92 it, EXIT "Converged to a
+   //                                     point of local infeasibility", falling
+   //                                     back to the banked t=2.39e-4, α*=0.067261
+   //
+   // The two runs are bit-identical for their first 94 callbacks — the option
+   // changes nothing about the path, only the verdict — and the last row of
+   // the second is `92r`, i.e. a restoration iteration.  Raising `tol` instead
+   // is worse still: it additionally sets the barrier floor
+   // μ_min = tol/(barrier_tol_factor+1).  A gate in the callback touches
+   // neither, so IPOPT's own tolerances stay at their tested values and the
+   // filter, the restoration phase and the μ schedule are untouched.
+   double level_tol_scale_ = 0.0;   // κ; 0 disables the gate entirely
+   double level_gate_floor_ = 0.0;  // --tol, as a floor on how tight κ√t may get
+   double level_gate_t_ = 0.0;      // only test once t_ has reached this level
+   int level_gate_hits_ = 1;        // consecutive qualifying callbacks required
+   int level_gate_seen_ = 0;
+   bool level_gate_fired_ = false;
+
    bool intermediate_callback(AlgorithmMode mode, Index iter, Number obj_value,
                               Number inf_pr, Number inf_du, Number mu, Number,
                               Number, Number, Number, Index,
                               const IpoptData* ip_data,
                               IpoptCalculatedQuantities* ip_cq) override {
+      // The Scholtes level gate (see the member comment).  Ahead of the
+      // μ-coupled bookkeeping below, because it serves both continuations.
+      if (level_tol_scale_ > 0.0 && mode == RegularMode && iter > 0 &&
+          t_ <= level_gate_t_ * (1.0 + 1e-9)) {
+         const double gate =
+            std::max(level_gate_floor_, level_tol_scale_ * std::sqrt(t_));
+         if (inf_pr <= gate && inf_du <= gate && mu <= gate) {
+            if (++level_gate_seen_ >= level_gate_hits_) {
+               level_gate_fired_ = true;
+               if (mu_progress_every_ > 0)
+                  std::printf("    [level gate] t=%.2e  inf_pr=%.1e  inf_du=%.1e "
+                              " mu=%.1e  all <= %.1e = %.3g*sqrt(t) — stopping\n",
+                              t_, inf_pr, inf_du, mu, gate, level_tol_scale_);
+               return false;            // → Ipopt::User_Requested_Stop
+            }
+         } else {
+            level_gate_seen_ = 0;
+         }
+      }
       if (t_mu_scale_ <= 0.0) return true;
-      const double t_new = std::max(t_floor_, t_mu_scale_ * mu);
+      double t_new = std::max(t_floor_, t_mu_scale_ * mu);
+      if (t_rate_ > 0.0 && t_new < t_ * t_rate_)      // no faster than this
+         t_new = std::max(t_floor_, t_ * t_rate_);
       const bool tightened = t_new < t_;
       if (tightened) {
          t_ = t_new;

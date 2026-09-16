@@ -196,8 +196,7 @@ for i in "${!NS[@]}"; do
   # HSL-free by default: the monolithic baseline is IPOPT's own MUMPS (conda's
   # libipopt ships it) and the decomposition is dd_solver_simple.hpp. ddsimple
   # also carries --save-solution, so the plots below are produced either way.
-  run_timed "$tag" mumps "$RUN/logs/${tag}_mumps.log" -- $BIN "${common[@]}" --solver mumps
-  run_timed "$tag" ddsimple "$RUN/logs/${tag}_ddsimple.log" -- $BIN "${common[@]}" --solver ddsimple \
+  run_timed "$tag" ddsimple "$RUN/logs/${tag}_ddsimple.log" -- $BIN "${common[@]}" --solver ddsimple --hessian exact \
       --save-solution "$RUN/sols/sol_${tag}.npz"
   # The HSL arms. --solver dd exists only when the build found libhsl_ma57/ma97
   # (build_linux.sh defines DD_HAVE_MA57 iff it did), --solver ma57 additionally

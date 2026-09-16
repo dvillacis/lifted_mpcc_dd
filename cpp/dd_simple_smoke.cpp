@@ -100,6 +100,8 @@ int test_no_peel() {
 
       Arrowhead::Options opt;
       opt.cg_tol = 1e-12;
+      opt.peel_cg_tol = 1e-12;   // exactness check: hold the peel
+                                 // columns to the solve's precision
       opt.cg_maxit = 2000;
 
       Arrowhead ah;
@@ -183,6 +185,8 @@ int test_peel() {
       opt.n_primal = n_primal;      // -> the nbd border duals are peeled
       opt.alpha_index = oa;         // -> so is alpha
       opt.cg_tol = 1e-12;
+      opt.peel_cg_tol = 1e-12;   // exactness check: hold the peel
+                                 // columns to the solve's precision
       opt.cg_maxit = 2000;
 
       Arrowhead ah;

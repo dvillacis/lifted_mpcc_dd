@@ -452,7 +452,7 @@ enum class Warn {
    LdltSymbolic,   // Eigen's analyzePattern failed: the structure is unusable
    LdltNumeric,    // W_k breakdown: Eigen info() != Success, or a zero/NaN pivot
    CoarseNotSpd,   // the DDS_COARSE Galerkin matrix is not SPD (term left off)
-   PrecondNotSpd,  // an ASd block is indefinite (used anyway, via LDLT)
+   PrecondNotSpd,  // an ASd block is indefinite (used anyway, via U|Λ|⁻¹Uᵀ)
    CgPeelColumn,   // a Z column of the peel cache did not converge → SINGULAR
    CgRejected,     // the interface answer failed the §7 acceptance test
    CgUnusable,     // ... and there was no iterate at all to fall back on
@@ -751,7 +751,7 @@ public:
               const std::vector<int>& keptpos, const Vec& diagS_kept) {
       nf_ = nf;
       llt_.assign(Nk.size(), Eigen::LLT<Mat>());
-      ldlt_.assign(Nk.size(), Eigen::LDLT<Mat>());
+      absinv_.assign(Nk.size(), Mat());
       spd_.assign(Nk.size(), 0);
       idx_.assign(Nk.size(), {});
       Info info;
@@ -775,16 +775,53 @@ public:
             llt_[k] = std::move(f);
             spd_[k] = 1;
          } else {
-            // Indefinite: keep the block, but keep the SYMMETRY too.
+            // Indefinite.  Use the matrix ABSOLUTE VALUE, M_k⁻¹ → U|Λ|⁻¹Uᵀ.
+            //
+            // Why the absolute value and not just a stable factorization: the
+            // blocks that fail Cholesky are only BARELY indefinite — measured,
+            // their most negative eigenvalue is 1e-6 to 3e-2 of the largest.
+            // But inversion amplifies it brutally: λ = −1e-6·λmax becomes
+            // −1e6/λmax, which then dominates the additive sum, and the
+            // aggregate M⁻¹ is wildly indefinite with a huge norm.  CG's
+            // conjugacy needs M⁻¹ SPD, so it collapses.  Measured κ(M⁻¹S_ff)
+            // on the factorizations where this fires, versus flipping to |Λ|:
+            //
+            //     N=32  b12  3/16 bad   1.62e16  →  2.16e3
+            //     N=32  b28  2/16 bad   3.05e15  →      950
+            //     N=64  b20  2/16 bad   5.20e16  →  2.55e3
+            //     N=96  b16  2/16 bad   5.39e16  →  4.31e3
+            //     N=96  b36  2/16 bad   4.80e16  →  1.26e3
+            //
+            // Thirteen orders of magnitude, landing on the same ~1e3 that the
+            // all-SPD factorizations achieve.  And the frequency GROWS with the
+            // problem: ~2/10 builds at N=32, 5/10 at N=96, >50% at N=256 — so
+            // at the sizes that matter this was most of the run.
+            //
+            // Flipping the sign of a tiny eigenvalue is legitimate here in a
+            // way it never would be for a solve: a preconditioner has to be SPD
+            // and cheap, not correct.  Note this DOES form an explicit inverse
+            // for these few blocks, but U|Λ|⁻¹Uᵀ is symmetric BY CONSTRUCTION
+            // (and symmetrised below), so it does not reintroduce the asymmetry
+            // that the Cholesky path exists to avoid.  Eigen's LDLT |D| is NOT
+            // a substitute — flipping PIVOTS is not flipping EIGENVALUES, and
+            // measured it changed nothing at N=256.
             ++info.blocks_refused;
             for (int i = 0; i < mb; ++i) hit[gl[i]] = 1;
-            Eigen::LDLT<Mat> h(M);
-            if (h.info() != Eigen::Success || !h.vectorD().allFinite() ||
-                h.vectorD().cwiseAbs().minCoeff() <= 0.0) {
-               ++info.blocks_singular;      // genuinely singular: skip it
-               continue;
-            }
-            ldlt_[k] = std::move(h);
+            Eigen::SelfAdjointEigenSolver<Mat> es(M);
+            if (es.info() != Eigen::Success) { ++info.blocks_singular; continue; }
+            Vec d = es.eigenvalues();
+            const double sc = d.cwiseAbs().maxCoeff();
+            if (!(sc > 0.0)) { ++info.blocks_singular; continue; }
+            static const double clip = [] {
+               const char* e = std::getenv("DDS_PC_CLIP");
+               return e ? std::atof(e) : 1e-6;
+            }();
+            for (int i = 0; i < mb; ++i)
+               d[i] = 1.0 / std::max(d[i], clip * sc);   // CLIP, not |Λ|
+            Mat Bi = es.eigenvectors() * d.asDiagonal()
+                   * es.eigenvectors().transpose();
+            if (!Bi.allFinite()) { ++info.blocks_singular; continue; }
+            absinv_[k] = Mat(0.5 * (Bi + Bi.transpose()));   // exactly symmetric
             spd_[k] = 0;
          }
          idx_[k] = gl;
@@ -802,9 +839,8 @@ public:
          if (mb == 0) continue;
          Vec rk(mb);
          for (int i = 0; i < mb; ++i) rk[i] = r[idx[i]];
-         // Vec, not auto: the two Solve<> expression types do not unify.
          const Vec zk = spd_[k] ? Vec(llt_[k].solve(rk))    // L Lᵀ zk = rk
-                                : Vec(ldlt_[k].solve(rk));  // P L D Lᵀ Pᵀ
+                                : Vec(absinv_[k] * rk);     // U |Λ|⁻¹ Uᵀ
          for (int i = 0; i < mb; ++i) z[idx[i]] += zk[i];   // ADDITIVE
       }
    }
@@ -812,7 +848,7 @@ public:
 private:
    int nf_ = 0;
    std::vector<Eigen::LLT<Mat>> llt_;       // SPD blocks: Cholesky
-   std::vector<Eigen::LDLT<Mat>> ldlt_;     // indefinite blocks: symmetric LDLᵀ
+   std::vector<Mat> absinv_;                // indefinite blocks: U |Λ|⁻¹ Uᵀ
    std::vector<char> spd_;                  // which of the two holds block k
    std::vector<std::vector<int>> idx_;      // their kept-position lists
 };
@@ -933,7 +969,28 @@ public:
       // and measured it is what makes tile partitions scale.  Set false to
       // A/B against the α + dual peel alone.
       bool peel_cross_points = true;
-      double cg_tol = 1e-10;    // CG target; acceptance is separate (1e-2, §7)
+      // Two DIFFERENT jobs, so two tolerances.  cg_tol is the target for the
+      // INTERFACE SOLVE (§9).  The peel-cache columns of §6 do not need it:
+      // asking all 246 of them for 1e-10 is where this solver spends its time
+      // — measured at N=32/nsub=8/30 Newton steps, 2.04M CG iterations and
+      // 92% of total runtime inside build_peel_cache, against 0.2% in the W_k
+      // factorizations the decomposition exists for.
+      //
+      // But peel_cg_tol canNOT be relaxed to the 1e-2 acceptance bar of
+      // build_peel_cache: Z = S_ff⁻¹ S_fP is not scratch for the §8 prediction,
+      // it is part of the SOLVE operator, so per-column error lands in the
+      // true residual that solve_interface judges at 1e-2 — and it lands there
+      // summed over all |P| columns.  Measured (N=32, 30 Newton steps, wall /
+      // CG answers rejected, baseline 1e-10 = 74.7s / 0):
+      //     1e-8  63.5s /   0      1e-6  49.7s /  57
+      //     1e-7  57.1s /   0      1e-5  42.6s / 251
+      //     1e-3  52.6s / 967 (and 247 step residuals over kStepResidualWarn)
+      // 1e-7 is the knee: 1.31x off the baseline wall with rejected still 0,
+      // and identical alpha*, PSNR, refused predictions and warning counts.
+      // Past it the interface solve starts handing back steps it knows are
+      // bad, which is a worse trade than the time it buys.
+      double cg_tol = 1e-10;      // interface solve (§9)
+      double peel_cg_tol = 1e-7;  // peel-cache columns (§6); see above
       int cg_maxit = 500;
    };
 
@@ -1636,7 +1693,7 @@ private:
          std::ostringstream m;
          m << pci.blocks_refused << " of " << nsub_ << " local blocks failed "
               "Cholesky (" << pci.positions_indef << " of " << nf
-           << " kept positions); factorized by LDLT and used anyway"
+           << " kept positions); sign-flipped to U|Λ|⁻¹Uᵀ and used anyway"
            << (pci.blocks_singular
                   ? ", except " + std::to_string(pci.blocks_singular) +
                         " singular even for LDLT and skipped"
@@ -1699,7 +1756,7 @@ private:
          Vec z;
          const Vec w0 = Zwarm_.col(j);
          const CgResult r = cg_solve(applyA, P2, Vec(SfP_.col(j)), z,
-                                     opt_.cg_tol, opt_.cg_maxit, &w0);
+                                     opt_.peel_cg_tol, opt_.cg_maxit, &w0);
          stats_.iters += r.iters;
          if (r.indefinite) ++stats_.indef_before;
          if (!(r.rel < 1e-2) || !z.allFinite()) {

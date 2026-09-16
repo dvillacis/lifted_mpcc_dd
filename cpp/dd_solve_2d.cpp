@@ -363,6 +363,9 @@ int main(int argc, char** argv) {
    double t0 = 1.0, tmin = 1e-4, factor = 0.85, tol = 1e-8, c_theta = 1.0;
    std::string cg_apply = "assembled";
    double wmax = 2e19, reg_alpha = 1e-4, sigma = 0.1, cg_tol = 1e-10;
+   // Peel-cache columns do not need the interface solve's 1e-10; 1e-7 is
+   // the measured knee (see Arrowhead::Options::peel_cg_tol).
+   double peel_cg_tol = 1e-7;
    int nsub = 2, maxiter = 3000, printlevel = 0, size = 0, seed = 0, cg_maxit = 500;
    int minres_lag = 1;
    int schur_lag = 1;
@@ -447,6 +450,7 @@ int main(int argc, char** argv) {
       else if (a == "--precond")  precond = next();
       else if (a == "--wk-backend") wk_backend = next();
       else if (a == "--cg-tol")   cg_tol = std::stod(next());
+      else if (a == "--peel-cg-tol") peel_cg_tol = std::stod(next());
       else if (a == "--cg-max-iter") cg_maxit = std::stoi(next());
       else if (a == "--cg-apply") cg_apply = next();
       else if (a == "--minres-lag") minres_lag = std::stoi(next());
@@ -889,6 +893,7 @@ int main(int argc, char** argv) {
       o.alpha_index = alpha_peel ? mpcc->oa : -1;
       o.peel_cross_points = cross_peel;
       o.cg_tol = cg_tol;
+      o.peel_cg_tol = peel_cg_tol;
       o.cg_maxit = cg_maxit;
       DDSimpleSolver::config(owner, part.n_sub);
       DDSimpleSolver::config_options(o);
@@ -896,7 +901,8 @@ int main(int argc, char** argv) {
                 << (alpha_peel ? ",alpha-peel" : ",no-alpha-peel")
                 << (dual_peel ? ",dual-peel" : ",no-dual-peel")
                 << (cross_peel ? ",cross-peel" : ",no-cross-peel")
-                << ",tol=" << cg_tol << ",maxit=" << cg_maxit << ")\n"
+                << ",tol=" << cg_tol << ",peel-tol=" << peel_cg_tol
+                << ",maxit=" << cg_maxit << ")\n"
                 << "  inertia=PREDICTED: S is never assembled or factorized; "
                    "In(S) = In(T) from the |P|x|P| peel complement\n";
    }

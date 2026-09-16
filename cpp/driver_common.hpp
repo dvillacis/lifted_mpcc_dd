@@ -194,6 +194,60 @@ inline bool init_app(Ipopt::SmartPtr<Ipopt::IpoptApplication> &app,
   return true;
 }
 
+// The level-gate scale kappa, ON by default at 1.0 (gate = sqrt(t); at the
+// usual t_min = 1e-4 that is 1e-2, against the 1e-4 the old acceptable_tol
+// asked for).  MEASURED, mariposa, 4x4 tiles, --solver ddsimple unless noted,
+// everything else at its default:
+//
+//                                    off (DD_LEVEL_TOL=0)      1.0
+//   N=32  consensus              124 it, a*=0.054030      124 it, a*=0.054030
+//   N=32  permutation            244 it, a*=0.054025      204 it, a*=0.054581
+//   N=64  consensus              229 it, a*=0.067483      126 it, a*=0.067501
+//   N=64  consensus, mumps       141 it, a*=0.067484      118 it, a*=0.067501
+//
+// PSNR IDENTICAL in all four pairs (23.67 / 23.67 / 25.02 / 25.02 dB) and a*
+// agrees to three significant figures; N=32 consensus is a no-op, because
+// IPOPT checks its own convergence BEFORE calling the callback, so the gate
+// can only ever stop a run IPOPT was going to keep iterating on.  The N=64
+// consensus row is the one worth reading twice: the ~100 iterations it drops
+// are exactly the ill-conditioned tail where the interface solve struggles, so
+// the solver's own health improves with it --- CG interface rejections
+// 404 -> 2, steps above the residual tolerance 222 -> 11, W_k factorization
+// breakdowns 38 -> 7, wall clock 254.8 s -> 95.9 s.
+//
+// NOT MEASURED at N=128/256 or on the 1D and dataset drivers, which share this
+// code; DD_LEVEL_TOL=0 restores the previous behaviour exactly if one of them
+// regresses.
+constexpr double kLevelTolDefault = 1.0;
+
+// THE SCHOLTES LEVEL GATE.  A relaxed level t is only worth solving to the
+// accuracy the relaxation itself has, which the geometry puts at sqrt(t) — see
+// the long comment on MpccTNLPBase::level_tol_scale_ in mpcc_base.hpp, which
+// also records why this CANNOT be done through IPOPT's acceptable_tol (it
+// governs the restoration phase's convergence test too, and loosening it turns
+// restoration entries into spurious local-infeasibility exits) nor through
+// `tol` (which additionally sets the barrier floor mu_min).  The gate lives in
+// the TNLP's intermediate_callback; this reads its scale.
+//
+//   DD_LEVEL_TOL=<k>   kappa: stop a level once inf_pr, inf_du and mu are all
+//                      below max(--tol, k*sqrt(t)).  --tol is a floor on the
+//                      gate exactly as it is on IPOPT's own tolerances above,
+//                      so a LOOSER --tol loosens the gate too; asking for a
+//                      TIGHTER solve than k*sqrt(t) means turning the gate off.
+//                      DD_LEVEL_TOL=0 disables it and restores the
+//                      pre-2026-09-16 behaviour exactly.
+//   DD_LEVEL_HITS=<n>  consecutive qualifying callbacks required (default 1,
+//                      matching IPOPT's acceptable_iter).
+inline double level_tol_scale() {
+  const char *e = std::getenv("DD_LEVEL_TOL");
+  return e ? std::atof(e) : kLevelTolDefault;
+}
+
+inline int level_tol_hits() {
+  const char *e = std::getenv("DD_LEVEL_HITS");
+  return e ? std::max(1, std::atoi(e)) : 1;
+}
+
 // One attempted Scholtes level, for the per-level table and the solution dumps.
 struct Level {
   double t;
@@ -242,6 +296,14 @@ RunResult run_scholtes(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
     p.eps_theta_ = c_theta * t; // TR gauge ridge, weight ∝ t (0 = off)
     app->Options()->SetNumericValue("tol", std::max(tol, 0.1 * t));
     app->Options()->SetNumericValue("acceptable_tol", std::max(tol, 1.0 * t));
+    // Arm the sqrt(t) level gate at THIS level's t (a no-op when the scale is
+    // 0). Reset per level: each one earns its own stop.
+    p.level_tol_scale_ = level_tol_scale();
+    p.level_gate_hits_ = level_tol_hits();
+    p.level_gate_floor_ = tol;
+    p.level_gate_t_ = t;
+    p.level_gate_seen_ = 0;
+    p.level_gate_fired_ = false;
     if (warm_start && p.have_warm_)
       app->Options()->SetStringValue("warm_start_init_point", "yes");
 
@@ -277,8 +339,12 @@ RunResult run_scholtes(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
     const double value =
         x.empty() ? 0.0
                   : (value_is_alpha ? x[p.oa] : p.weight_of_alpha(x[p.oa]));
+    // User_Requested_Stop is a SUCCESS here exactly when our own level gate
+    // asked for it — the iterate met inf_pr, inf_du, mu <= k*sqrt(t).  Any
+    // other User_Requested_Stop is still a failure.
     const bool ok = (st == Ipopt::Solve_Succeeded ||
-                     st == Ipopt::Solved_To_Acceptable_Level);
+                     st == Ipopt::Solved_To_Acceptable_Level ||
+                     (st == Ipopt::User_Requested_Stop && p.level_gate_fired_));
     res.hist.push_back({t, (int)st, iters, comp,
                         x.empty() ? 0.0 : p.weight_of_alpha(x[p.oa]),
                         p.sol_obj_, xi_max, ok});
@@ -314,6 +380,34 @@ RunResult run_mu_coupled(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
   const double mu0 = 0.1;
   p.t_mu_scale_ = t_mu_scale;
   p.t_floor_ = t_min;
+  // T-RATCHET RATE LIMIT, default 0.5: t may at most HALVE per iteration.
+  // t is slaved to μ, so one monotone μ cut tightens complementarity by the
+  // same factor at once, and IPOPT's first cut is violent — μ 0.1 → 6.98e-4
+  // before the first Newton step, i.e. t 1.0 → 6.98e-3, a 143x tightening in
+  // one step.  Measured at N=256 consensus that put the run into restoration at
+  // it=2 (inf_du 1.0e+03) which it never escaped: t stayed PINNED at 6.98e-3
+  // and inf_du at 1.8e+02 — 258x above the μ gate of 1000·μ = 0.698 — so μ
+  // could not advance and the solve stalled.  This is the "N=256
+  // dual-infeasibility floor".  Limiting the rate does not change where t ends
+  // up (it still converges to max(t_floor, c·μ) once μ settles), only how fast
+  // it gets there.  Measured, α*/PSNR IDENTICAL at every consensus size:
+  //
+  //                         off                     0.5
+  //   consensus N=32   status 1, 125 it, 101 rej   status 0, 171 it,  24 rej
+  //   consensus N=64   status 1,  82 it, 118 rej   status 1,  72 it,  58 rej
+  //   consensus N=128  status 1, 138 it,  52 rej   status 0, 142 it,  34 rej
+  //   consensus N=256  t pinned 6.98e-3,           t advancing to 3.37e-3,
+  //                    inf_du stuck 1.8e+02        inf_du back to single digits
+  //   permutation N=32 290 it, PSNR 23.39          393 it, PSNR 23.67
+  //
+  // Unlike DD_BARRIER_TOL and the μ-damping knobs, this is NOT formulation
+  // scoped: it is a property of the t-μ coupling, not of the decomposition, and
+  // the permutation form improves under it too (it stops converging to the
+  // worse α*=0.0645 local solution and agrees with consensus at 0.0546).
+  // 0.7 was measured and rejected: it avoids the it=2 restoration outright but
+  // drifts onto a far looser path (obj 66.1 vs 51.2 at it=20).
+  //   DD_T_RATE=<f>   override; DD_T_RATE=0 restores the unlimited ratchet.
+  p.t_rate_ = std::getenv("DD_T_RATE") ? std::atof(std::getenv("DD_T_RATE")) : 0.5;
   p.c_theta_live_ = c_theta;
   p.t_ = std::max(t_min, t_mu_scale * mu0);
   p.eps_theta_ = c_theta * p.t_;
@@ -329,6 +423,15 @@ RunResult run_mu_coupled(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
   p.prev_valid_ = false;
   app->Options()->SetNumericValue("tol", std::max(tol, 0.1 * t_min));
   app->Options()->SetNumericValue("acceptable_tol", std::max(tol, 1.0 * t_min));
+  // The single solve rides t all the way down to t_min, so t_min is the level
+  // the answer is reported at and the only one the gate may fire on — stopping
+  // at a looser t would report a level the continuation had not finished.
+  p.level_tol_scale_ = level_tol_scale();
+  p.level_gate_hits_ = level_tol_hits();
+  p.level_gate_floor_ = tol;
+  p.level_gate_t_ = t_min;
+  p.level_gate_seen_ = 0;
+  p.level_gate_fired_ = false;
 
   std::cout << std::scientific << std::setprecision(3);
   std::cout << "  [mu-coupled] single solve: t seeded " << p.t_ << ", floor "
@@ -351,7 +454,8 @@ RunResult run_mu_coupled(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
   for (int e = 0; e < p.n_lift && !p.sol_lam_.empty(); ++e)
     xi_max = std::max(xi_max, std::abs(p.sol_lam_[p.rcomp + e]));
   const bool ok =
-      (st == Ipopt::Solve_Succeeded || st == Ipopt::Solved_To_Acceptable_Level);
+      (st == Ipopt::Solve_Succeeded || st == Ipopt::Solved_To_Acceptable_Level ||
+       (st == Ipopt::User_Requested_Stop && p.level_gate_fired_));
   const double w = x.empty() ? 0.0 : p.weight_of_alpha(x[p.oa]);
   res.hist.push_back({p.t_, (int)st, iters, comp, w, p.sol_obj_, xi_max, ok});
   std::cout << "        t     status  iters      comp_res      weight"
@@ -359,6 +463,11 @@ RunResult run_mu_coupled(Ipopt::SmartPtr<Ipopt::IpoptApplication> app,
   std::cout << "  " << std::setw(9) << p.t_ << std::setw(8) << (int)st
             << std::setw(8) << iters << std::setw(14) << comp << std::setw(12)
             << w << std::setw(12) << p.sol_obj_ << std::setw(9) << cpu << "\n";
+  // status 5 is User_Requested_Stop, which here means the level gate fired and
+  // NOT that anything went wrong — say so, so the table row is not misread.
+  if (p.level_gate_fired_)
+    std::cout << "  [level gate] status 5 is the sqrt(t) level gate, not a "
+                 "failure (DD_LEVEL_TOL=0 to disable)\n";
   if (ok) {
     res.best_comp = comp;
     res.best_x = x;
