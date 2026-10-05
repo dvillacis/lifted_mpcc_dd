@@ -80,8 +80,10 @@ def _parse_solution_npz(path):
                     comp_res=float(r[3]), weight=float(r[4]), obj=float(r[5]),
                     xi_max=float(r[6]), converged=bool(int(r[7]))) for r in lv]
     mu_trace = d["mu_trace"] if d["mu_trace"].size else None
+    # --grid collocated (2026-10-02): the cell fields live on the N×N pixels
+    nc = N if ("collocated" in d.files and int(d["collocated"])) else N - 1
     return dict(
-        N=N, nc=N - 1, m_u=N * N, m_q=(N - 1) ** 2, sigma=float(d["sigma"]),
+        N=N, nc=nc, m_u=N * N, m_q=nc ** 2, sigma=float(d["sigma"]),
         stencil="averaged" if int(d["averaged"]) else "onesided",
         weight_mode="exp" if w_exp else "linear",
         alpha=a, weight=float(d["weight"]),

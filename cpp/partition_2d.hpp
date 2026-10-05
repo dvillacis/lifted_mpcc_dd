@@ -18,14 +18,19 @@
 // cross corner, so no cell has both qx AND qy on the border, so the cut-corner dual
 // rank-deficiency never arises — the 2D generalization of the working 1D DD, at the
 // price of a wider interface and only k subdomains.
+//
+// COLLOCATED grid (--grid collocated): the cells are the N² pixels themselves
+// (nc = N), and the anchor rule below becomes the identity — every pixel, with
+// all of its variables and rows, belongs to the tile that contains it.
 // ---------------------------------------------------------------------------
 struct Partition2D {
    int N, nc, k, n_sub;
    bool striped;
    std::vector<int> bounds, cell_owner, node_owner;
 
-   Partition2D(int N_, int k_, bool striped_ = false)
-       : N(N_), nc(N_ - 1), k(k_), n_sub(striped_ ? k_ : k_ * k_), striped(striped_) {
+   Partition2D(int N_, int k_, bool striped_ = false, bool collocated = false)
+       : N(N_), nc(collocated ? N_ : N_ - 1), k(k_), n_sub(striped_ ? k_ : k_ * k_),
+         striped(striped_) {
       // np.linspace(0, nc, k+1).astype(int) — truncated, last one exact.
       bounds.assign(k + 1, 0);
       const double step = (double)nc / (double)k;
@@ -46,13 +51,15 @@ struct Partition2D {
                      cell_owner[i * nc + j] = a * k + c;
       }
 
-      // anchor rule: node (i,j) → cell (i−1,j−1), clamped — the cell the node
-      // anchors under the one-sided stencil
+      // anchor rule: node (i,j) → cell (i,j), clamped — the cell whose top-left
+      // corner the node is, i.e. the cell the node anchors under the one-sided
+      // (forward-difference) stencil. Before 2026-10-02: cell (i−1,j−1), the
+      // mirror rule of the old bottom-right-anchored stencil.
       node_owner.assign(N * N, 0);
       for (int i = 0; i < N; ++i)
          for (int j = 0; j < N; ++j) {
-            const int ci = std::min(std::max(i - 1, 0), nc - 1);
-            const int cj = std::min(std::max(j - 1, 0), nc - 1);
+            const int ci = std::min(i, nc - 1);
+            const int cj = std::min(j, nc - 1);
             node_owner[i * N + j] = cell_owner[ci * nc + cj];
          }
    }

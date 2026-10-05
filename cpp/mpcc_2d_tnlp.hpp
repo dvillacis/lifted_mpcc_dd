@@ -22,12 +22,28 @@
 // STENCILS (both reproduce the board; `onesided` is the default and the measured
 // winner — see ../CLAUDE.md, the averaged one annihilates the Nyquist mode so
 // TV(checkerboard) = 0 and it denoises visibly worse):
-//   onesided : Kx = Sh⊗D, Ky = D⊗Sh   → (Kx u)_{a,b} = u[a+1,b+1] − u[a+1,b]
-//                                        (Ky u)_{a,b} = u[a+1,b+1] − u[a,b+1]
-//              both anchored at the COMMON node (a+1,b+1) — which is what the
-//              partition's anchor rule keys off, and why only one dual component
-//              crosses each cut.
+//   onesided : Kx = S0⊗D, Ky = D⊗S0   → (Kx u)_{a,b} = u[a,b+1] − u[a,b]
+//                                        (Ky u)_{a,b} = u[a+1,b] − u[a,b]
+//              forward differences, both anchored at the COMMON node (a,b), the
+//              cell's top-left corner — which is what the partition's anchor rule
+//              keys off, and why only one dual component crosses each cut.
+//              (Until 2026-10-02 this was the mirror image, backward differences
+//              anchored at the bottom-right node (a+1,b+1); runs recorded before
+//              that date used it.)
 //   averaged : Kx = A⊗D, Ky = D⊗A     → the ½ bilinear stencil, 4 nodes per cell.
+//
+// GRIDS (--grid, 2026-10-02). Everything above is the STAGGERED grid (default).
+// `collocated` puts qx, qy, r, δ, θ on the N² pixels, with u: the "cells" are the
+// pixels themselves (nc = N, m_q = N², cell index = pixel index), and K is the
+// forward difference with Neumann boundary — Chambolle's discrete gradient, the
+// discretization of the uniform driver (mpcc_tnlp.hpp):
+//   (Kx u)_{i,j} = u[i,j+1] − u[i,j] for j < N−1, a ZERO row on the last column,
+//   (Ky u)_{i,j} = u[i+1,j] − u[i,j] for i < N−1, a ZERO row on the last row.
+// On a zero row the lifting reads −r·cosθ = 0 (resp. −r·sinθ = 0), and that qx
+// (resp. qy) enters no state row: the lower-level dual is determined there only
+// through h3, exactly as in the TV optimality system. Nothing else changes —
+// the rows, Jacobian pieces and Hessian blocks are the same lists over m_q, the
+// zero rows simply contribute no K entries. Image route only (no Python dump).
 //
 // 21 Jacobian pieces (20 without ha) and 8 Hessian blocks, assembled in the SAME
 // order as their structure arrays — matched positionally, not by key, in both
@@ -53,6 +69,7 @@ class Mpcc2DTNLP : public MpccTNLPBase {
 public:
    int N = 0, m_u = 0, m_q = 0, nc = 0;
    bool averaged = false;                 // stencil
+   bool collocated = false;               // grid: q, r, δ, θ on the pixels (nc = N)
    int file_nsub = 0;
    double sigma_ = 0.1;
    std::vector<int> file_owner_;          // Python's kkt_owner, for --self-check
@@ -69,16 +86,23 @@ public:
    //            the warm start with the C++ Chambolle–Pock below. Convenient, but
    //            NOT the same instance as Python's — see load_image_data().
    Mpcc2DTNLP(const std::string& datafile, const image_io::Opts& opt = {},
-              bool exp_weight = false, bool averaged_stencil = false) {
+              bool exp_weight = false, bool averaged_stencil = false,
+              bool collocated_grid = false) {
       if (image_io::ends_with(datafile, ".txt")) {
+         if (collocated_grid)
+            throw std::runtime_error("the collocated grid has no .txt route "
+                                     "(dump_data_2d.py writes staggered instances)");
          load(datafile);
       } else {
          weight_exp = exp_weight;
          has_ha = !weight_exp;
          averaged = averaged_stencil;
+         collocated = collocated_grid;
+         if (collocated && averaged)
+            throw std::runtime_error("the averaged stencil is staggered-only");
          load_image_data(datafile, opt);
       }
-      nc = N - 1; m_u = N * N; m_q = nc * nc;
+      nc = collocated ? N : N - 1; m_u = N * N; m_q = nc * nc;
       n_state = m_u; n_lift = m_q;
       ou = 0; oqx = m_u; oqy = m_u + m_q; oR = m_u + 2 * m_q; oD = m_u + 3 * m_q;
       oTh = m_u + 4 * m_q; oa = m_u + 5 * m_q;
@@ -142,11 +166,20 @@ public:
       for (int a = 0; a < nc; ++a)
          for (int b = 0; b < nc; ++b) {
             const int cell = a * nc + b;
-            if (!averaged) {
-               Kx_.push_back({cell, node(a + 1, b), -1.0});
-               Kx_.push_back({cell, node(a + 1, b + 1), 1.0});
-               Ky_.push_back({cell, node(a, b + 1), -1.0});
-               Ky_.push_back({cell, node(a + 1, b + 1), 1.0});
+            if (collocated) {                    // cell = pixel (a,b); Neumann
+               if (b < N - 1) {
+                  Kx_.push_back({cell, node(a, b), -1.0});
+                  Kx_.push_back({cell, node(a, b + 1), 1.0});
+               }
+               if (a < N - 1) {
+                  Ky_.push_back({cell, node(a, b), -1.0});
+                  Ky_.push_back({cell, node(a + 1, b), 1.0});
+               }
+            } else if (!averaged) {
+               Kx_.push_back({cell, node(a, b), -1.0});
+               Kx_.push_back({cell, node(a, b + 1), 1.0});
+               Ky_.push_back({cell, node(a, b), -1.0});
+               Ky_.push_back({cell, node(a + 1, b), 1.0});
             } else {
                Kx_.push_back({cell, node(a, b), -0.5});
                Kx_.push_back({cell, node(a, b + 1), 0.5});

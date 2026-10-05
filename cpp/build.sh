@@ -79,12 +79,22 @@ else
   echo "      and mumps still work (set HSLDIR to re-enable MA57)" >&2
 fi
 
+# LAPACK (optional): dd_solve_2d --block-solver dense (dense Bunch–Kaufman
+# blocks, exact inertia) needs dsytrf/dsytrs. Homebrew's OpenBLAS carries them.
+LAPACKFLAGS=()
+LAPACKLIBS=()
+if OPENBLAS="$(brew --prefix openblas 2>/dev/null)" && [ -f "$OPENBLAS/lib/libopenblas.dylib" ]; then
+  LAPACKFLAGS=(-DDD_HAVE_LAPACK)
+  LAPACKLIBS=(-L"$OPENBLAS/lib" -lopenblas -Wl,-rpath,"$OPENBLAS/lib")
+fi
+
 exec clang++ -std=c++17 -O2 \
   -nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK" \
   -I"$EIGEN" -I"$ROOT" -I"$ROOT/third_party" $(pkg-config --cflags ipopt) \
-  "${OMPFLAGS[@]}" "${MUMPSFLAGS[@]}" "${HSLFLAGS[@]}" \
+  "${OMPFLAGS[@]}" "${MUMPSFLAGS[@]}" "${HSLFLAGS[@]}" "${LAPACKFLAGS[@]}" \
   "$@" \
   "${HSLLIBS[@]}" \
+  "${LAPACKLIBS[@]}" \
   "${MUMPSLIBS[@]}" \
   -lz \
   $(pkg-config --libs ipopt)

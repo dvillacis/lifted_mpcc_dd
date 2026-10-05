@@ -2,6 +2,7 @@
 cpp/dd_solve
 cpp/dd_solve_1d
 cpp/dd_solve_2d
+cpp_minimal/tv_learn
 cpp/dd_solve_dataset
 cpp/dd_solve*_omp
 cpp/dd_solve*_prof
@@ -11,7 +12,7 @@ cpp/mumps_smoke
 *.o
 *.dSYM/
 *.dwarf
-
+docs/
 # Solver output (regenerated)
 cpp/results/
 /results/

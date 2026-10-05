@@ -26,11 +26,29 @@
 //
 // The consensus variables then appear in linking rows and (for u) in the
 // quadratic objective / (for α) in the ridge and box.  Keeping the objective
-// on the ORIGINAL indices is deliberate: it saves rewriting eval_f/eval_grad_f
-// and its only structural effect is a PSD diagonal in the corner block C —
+// on the ORIGINAL indices is the DEFAULT (--objective consensus) and is
+// deliberate: its only structural effect is a PSD DIAGONAL corner block
+//
+//     C = δ_w·I + diag(σ on each border u node, 0 on every border qx/qy,
+//                      σ·reg_α + Σ_α on the consensus α),
+//
 // which can only push S further into positive definiteness.  That is the one
 // (benign) departure from strict Lueg form, where the complicating variables
 // carry no objective terms at all.
+//
+// --objective copies RECOVERS strict Lueg form (split_objective_ below).  The
+// fidelity of a border node is distributed over its copies with weight
+// 1/|T(u_i)|, the α ridge over the α copies with weight 1/n_tiles, and the α
+// box moves from the consensus α to the copies.  The weights are what keep it
+// the SAME problem: at any point feasible for the linking rows all copies of a
+// node agree, so Σ_k (1/|T|)·½(ũ⁽ᵏ⁾−f)² = ½(u−f)².  No consensus column is
+// then left with any curvature or any bound, so C = δ_w·I exactly and C = 0 at
+// δ_w = 0.  MEASURED: it costs nothing — with --solver mumps the entire IPOPT
+// trace is IDENTICAL to the default's, because the linking rows are linear and
+// the start is feasible for them, so the iterates never leave the manifold
+// where the two objectives agree, and the Newton systems differ only by a
+// shift w_k·∇Φ in the linking multipliers ν_k.  See docs/consensus_formulation
+// (§6.2) for the proof and the ddsimple numbers.
 //
 // EQUIVALENCE.  This is an exact reformulation — the linking constraints force
 // copies equal to consensus values at any feasible point, so the solution set
@@ -58,6 +76,7 @@
 #include <algorithm>
 #include <vector>
 
+#include "ipopt_phase.hpp"
 #include "mpcc_2d_tnlp.hpp"
 #include "partition_2d.hpp"
 
@@ -84,6 +103,14 @@ public:
    std::vector<Ent> DXT_, DYT_;        // h1 divergence, columns remapped per row tile
    std::vector<Ent> KX2_, KY2_;        // h2 u-stencils, columns remapped per cell tile
    std::vector<int> qxeff3_, qyeff3_;  // h3 row e → qx/qy index its tile uses
+   std::vector<Ent> fid_;              // objective fidelity: {node, column, weight}
+
+   // --objective copies: distribute the objective over the COPIES instead of
+   // leaving it on the consensus indices, so that no consensus column carries
+   // objective curvature and the corner block C empties to IPOPT's δ_w·I —
+   // strict Lueg form.  Must be set BEFORE init_consensus(), which bakes it
+   // into fid_ and the Hessian structure.  Default false: see the header.
+   bool split_objective_ = false;
 
    // Build the whole consensus structure from a partition.  Must be called
    // once, after the parent constructor (and after x_start_ is filled, which
@@ -197,6 +224,23 @@ public:
          qyeff3_[e] = eff(oqy + e, cell_tile_[e]);
       }
 
+      // -- the objective's fidelity terms, {node i, column, weight}.  By
+      // default one term per node on the ORIGINAL column — which for a border
+      // node IS the consensus column, and is what puts a PSD diagonal into the
+      // corner block C.  Under split_objective_ a border node's term is
+      // DISTRIBUTED over its copies with weight 1/|T(u_i)|: equal at any
+      // feasible point (all copies agree), so the same problem, but nothing
+      // lands on a consensus column.  The α ridge is split the same way, by
+      // 1/n_tiles, inside the (α,α) Hessian block and eval_f/eval_grad_f.
+      fid_.clear();
+      for (int i = 0; i < m_u; ++i) {
+         const int v = ou + i;
+         if (!split_objective_ || base[v] < 0) { fid_.push_back({i, v, 1.0}); continue; }
+         const double w = 1.0 / (double)tiles[v].size();
+         for (size_t j = 0; j < tiles[v].size(); ++j)
+            fid_.push_back({i, base[v] + (int)j, w});
+      }
+
       build_consensus_structures();
 
       // -- the starting point: copies start equal to their consensus value,
@@ -254,7 +298,7 @@ public:
       for (int l = 0; l < n_link; ++l) J(rlink + l, link_orig_[l]);      // 23
 
       auto H = [&](int r, int c) { hr_.push_back(r); hc_.push_back(c); };
-      for (int i = 0; i < m_u; ++i) H(ou + i, ou + i);                   // (u,u)
+      for (const auto& e : fid_) H(e.c, e.c);                            // (u,u)
       for (int e = 0; e < m_q; ++e) H(oTh + e, oR + e);                  // (θ,r)
       for (int e = 0; e < m_q; ++e) H(oTh + e, oD + e);                  // (θ,δ)
       for (int e = 0; e < m_q; ++e) H(oTh + e, oTh + e);                 // (θ,θ)
@@ -262,7 +306,68 @@ public:
       for (const auto& t : DXT_) H(a_of_h1_[t.r], t.c);                  // (α,qx)
       for (const auto& t : DYT_) H(a_of_h1_[t.r], t.c);                  // (α,qy)
       for (int k = 0; k < n_tiles; ++k) H(aeff_[k], aeff_[k]);           // (α,α) d²Q
-      H(oa, oa);                                                         // (α,α) reg
+      if (!split_objective_) H(oa, oa);                                  // (α,α) reg
+   }
+
+   // ---- the objective.  Arithmetic identical to the parent's in the default
+   // mode (fid_ is then one unit-weight term per node on ou+i); under
+   // split_objective_ the fidelity rides on fid_'s weighted copy columns and
+   // the ridge on the α copies.  Both agree at any point feasible for the
+   // linking rows, which is all exactness requires.
+   bool eval_f(Index, const Number* x, bool, Number& obj) override {
+      double s = 0.0;
+      for (const auto& e : fid_) {
+         const double d = x[e.c] - uclean_[e.r];
+         s += e.v * d * d;
+      }
+      double a2 = 0.0;
+      if (split_objective_)
+         for (int k = 0; k < n_tiles; ++k)
+            a2 += x[aeff_[k]] * x[aeff_[k]] / (double)n_tiles;
+      else
+         a2 = x[oa] * x[oa];
+      obj = 0.5 * loss_scale_ * s + 0.5 * reg_alpha_ * a2;
+      if (eps_theta_ != 0.0) {
+         double g = 0.0;
+         for (int e = 0; e < n_lift; ++e) {
+            const double d = x[oTh + e] - theta_ref_[e];
+            g += d * d;
+         }
+         obj += 0.5 * loss_scale_ * eps_theta_ * g;
+      }
+      return true;
+   }
+
+   bool eval_grad_f(Index, const Number* x, bool, Number* g) override {
+      for (int i = 0; i < n; ++i) g[i] = 0.0;
+      for (const auto& e : fid_)
+         g[e.c] += loss_scale_ * e.v * (x[e.c] - uclean_[e.r]);
+      if (split_objective_)
+         for (int k = 0; k < n_tiles; ++k)
+            g[aeff_[k]] += reg_alpha_ * x[aeff_[k]] / (double)n_tiles;
+      else
+         g[oa] += reg_alpha_ * x[oa];
+      if (eps_theta_ != 0.0)
+         for (int e = 0; e < n_lift; ++e)
+            g[oTh + e] = loss_scale_ * eps_theta_ * (x[oTh + e] - theta_ref_[e]);
+      return true;
+   }
+
+   // The α box is the only variable bound a consensus column can carry (δ ≤ 1
+   // is cell-local), and its barrier term Σ_α sits in C.  Under
+   // split_objective_ it moves to the copies — leaving it on the consensus α
+   // would put Σ_α straight back into the corner block this mode exists to
+   // empty.  Everything else is the parent's.
+   bool get_bounds_info(Index nn, Number* xl, Number* xu, Index mm, Number* gl,
+                        Number* gu) override {
+      if (!Mpcc2DTNLP::get_bounds_info(nn, xl, xu, mm, gl, gu)) return false;
+      if (!split_objective_) return true;
+      xl[oa] = -2e19; xu[oa] = 2e19;            // first: aeff_[k] == oa if n_tiles == 1
+      for (int k = 0; k < n_tiles; ++k) {
+         if (has_ha) { xu[aeff_[k]] = w_max_; }
+         else { xl[aeff_[k]] = alpha_lo_; xu[aeff_[k]] = alpha_hi_; }
+      }
+      return true;
    }
 
    bool eval_g(Index, const Number* x, bool, Index, Number* g) override {
@@ -338,11 +443,13 @@ public:
          for (Index k = 0; k < nele; ++k) { iRow[k] = hr_[k]; jCol[k] = hc_[k]; }
          return true;
       }
+      // restoration evaluates this Hessian with obj_factor = 0 (ipopt_phase.hpp)
+      ipopt_phase::restoration() = (obj_factor == 0.0);
       std::vector<double> dq(m_u, 0.0);
       for (const auto& t : DXT_) dq[t.r] += t.v * x[t.c];
       for (const auto& t : DYT_) dq[t.r] += t.v * x[t.c];
       Index k = 0;
-      for (int i = 0; i < m_u; ++i) values[k++] = obj_factor;             // (u,u)
+      for (const auto& e : fid_) values[k++] = obj_factor * e.v;          // (u,u)
       for (int e = 0; e < m_q; ++e)                                       // (θ,r)
          values[k++] = lam[rh2x + e] * std::sin(x[oTh + e])
                      - lam[rh2y + e] * std::cos(x[oTh + e]);
@@ -363,13 +470,16 @@ public:
       for (const auto& t : DYT_)
          values[k++] = dQ(x[a_of_h1_[t.r]]) * t.v * lam[rh1 + t.r];
       // (α,α): the d²Q part per tile (zero for the linear weight), then the
-      // reg-α ridge on the CONSENSUS α — the objective lives on the original
-      // indices (see the header comment).
+      // reg-α ridge — on the CONSENSUS α by default (the objective lives on the
+      // original indices, see the header comment), or split 1/n_tiles onto the
+      // copies under split_objective_, where it must NOT reach the consensus
+      // column.
       std::vector<double> aa(n_tiles, 0.0);
       for (int i = 0; i < m_u; ++i) aa[node_tile_[i]] += lam[rh1 + i] * dq[i];
+      const double rw = split_objective_ ? reg_alpha_ / (double)n_tiles : 0.0;
       for (int t = 0; t < n_tiles; ++t)
-         values[k++] = d2Q(x[aeff_[t]]) * aa[t];
-      values[k++] = obj_factor * reg_alpha_;
+         values[k++] = d2Q(x[aeff_[t]]) * aa[t] + obj_factor * rw;
+      if (!split_objective_) values[k++] = obj_factor * reg_alpha_;
       return true;
    }
 };

@@ -405,7 +405,9 @@
 #define DD_SOLVER_SIMPLE_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -418,6 +420,8 @@
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
+
+#include "ipopt_phase.hpp"
 
 namespace ddsimple {
 
@@ -651,6 +655,109 @@ private:
 };
 
 // =============================================================================
+//  DenseBK — a dense symmetric-indefinite factorization with EXACT inertia
+//  (Options::dense_blocks, --block-solver dense; needs LAPACK).
+//
+//  LAPACK's Bunch–Kaufman dsytrf: P Â Pᵀ = L D Lᵀ with 1×1 AND 2×2 pivots, so a
+//  KKT block with zero diagonals (λ, ρ rows) factorizes whatever the order,
+//  and Sylvester gives the inertia of Â from D: a 1×1 pivot by its sign, a 2×2
+//  pivot by its two eigenvalues. Â = S A S is A after symmetric Ruiz
+//  equilibration (a congruence, so In(Â) = In(A)), which puts the barrier Σ
+//  (up to 1e10) and the δ-sized entries on one scale before pivots are judged.
+//  A pivot eigenvalue with |d| <= tol (DDS_BK_TOL, default 1e-13, on the
+//  equilibrated scale) counts as ZERO: its sign is below the backward error,
+//  and the block is reported numerically singular.
+//  This is the reference route, not a production one: O(n³) per block.
+// =============================================================================
+#ifdef DD_HAVE_LAPACK
+extern "C" {
+void dsytrf_(const char* uplo, const int* n, double* a, const int* lda, int* ipiv,
+             double* work, const int* lwork, int* info);
+void dsytrs_(const char* uplo, const int* n, const int* nrhs, const double* a,
+             const int* lda, const int* ipiv, double* b, const int* ldb, int* info);
+}
+#endif
+
+class DenseBK {
+public:
+   // A: symmetric, only its LOWER triangle is read.
+   bool factorize(const Mat& A) {
+      n_ = (int)A.rows();
+      neg_ = pos_ = zero_ = 0;
+      ok_ = false;
+      min_piv_ = std::numeric_limits<double>::infinity();
+      if (n_ == 0) { ok_ = true; return true; }
+#ifdef DD_HAVE_LAPACK
+      a_ = A.triangularView<Eigen::Lower>();
+      a_ += A.triangularView<Eigen::StrictlyLower>().transpose();
+      // symmetric Ruiz: s_i ← s_i / sqrt(max_j |Â_ij|), a few sweeps
+      sc_.setOnes(n_);
+      for (int sweep = 0; sweep < 8; ++sweep) {
+         Vec r = a_.cwiseAbs().rowwise().maxCoeff();
+         bool done = true;
+         for (int i = 0; i < n_; ++i) {
+            const double f = (r[i] > 0.0) ? 1.0 / std::sqrt(r[i]) : 1.0;
+            if (std::abs(f - 1.0) > 1e-3) done = false;
+            r[i] = f;
+         }
+         a_ = r.asDiagonal() * a_ * r.asDiagonal();
+         sc_.array() *= r.array();
+         if (done) break;
+      }
+      ipiv_.resize(n_);
+      int lwork = 64 * n_, info = 0;
+      std::vector<double> work(lwork);
+      dsytrf_("L", &n_, a_.data(), &n_, ipiv_.data(), work.data(), &lwork, &info);
+      if (info < 0) return false;
+      static const double tol = std::getenv("DDS_BK_TOL") ? std::atof(std::getenv("DDS_BK_TOL")) : 1e-13;
+      auto classify = [&](double v) {
+         min_piv_ = std::min(min_piv_, std::abs(v));
+         if (std::abs(v) <= tol) ++zero_;
+         else if (v < 0.0) ++neg_;
+         else ++pos_;
+      };
+      for (int k = 0; k < n_;) {
+         if (ipiv_[k] > 0) { classify(a_(k, k)); ++k; continue; }
+         const double a = a_(k, k), b = a_(k + 1, k), c = a_(k + 1, k + 1);
+         const double h = 0.5 * (a + c), r = std::sqrt(0.25 * (a - c) * (a - c) + b * b);
+         classify(h + r);
+         classify(h - r);
+         k += 2;
+      }
+      ok_ = (info == 0);
+      return true;
+#else
+      return false;
+#endif
+   }
+   // In place, nrhs columns (n × nrhs, column-major): x = A⁻¹ b = S Â⁻¹ S b.
+   void solve(double* b, int nrhs) const {
+      if (n_ == 0) return;
+#ifdef DD_HAVE_LAPACK
+      Eigen::Map<Mat> B(b, n_, nrhs);
+      B = sc_.asDiagonal() * B;
+      int info = 0;
+      dsytrs_("L", &n_, &nrhs, a_.data(), &n_, ipiv_.data(), b, &n_, &info);
+      B = sc_.asDiagonal() * B;
+#else
+      (void)b; (void)nrhs;
+#endif
+   }
+   int negative() const { return neg_; }
+   int zero() const { return zero_; }
+   bool usable() const { return ok_ && zero_ == 0; }   // a solve means something
+   double min_pivot() const { return min_piv_; }        // equilibrated scale
+
+private:
+   int n_ = 0, neg_ = 0, pos_ = 0, zero_ = 0;
+   bool ok_ = false;
+   double min_piv_ = 0.0;
+   Mat a_;
+   Vec sc_;
+   std::vector<int> ipiv_;
+};
+
+// =============================================================================
 //  Precond — the ASd interface preconditioner (§7).
 //
 //  "Additive Schur, assembled diagonal" (Lueg eq. 20–21, as implemented by the
@@ -865,10 +972,15 @@ private:
 //
 //  What it reports back: `indefinite` records a pAp ≤ 0 event — in exact
 //  arithmetic a one-directional PROOF that A is not SPD (not seeing it proves
-//  nothing).  In floating point at ‖A‖ ~ 1e18 a merely tiny pAp can round
-//  non-positive, so the flag OVER-REPORTS; the referee experiments recorded
-//  runs where it fired repeatedly while the §8 prediction stayed correct.
-//  Treat it as evidence, not as a certificate — the Stats counters do.
+//  nothing).  In floating point at ‖A‖ ~ 1e18 a merely tiny pAp could round
+//  non-positive, and the referee experiments recorded runs where it fired
+//  while the §8 prediction stayed correct — but a later check against a dense
+//  eigendecomposition of S (cameraman N=32, 4×4 and 8×8 tiles, 78 and 126
+//  factorizations) found S_ff genuinely indefinite in EXACTLY the
+//  factorizations where a Z column broke down, and the uncorrected inertia
+//  one to three short of the truth there.  So during the Z build the flag is
+//  ACTED ON: the column counts as failed and the factorization is refused
+//  (build_peel_cache).  During a later solve it is still only counted.
 // =============================================================================
 struct CgResult {
    double rel = 1.0;          // best relative residual reached
@@ -992,6 +1104,143 @@ public:
       double cg_tol = 1e-10;      // interface solve (§9)
       double peel_cg_tol = 1e-7;  // peel-cache columns (§6); see above
       int cg_maxit = 500;
+      // EXPERIMENT (A/B against CG): solve with S_ff through a sparse Eigen
+      // LDLᵀ of the ASSEMBLED kept×kept block instead of CG.
+      //     0   CG everywhere (the design of §6–§7)
+      //     1   the peel columns Z = S_ff⁻¹ S_fP by the direct factorization
+      //         (one multi-RHS back-solve); the interface solve stays CG
+      //     2   the interface solve g = S_ff⁻¹ r_f by it too — no CG at all
+      // Assembling S_ff is one walk over the dense S_k blocks and C, so it
+      // is cheap; but a factorization of S_ff is exactly the serial global
+      // step §2 exists to avoid, so this is a benchmark switch, not the
+      // design.  The §8 prediction keeps its refusal semantics: a non-
+      // positive pivot of D is the direct analogue of CG's pAp <= 0, and the
+      // factorization is refused (SINGULAR) on it.
+      int sff_direct = 0;
+      // BORDER REGULARIZATION (0 = off, the historical behaviour).
+      //
+      // An alternative to promoting the multipliers of all-border constraint
+      // rows.  Such a row owns no interior column, so its multiplier's row of
+      // W_k is structurally EMPTY and W_k is singular for every value of the
+      // entries — which is why the driver promotes those multipliers to the
+      // border, and why S is then indefinite and the dual peel of §6 is
+      // forced (In(S) has exactly one negative eigenvalue per border dual).
+      //
+      // Leaving them in W_k and regularizing the empty diagonal instead moves
+      // that negative eigenvalue from S into W_k, where it is read off a pivot
+      // sign for free.  The reported inertia is UNCHANGED —
+      //     n_neg = Σ_k n_neg(W_k) + n_neg(S)
+      // simply counts the same directions on the other side of the split —
+      // but S becomes SPD, so CG is valid on the WHOLE interface and no peel,
+      // no Z and no T are needed for definiteness.
+      //
+      // The price is conditioning, not sign: with δ on the empty diagonal the
+      // Schur complement gains +(1/δ)·bbᵀ per regularized row, b being that
+      // row's border Jacobian — a POSITIVE semidefinite rank-one spike.  The
+      // exactly enforced constraint has become a penalty of parameter 1/δ, so
+      // δ trades ‖Ã − A‖ against κ(S): too small and CG cannot converge, too
+      // large and §9's refinement has to work harder to recover the step.
+      // Use with --no-promote-corners; with promotion on there is nothing
+      // structurally empty left to regularize.
+      double border_reg = 0.0;
+      // DROP THE CORNER REGULARIZATION (--drop-corner-reg, false = historical).
+      //
+      // In Lueg's form — the consensus formulation with the objective on the
+      // copies — the complicating variables appear only in linear linking rows,
+      // so the corner block C is zero and needs no regularization (Lueg et al.
+      // 2026, §2). Inside IPOPT it is not: the global inertia correction adds
+      // δ_w·I to every primal diagonal, the consensus variables included, so a
+      // regular iteration hands us C = δ_w·I. With this switch C is replaced by
+      // its Lueg value, 0, at every factorization where that is exactly what it
+      // is — C a scalar multiple of I with no off-diagonal entry, outside the
+      // restoration phase (ipopt_phase.hpp; there C also carries the
+      // restoration objective's proximity term, a real part of that problem,
+      // and is kept). The δ_w on the interior blocks W_k is untouched. The step
+      // then solves a matrix that differs from IPOPT's by δ_w on the border
+      // diagonal, which IPOPT's iterative refinement sees.
+      bool drop_corner = false;
+      // PER-BLOCK DUAL REGULARIZATION (--block-dual-reg; dual_start < 0 = off).
+      //
+      // A W_k can be singular although the full KKT matrix is not: in the
+      // consensus form every copied variable is pinned by its linking row, so
+      // W_k is the tile's problem with that data fixed, and the multipliers of
+      // gradient rows reading only copied nodes lose their pinning where r ≈ 0
+      // (measured: monolithic MUMPS never needs δ_c, the tile blocks do).
+      // Reporting SINGULAR then makes IPOPT switch on its GLOBAL δ_c, for every
+      // block and for the rest of the run, after which min|λ(W_k)| = δ_c.
+      //
+      // Instead, a W_k whose LDLᵀ breaks down is refactorized with −ε_k on its
+      // DUAL diagonal only (Lueg et al. 2026 §3.5: δ_C^k per partition), ε_k on
+      // the ladder kRegMin·10^j up to kRegMax, and the next factorization
+      // starts one rung below the last ε_k that worked. The other blocks are
+      // untouched. The regularized blocks only precondition: solve() refines
+      // against the ORIGINAL triplets, so the step returned is IPOPT's own
+      // (the full matrix is nonsingular, so the refinement converges), and
+      // IPOPT never sees a singular factorization from a W_k.
+      //
+      // dual_start = first KKT index of a multiplier (n + n_ineq in the
+      // drivers' ordering primal | slacks | λ_c | λ_d).
+      int dual_start = -1;
+      // W_k-ONLY REGULARIZATION (--wk-reg-h / --wk-reg-c; 0 = off).
+      //
+      // Not IPOPT's δ_w/δ_c: those come from IPOPT's inertia-correction retries
+      // and sit on the WHOLE KKT matrix (corner C and linking rows included).
+      // These are two fixed constants put on the subdomain blocks only, for
+      // the conditioning of W_k, as in Lueg et al. 2026 (§3.5):
+      //
+      //          x_k                 y_k                 λ_k              ρ_k
+      //   x_k [ ∇²_xx L + δ_H^W      ∇²_xy L             (∇_x h)ᵀ          0 ]
+      //   y_k [ ∇²_yx L              ∇²_yy L + δ_H^W     (∇_y h)ᵀ          I ]
+      //   λ_k [ ∇_x h                ∇_y h               −δ_C^W I          0 ]
+      //   ρ_k [ 0                    I                   0                 0 ]
+      //
+      // (on top of whatever IPOPT's own δ_w/δ_c already put there). +wk_reg_h
+      // goes on every primal diagonal of W_k (x_k, y_k and the inequality
+      // slacks), −wk_reg_c on every multiplier diagonal EXCEPT the linking
+      // multipliers ρ_k = KKT indices [link_begin, link_end), which the identity
+      // (ρ_k, y_k) already pins. C and B_k are untouched. Like dual_start this
+      // only changes the factorization: S is formed from the regularized W_k,
+      // solve() refines against the ORIGINAL triplets, and the inertia reported
+      // to IPOPT is that of the regularized matrix (Haynsworth on W̃_k and S̃),
+      // which equals IPOPT's whenever no eigenvalue of the true matrix is
+      // smaller in magnitude than the shifts.
+      // wk_dual_start = first KKT index of a multiplier (n + n_ineq).
+      double wk_reg_h = 0.0, wk_reg_c = 0.0;
+      int wk_dual_start = -1, link_begin = -1, link_end = -1;
+      // PER-BLOCK INERTIA CORRECTION (--block-inertia; Lueg et al. 2026 §3.5).
+      //
+      // Each W_k gets its own δ_H^k (primal diagonal: x_k, y_k, slacks) and
+      // δ_C^k (multiplier diagonal, linking ρ_k excluded), chosen like IPOPT
+      // chooses its global δ_w/δ_c but block by block, until
+      //     In(W̃_k) = (#primal unknowns of tile k, #multipliers of tile k, 0).
+      // Per factorization, block k first tries δ_H^k = δ_C^k = 0; a breakdown
+      // or too FEW negative pivots (a rank-deficient block Jacobian) switches
+      // on δ_C^k = 1e-8·μ^{1/4} (IPOPT's jacobian_regularization formula); too
+      // MANY negative pivots climb the δ_H^k ladder of IPOPT's defaults —
+      // first 1e-4 (or last/3 when the block needed one before), then ×100
+      // (first escalation) / ×8, give up above 1e20. With every W̃_k right, the
+      // full matrix has IPOPT's inertia iff S̃ = C − Σ B_k W̃_k⁻¹ B_kᵀ has its
+      // own (positive definite in the consensus form); when it has not, the
+      // reported count is off and IPOPT raises its GLOBAL δ_w — Lueg's global
+      // fallback, which also reaches C. Unlike dual_start / wk_reg_*, the
+      // shifts are part of the matrix solved: solve() refines against
+      // IPOPT's triplets PLUS the block shifts (as IPOPT's SolveOnce solves its
+      // own perturbed system), and IPOPT's iterative refinement then measures
+      // the step against its unperturbed Newton system, exactly as it does for
+      // its own δ_w. Uses wk_dual_start / link_begin / link_end.
+      bool block_inertia = false;
+      // DENSE BLOCKS (--block-solver dense; needs LAPACK). Every W_k by
+      // DenseBK (Bunch–Kaufman, exact inertia, no breakdown on ρρ = 0), S_k by
+      // dense solves, and S̃ assembled dense and factorized the same way: its
+      // EXACT inertia goes into Haynsworth (no peel, no prediction) and the
+      // interface solve is direct. The reference for "correct inertia".
+      bool dense_blocks = false;
+      // INTERFACE INERTIA (--interface-inertia; needs dense_blocks and
+      // block_inertia). When every W̃_k is right but S̃ is not PD, shift the
+      // corner block C by δ_S·I (the consensus variables' diagonal) on the
+      // same ladder until it is, instead of handing IPOPT a wrong inertia and
+      // letting its GLOBAL δ_w hit every block again. Only S̃ is refactorized.
+      bool interface_inertia = false;
    };
 
    // Above this, a refined step is reported as poor (§9/§10).  Not a rejection
@@ -1019,12 +1268,12 @@ public:
                               // and judged again by solve()'s refinement, §9)
       long cache_builds = 0;  // peel caches built (one per factorization)
       // §8 falsification telemetry.  The two counters are NOT the same thing:
-      //   before  CG saw non-positive curvature while BUILDING the prediction,
-      //           so no prediction was issued — the safe outcome (SINGULAR).
+      //   before  CG saw non-positive curvature while BUILDING the prediction;
+      //           the factorization was refused (SINGULAR) and IPOPT
+      //           regularized — the safe outcome, enforced in build_peel_cache.
       //   after   it happened during a later solve, i.e. an inertia already
       //           handed to IPOPT rests on a premise this run has evidence
-      //           against.  The flag over-reports (see CgResult), so treat it
-      //           as a hint, not a verdict.
+      //           against.  Counted only (see CgResult).
       long indef_before = 0, indef_after = 0;
       long pred_refused = 0;  // factorizations where we declined to predict
       // ASd preconditioner health (§7).  An indefinite block is USED anyway,
@@ -1032,6 +1281,35 @@ public:
       // first two are telemetry on the §8 SPD premise, not a failure count.
       // pc_blocks_singular IS a failure: that block was skipped entirely.
       long pc_blocks_indef = 0, pc_positions_indef = 0, pc_blocks_singular = 0;
+      // Options::drop_corner telemetry, per factorization: C = δ_w·I with
+      // δ_w > 0 zeroed; C already 0 (IPOPT did not regularize); kept because
+      // IPOPT was in restoration; kept because C was not a multiple of I.
+      long corner_dropped = 0, corner_zero = 0, corner_kept_resto = 0,
+           corner_kept_nonscalar = 0;
+      // Options::dual_start telemetry: block factorizations that needed a
+      // local ε_k > 0, the largest ε_k used, and blocks still broken at kRegMax.
+      long blockreg_used = 0, blockreg_failed = 0;
+      double blockreg_max = 0.0;
+      // Options::block_inertia telemetry, over all block factorizations:
+      // needed δ_H^k > 0 / needed δ_C^k > 0 / no shift found (→ SINGULAR),
+      // extra LDLᵀ factorizations spent on the ladders, largest δ_H^k, and
+      // factorizations IPOPT still found with the wrong inertia (S̃ not PD).
+      long binert_blocks = 0, binert_dh = 0, binert_dc = 0, binert_failed = 0;
+      long binert_retries = 0, binert_wrong = 0, binert_dc_link = 0;
+      long binert_ipopt_dc = 0;   // factorizations IPOPT's own δ_c was on
+      // Options::dense_blocks: W_k factorization attempts with a numerically
+      // zero pivot (ladder attempts included); factorizations with S̃
+      // indefinite / numerically singular.
+      long dense_w_zero = 0, dense_s_indef = 0, dense_s_zero = 0;
+      // Options::interface_inertia: factorizations that needed δ_S > 0, the
+      // largest δ_S, extra S̃ factorizations
+      long sfix_used = 0, sfix_retries = 0;
+      double sfix_max = 0.0;
+      double binert_dh_max = 0.0;
+      // Wall-clock seconds, for the CG-vs-direct A/B (Options::sff_direct).
+      double t_factor = 0.0;  // factorize() total (W_k, S_k, C, peel cache)
+      double t_peel = 0.0;    // ... of which build_peel_cache()
+      double t_solve = 0.0;   // solve() total (arrowhead + refinement)
    };
 
    // --------------------------------------------------------------------
@@ -1055,15 +1333,30 @@ public:
                    << " entries, KKT dim is " << dim_ << "\n";
          return false;
       }
+      // Eigen has its own OpenMP threading for dense products.  Under the
+      // threaded peel-column loop of build_peel_cache that is NESTED
+      // parallelism: it oversubscribes the machine, and — because a threaded
+      // GEMM reduces in a different order — it makes the CG iteration counts
+      // depend on OMP_NUM_THREADS (measured: 891628 at T=1,2,12 against 892986
+      // at T=8, same answer but not the same arithmetic).  One thread here, and
+      // the parallelism that matters stays ours.
+#ifdef _OPENMP
+      Eigen::setNbThreads(1);
+#endif
       number_unknowns();
       if (!route_triplets()) return false;
       build_peel_sets();
+      sff_analyzed_ = false;   // a new pattern ⇒ a new symbolic analysis
       if (std::getenv("DDS_DEBUG"))
          std::cerr << "[dds] dim=" << dim_ << " nnz=" << nnz_
                    << " subdomains=" << nsub_ << " border p=" << p_
                    << " peeled=" << peel_.size() << " (" << n_peel_dual_
                    << " dual, " << n_peel_cross_ << " cross)  max dim W_k="
-                   << max_dimk_ << "\n";
+                   << max_dimk_
+                   << (opt_.border_reg > 0.0
+                           ? "  border-reg rows=" + std::to_string(n_reg_)
+                           : std::string())
+                   << "\n";
       return true;
    }
 
@@ -1071,7 +1364,7 @@ public:
    double* values() { return vals_.data(); }
    int dim() const { return dim_; }
 
-   enum Status { OK, SINGULAR };
+   enum Status { OK, SINGULAR, WRONG_INERTIA };
 
    // --------------------------------------------------------------------
    //  FACTORIZATION.  Four steps, in order:
@@ -1081,6 +1374,14 @@ public:
    //     4. build the peel cache, predict In(S)    (§6 + §8)
    // --------------------------------------------------------------------
    Status factorize() {
+      const auto t0 = std::chrono::steady_clock::now();
+      struct Tally {
+         double& acc; std::chrono::steady_clock::time_point t0;
+         ~Tally() {
+            acc += std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count();
+         }
+      } tally{stats_.t_factor, t0};
       n_neg_ = 0;
       peel_valid_ = false;   // the operator changed ⇒ the peel cache is void
 
@@ -1093,9 +1394,94 @@ public:
 #pragma omp parallel for schedule(dynamic)
 #endif
       for (int k = 0; k < nsub_; ++k) {
-         fill_from_triplets(W_[k], wtrip_[k]);
+         zhits_[k] = 0;
+         // Options::dual_start: start one rung below the ε_k that last worked
+         // (0 once the ladder has walked down past kRegMin), climb on breakdown.
+         if (opt_.dual_start >= 0) {
+            const double e = last_eps_[k] / 10.0;
+            eps_[k] = (e >= kRegMin) ? e : 0.0;
+         }
          fill_from_triplets(B_[k], btrip_[k]);
-         ok[k] = ldlt_[k]->factorize(W_[k]) ? 1 : 0;
+         if (opt_.block_inertia) {
+            ok[k] = factorize_block_inertia(k) ? 1 : 0;
+            continue;
+         }
+         fill_W(k);
+         ok[k] = factor_block(k) ? 1 : 0;
+         while (!ok[k] && opt_.dual_start >= 0 && eps_[k] < kRegMax) {
+            eps_[k] = (eps_[k] == 0.0) ? kRegMin : 10.0 * eps_[k];
+            fill_W(k);
+            ok[k] = ldlt_[k]->factorize(W_[k]) ? 1 : 0;
+         }
+         if (opt_.dual_start >= 0) last_eps_[k] = ok[k] ? eps_[k] : kRegMax;
+      }
+      if (opt_.dense_blocks)
+         for (int k = 0; k < nsub_; ++k) stats_.dense_w_zero += zhits_[k];
+      if (opt_.block_inertia) {
+         // IPOPT's global δ_c, read off its own dual diagonal
+         for (int t = 0; t < nnz_; ++t)
+            if (irow_[t] == jcol_[t] && irow_[t] >= opt_.wk_dual_start && vals_[t] != 0.0) {
+               ++stats_.binert_ipopt_dc;
+               break;
+            }
+         for (int k = 0; k < nsub_; ++k) {
+            ++stats_.binert_blocks;
+            if (dh_[k] > 0.0) ++stats_.binert_dh;
+            if (dc_[k] > 0.0) ++stats_.binert_dc;
+            if (dc_link_[k]) ++stats_.binert_dc_link;
+            if (!ok[k]) ++stats_.binert_failed;
+            stats_.binert_retries += tries_[k] - 1;
+            stats_.binert_dh_max = std::max(stats_.binert_dh_max, dh_[k]);
+         }
+         update_shift();
+      }
+      // DDS_VERIFY_WK: hand every W_k, exactly as it was factorized (block shifts
+      // of dual_start / wk_reg_* / block_inertia included)
+      // (lower triangle, global KKT indices), to the driver's checker, built at
+      // the iterate the callback recorded.
+      // Every factorization of a regular iteration is checked (the iterate is
+      // fixed within an iteration; only IPOPT's δ_w/δ_c change between tries).
+      if (ipopt_phase::wk_hook() && ipopt_phase::iterate().fresh &&
+          !ipopt_phase::restoration()) {
+         std::vector<std::vector<ipopt_phase::WkEntry>> blocks(nsub_);
+         std::vector<std::vector<int>> glob(nsub_);
+         for (int k = 0; k < nsub_; ++k) glob[k].assign(dimk_[k], -1);
+         for (int i = 0; i < dim_; ++i)
+            if (owner_[i] >= 0) glob[owner_[i]][lpos_[i]] = i;
+         for (int k = 0; k < nsub_; ++k) {
+            fill_W(k);
+            for (int j = 0; j < W_[k].outerSize(); ++j)
+               for (SpMat::InnerIterator it(W_[k], j); it; ++it)
+                  blocks[k].push_back({glob[k][it.row()], glob[k][it.col()], it.value()});
+         }
+         ipopt_phase::wk_hook()(blocks);
+      }
+      if (opt_.dual_start >= 0)
+         for (int k = 0; k < nsub_; ++k) {
+            if (eps_[k] > 0.0) ++stats_.blockreg_used;
+            if (!ok[k]) ++stats_.blockreg_failed;
+            stats_.blockreg_max = std::max(stats_.blockreg_max, eps_[k]);
+         }
+      // DDS_COND=dense0: the exact spectrum of every W_k (dim <= 3000) at each
+      // factorization ATTEMPT, before the breakdown test — to tell a singular
+      // W_k from an unpivoted-LDLᵀ breakdown on a nonsingular one.
+      if (const char* dc = std::getenv("DDS_COND"); dc && std::string(dc) == "dense0") {
+         static int n_try = 0;
+         ++n_try;
+         for (int k = 0; k < nsub_; ++k) {
+            if (dimk_[k] > 3000) continue;
+            const SpMat full = W_[k].selfadjointView<Eigen::Lower>();
+            const Vec ev = Eigen::SelfAdjointEigenSolver<Mat>(Mat(full), Eigen::EigenvaluesOnly)
+                               .eigenvalues();
+            const Vec a = ev.cwiseAbs();
+            int neg = 0;
+            for (int i = 0; i < ev.size(); ++i) neg += ev[i] < 0.0;
+            std::printf("[dds-cond0] try=%d W_%d dim=%d ldlt=%s  min|lam|=%.3e max|lam|=%.3e "
+                        "kappa=%.3e  negative=%d\n", n_try, k, dimk_[k],
+                        ok[k] ? "ok    " : "BROKE ", a.minCoeff(), a.maxCoeff(),
+                        a.maxCoeff() / a.minCoeff(), neg);
+         }
+         std::fflush(stdout);
       }
       for (int k = 0; k < nsub_; ++k) {
          if (!ok[k]) {
@@ -1103,13 +1489,23 @@ public:
             // is how a run that regularized its way out of trouble on every
             // second Newton step passes for a clean one.
             std::ostringstream m;
-            m << "W_" << k << " (dim " << dimk_[k] << "): " << ldlt_[k]->why()
+            m << "W_" << k << " (dim " << dimk_[k] << "): "
+              << (opt_.dense_blocks ? std::string("numerically zero Bunch–Kaufman pivot")
+                                    : ldlt_[k]->why())
               << "; reporting SINGULAR, IPOPT answers by raising δ_w";
             warn(Warn::LdltNumeric, m.str());
             return SINGULAR;
          }
-         n_neg_ += ldlt_[k]->negative_eigenvalues();   // the Σ_k In(W_k) of (3.1)
+         n_neg_ += block_neg(k);                       // the Σ_k In(W_k) of (3.1)
       }
+
+      // DDS_COND=1: estimate κ₂(W_k) = max|λ| / min|λ| for every subdomain at
+      // every factorization, of the matrix exactly as factorized (barrier Σ and
+      // IPOPT's δ_w included). W_k is symmetric indefinite, so max|λ| comes from
+      // power iteration and min|λ| from inverse iteration through the LDLᵀ just
+      // computed. One line per factorization on stdout, so it interleaves in
+      // order with the [mu-coupled] iteration lines.
+      if (std::getenv("DDS_COND")) report_condition();
 
       // ---- 2. the local Schur blocks (§5) ------------------------------
       // S_k = −B_k W_k⁻¹ B_kᵀ via (5.1)/(5.2): pruned forward solves on the
@@ -1124,6 +1520,13 @@ public:
          const int pk = (int)Nk_[k].size();
          if (pk == 0) { Sk_[k].resize(0, 0); continue; }
          const int nk = dimk_[k];
+         if (opt_.dense_blocks) {                // S_k = −B_k W̃_k⁻¹ B_kᵀ, dense
+            Mat X = Mat(SpMat(B_[k].transpose()));
+            dbk_[k].solve(X.data(), pk);
+            Mat S = -(B_[k] * X);
+            Sk_[k] = 0.5 * (S + S.transpose());
+            continue;
+         }
          // P B_kᵀ, still sparse.  Eigen's own permutation product, so there is
          // no way to get P and P⁻¹ the wrong way round.
          const SpMat PBt = ldlt_[k]->permutationP() * SpMat(B_[k].transpose());
@@ -1219,15 +1622,105 @@ public:
       C_.setFromTriplets(t.begin(), t.end());     // duplicates are summed
       C_.makeCompressed();
 
+      // DDS_CHECK_C=1: report the corner block at every factorization — its
+      // numerical nonzeros, largest entry, largest OFF-diagonal entry and the
+      // diagonal's range.  In the consensus formulation the border is the
+      // consensus variables only, so C should be diagonal: the objective's
+      // curvature on them (--objective consensus) plus IPOPT's δ_w, or δ_w·I
+      // alone (--objective copies, strict Lueg form).
+      if (std::getenv("DDS_CHECK_C")) {
+         static int n_fact = 0;
+         int nnz = 0;
+         double cmax = 0.0, offmax = 0.0;
+         double dmin = std::numeric_limits<double>::infinity(), dmax = -dmin;
+         std::vector<double> d(p_, 0.0);
+         for (int j = 0; j < C_.outerSize(); ++j)
+            for (SpMat::InnerIterator it(C_, j); it; ++it) {
+               if (it.value() != 0.0) ++nnz;
+               cmax = std::max(cmax, std::abs(it.value()));
+               if (it.row() == it.col()) d[it.row()] = it.value();
+               else offmax = std::max(offmax, std::abs(it.value()));
+            }
+         for (double v : d) { dmin = std::min(dmin, v); dmax = std::max(dmax, v); }
+         std::cerr << "[dds-C] fact=" << ++n_fact << " p=" << p_ << " nnz=" << nnz
+                   << " max|C|=" << cmax << " max|offdiag|=" << offmax
+                   << " diag in [" << dmin << ", " << dmax << "]"
+                   << (opt_.drop_corner ? (ipopt_phase::restoration() ? " resto" : " regular")
+                                        : "")
+                   << "\n";
+      }
+
+      // Options::drop_corner: replace C by its Lueg value 0 where IPOPT's C is
+      // exactly δ_w·I (regular iteration, scalar diagonal, nothing off it).
+      cscale_ = 1.0;
+      if (opt_.drop_corner && p_ > 0) {
+         if (ipopt_phase::restoration()) {
+            ++stats_.corner_kept_resto;
+         } else {
+            bool scalar = true;
+            const double c0 = C_.coeff(0, 0);
+            for (int j = 0; j < C_.outerSize() && scalar; ++j)
+               for (SpMat::InnerIterator it(C_, j); it; ++it)
+                  if ((it.row() != it.col() && it.value() != 0.0) ||
+                      (it.row() == it.col() && it.value() != c0)) { scalar = false; break; }
+            // an implicit (structurally absent) diagonal entry is 0
+            if (scalar && c0 != 0.0)
+               for (int i = 0; i < p_ && scalar; ++i)
+                  if (C_.coeff(i, i) != c0) scalar = false;
+            if (scalar) {
+               cscale_ = 0.0;
+               C_.setZero();
+               ++(c0 != 0.0 ? stats_.corner_dropped : stats_.corner_zero);
+            } else {
+               ++stats_.corner_kept_nonscalar;
+            }
+         }
+      }
+
       // diag(S), assembled WITHOUT assembling S: the corner diagonal plus each
       // subdomain's own contribution to the border unknowns it touches.  In a
       // distributed code this is one all-reduce over a p-vector — exactly why
       // the ASd preconditioner is built around it (see Precond).
       diagS_.setZero(p_);
       for (const auto& e : ctrip_)
-         if (e.r == e.c) diagS_[e.r] += vals_[e.t];
+         if (e.r == e.c) diagS_[e.r] += cscale_ * vals_[e.t];
       for (int k = 0; k < nsub_; ++k)
          for (int a = 0; a < (int)Nk_[k].size(); ++a) diagS_[Nk_[k][a]] += Sk_[k](a, a);
+
+      // Options::dense_blocks: S̃ assembled and factorized densely; its exact
+      // inertia replaces the §8 prediction and the interface solve is direct.
+      if (opt_.dense_blocks) {
+         Mat S = Mat(C_) * cscale_;
+         for (int k = 0; k < nsub_; ++k)
+            for (int a = 0; a < (int)Nk_[k].size(); ++a)
+               for (int b = 0; b < (int)Nk_[k].size(); ++b)
+                  S(Nk_[k][a], Nk_[k][b]) += Sk_[k](a, b);
+         if (!dS_.factorize(S)) return SINGULAR;
+         if (dS_.negative() > 0) ++stats_.dense_s_indef;
+         if (!dS_.usable()) ++stats_.dense_s_zero;
+         // Options::interface_inertia: δ_S on C until S̃ is PD
+         if (opt_.interface_inertia && (!dS_.usable() || dS_.negative() > 0)) {
+            const Ladder& L = ladder();
+            double ds = (last_ds_ > 0.0) ? std::max(1e-20, L.dec * last_ds_) : L.first;
+            for (;;) {
+               Mat Sd = S;
+               Sd.diagonal().array() += ds;
+               ++stats_.sfix_retries;
+               if (!dS_.factorize(Sd)) return SINGULAR;
+               if (dS_.usable() && dS_.negative() == 0) break;
+               ds *= (last_ds_ == 0.0 || 1e5 * last_ds_ < ds) ? L.inc_first : L.inc;
+               if (ds > 1e20) return WRONG_INERTIA;
+            }
+            last_ds_ = ds;
+            ++stats_.sfix_used;
+            stats_.sfix_max = std::max(stats_.sfix_max, ds);
+            for (int i = 0; i < dim_; ++i)
+               if (owner_[i] < 0) shift_[i] = ds;
+         }
+         if (!dS_.usable()) return SINGULAR;
+         n_neg_ += dS_.negative();
+         return OK;
+      }
 
       // ---- 4. peel cache + predicted In(S) (§6, §8) --------------------
       // Building the cache HERE rather than lazily at the first solve is what
@@ -1240,13 +1733,27 @@ public:
          if (std::getenv("DDS_DEBUG"))
             std::cerr << "[dds] peel cache failed, so In(S) cannot be predicted "
                          "→ SINGULAR\n";
-         return SINGULAR;
+         // Options::dual_start: the refusal means CG met non-positive
+         // curvature on S_ff, i.e. S is not SPD — a curvature (δ_w) problem,
+         // not a rank one. SINGULAR would make IPOPT reach for its GLOBAL δ_c
+         // first (and keep it), which is exactly what the per-block dual
+         // regularization is there to avoid; report the inertia as wrong.
+         return (opt_.dual_start >= 0 || opt_.block_inertia) ? WRONG_INERTIA : SINGULAR;
       }
       n_neg_ += t_neg_;                        // Haynsworth twice: (3.1) + (8.1)
       return OK;
    }
 
    int negative_eigenvalues() const { return n_neg_; }
+   // Options::block_inertia: IPOPT rejected the reported inertia (S̃ not PD)
+   void note_wrong_inertia() { if (opt_.block_inertia) ++stats_.binert_wrong; }
+   // How many structurally uncoupled unknowns border_reg filled in.  Zero
+   // when the option is off, and zero with corner promotion on (those
+   // rows left W_k for the border instead).
+   int border_reg_rows() const { return n_reg_; }
+   // The KKT indices border_reg fills in.  Must be set BEFORE
+   // set_structure; ignored unless Options::border_reg > 0.
+   void set_reg_rows(std::vector<int> r) { reg_rows_ = std::move(r); }
    const Stats& stats() const { return stats_; }
    void reset_stats() { stats_ = Stats(); }
 
@@ -1258,6 +1765,14 @@ public:
    //  must report SINGULAR.
    // --------------------------------------------------------------------
    bool solve(double* rhs) {
+      const auto t0 = std::chrono::steady_clock::now();
+      struct Tally {
+         double& acc; std::chrono::steady_clock::time_point t0;
+         ~Tally() {
+            acc += std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count();
+         }
+      } tally{stats_.t_solve, t0};
       const std::vector<double> b0(rhs, rhs + dim_);
       std::vector<double> x(b0), r(dim_), Ax(dim_), best;
       // The very first interface solve can genuinely fail (there is no direct
@@ -1379,6 +1894,70 @@ private:
          }
       }
 
+      // -- pass 2b: the border-regularization diagonal --------------------
+      // reg_rows_ holds the KKT indices of the rank-1 pair multipliers the
+      // driver would otherwise have promoted to the border (see
+      // Options::border_reg).  They are NOT structurally empty in W_k — the
+      // (h3x,h3y) pair keeps its (δ,θ) columns with determinant δ, and
+      // collapses only as δ → 0 — so no pattern test can find them and the
+      // caller has to say which they are.
+      //
+      // Sign = the inertia the unknown is supposed to carry, so that n_neg is
+      // unchanged with respect to the promoting route: these are constraint
+      // multipliers, hence negative directions.  An index already on the
+      // border, or out of range, is skipped: with promotion ON there is
+      // nothing here to do.
+      wreg_.assign(nsub_, {});
+      n_reg_ = 0;
+      if (opt_.border_reg > 0.0) {
+         for (int idx : reg_rows_) {
+            if (idx < 0 || idx >= dim_) continue;
+            const int k = owner_[idx];
+            if (k < 0) continue;                 // promoted after all
+            wreg_[k].push_back({lpos_[idx],
+                                (idx >= opt_.n_primal) ? -1.0 : 1.0});
+            ++n_reg_;
+         }
+      }
+
+      // Options::dual_start: the local positions of each block's multipliers,
+      // the only diagonal entries the per-block dual regularization touches.
+      wdual_.assign(nsub_, {});
+      eps_.assign(nsub_, 0.0);
+      last_eps_.assign(nsub_, 0.0);
+      if (opt_.dual_start >= 0)
+         for (int i = opt_.dual_start; i < dim_; ++i)
+            if (owner_[i] >= 0) wdual_[owner_[i]].push_back(lpos_[i]);
+      // Options::wk_reg_h / wk_reg_c: the primal and the non-linking multiplier
+      // positions of each block.
+      // Options::block_inertia uses the same positions for δ_H^k / δ_C^k and
+      // needs each block's multiplier count (its target negative inertia).
+      wkh_.assign(nsub_, {});
+      wkc_.assign(nsub_, {});
+      ndual_.assign(nsub_, 0);
+      wkr_.assign(nsub_, {});
+      dc_link_.assign(nsub_, 0);
+      dh_.assign(nsub_, 0.0);
+      dc_.assign(nsub_, 0.0);
+      last_dh_.assign(nsub_, 0.0);
+      tries_.assign(nsub_, 1);
+      shift_.clear();
+      const bool shift_h = opt_.wk_reg_h > 0.0 || opt_.block_inertia;
+      const bool shift_c = opt_.wk_reg_c > 0.0 || opt_.block_inertia;
+      for (int i = 0; i < dim_; ++i) {
+         if (owner_[i] < 0) continue;
+         if (i < opt_.wk_dual_start) {
+            if (shift_h) wkh_[owner_[i]].push_back(lpos_[i]);
+         } else {
+            ++ndual_[owner_[i]];
+            if (!(i >= opt_.link_begin && i < opt_.link_end)) {
+               if (shift_c) wkc_[owner_[i]].push_back(lpos_[i]);
+            } else if (opt_.block_inertia) {
+               wkr_[owner_[i]].push_back(lpos_[i]);
+            }
+         }
+      }
+
       // -- allocate the blocks, analyze the W_k, precompute the reaches --
       W_.assign(nsub_, SpMat());
       B_.assign(nsub_, SpMat());
@@ -1387,14 +1966,17 @@ private:
       // movable, so they cannot live in a vector directly
       ldlt_.clear();
       for (int k = 0; k < nsub_; ++k) ldlt_.emplace_back(new Ldlt());
+      dbk_.assign(nsub_, DenseBK());
+      zhits_.assign(nsub_, 0);
       reach_.assign(nsub_, {});
       for (int k = 0; k < nsub_; ++k) {
          const int pk = (int)Nk_[k].size();
          W_[k].resize(dimk_[k], dimk_[k]);           // lower triangle only
          B_[k].resize(pk, dimk_[k]);
-         fill_from_triplets(W_[k], wtrip_[k]);       // zeros: pattern only
+         fill_W(k);                                  // zeros: pattern only
          fill_from_triplets(B_[k], btrip_[k]);       // zeros: pattern for the reach
-         if (!ldlt_[k]->analyze(W_[k])) {
+         const bool analyzed = ldlt_[k]->analyze(W_[k]);
+         if (!analyzed) {
             std::ostringstream m;
             m << "W_" << k << " (dim " << dimk_[k] << "): " << ldlt_[k]->why();
             warn(Warn::LdltSymbolic, m.str());
@@ -1541,6 +2123,133 @@ private:
       M.makeCompressed();
    }
 
+   // W_k from its triplets PLUS the border-regularization diagonal.  Kept
+   // separate from fill_from_triplets because the added entries have no
+   // triplet index: their value is ±border_reg, not vals_[t].  setFromTriplets
+   // SUMS duplicates, so a diagonal IPOPT already supplied is added to rather
+   // than overwritten.  With border_reg == 0 the wreg_ lists are empty and
+   // this is byte-identical to the historical path.
+   // Largest and smallest |λ| of W_k (DDS_COND). Rayleigh quotients of the
+   // power / inverse iterations, stopped at 1e-8 relative change or 500 steps;
+   // a deterministic start vector so runs are comparable.
+   void extreme_eigs(int k, double& lmax, double& lmin, Vec* vmin = nullptr) const {
+      const int n = dimk_[k];
+      const auto Wsym = W_[k].selfadjointView<Eigen::Lower>();
+      Vec x(n), y(n);
+      for (int i = 0; i < n; ++i) x[i] = 1.0 + 0.1 * std::sin(1.0 + i);
+      x.normalize();
+      lmax = 0.0;
+      for (int it = 0; it < 500; ++it) {
+         y = Wsym * x;
+         const double rq = std::abs(x.dot(y));
+         const double ny = y.norm();
+         if (ny == 0.0) break;
+         x = y / ny;
+         if (it > 5 && std::abs(ny - lmax) <= 1e-8 * ny) { lmax = ny; break; }
+         lmax = ny;
+         (void)rq;
+      }
+      for (int i = 0; i < n; ++i) x[i] = 1.0 + 0.1 * std::cos(1.0 + i);
+      x.normalize();
+      double inv = 0.0;                          // estimate of 1/min|λ|
+      for (int it = 0; it < 500; ++it) {
+         y = x;
+         block_solve(k, y.data(), 1);           // y = W_k⁻¹ x
+         const double ny = y.norm();
+         if (!std::isfinite(ny) || ny == 0.0) { inv = std::numeric_limits<double>::infinity(); break; }
+         x = y / ny;
+         if (it > 5 && std::abs(ny - inv) <= 1e-8 * ny) { inv = ny; break; }
+         inv = ny;
+      }
+      lmin = (inv > 0.0) ? 1.0 / inv : 0.0;
+      if (vmin) *vmin = x;
+   }
+
+   void report_condition() {
+      static int n_fact = 0;
+      ++n_fact;
+      std::vector<double> kap(nsub_), lmx(nsub_), lmn(nsub_);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (int k = 0; k < nsub_; ++k) {
+         extreme_eigs(k, lmx[k], lmn[k]);
+         kap[k] = (lmn[k] > 0.0) ? lmx[k] / lmn[k] : std::numeric_limits<double>::infinity();
+      }
+      // DDS_COND=dense: referee the iterative estimates with a dense
+      // eigendecomposition of every W_k up to dimension 3000.
+      if (std::string(std::getenv("DDS_COND")) == "dense") {
+         double worst = 0.0;
+         for (int k = 0; k < nsub_; ++k) {
+            if (dimk_[k] > 3000) continue;
+            const SpMat full = W_[k].selfadjointView<Eigen::Lower>();
+            const Mat D = Mat(full);
+            const Vec ev = Eigen::SelfAdjointEigenSolver<Mat>(D, Eigen::EigenvaluesOnly)
+                               .eigenvalues().cwiseAbs();
+            const double kd = ev.maxCoeff() / ev.minCoeff();
+            worst = std::max(worst, std::abs(kap[k] - kd) / kd);
+         }
+         std::printf("[dds-cond] dense check: max relative error of the kappa "
+                     "estimates = %.2e\n", worst);
+      }
+      if (std::string(std::getenv("DDS_COND")) == "blocks") {
+         std::printf("[dds-condk] fact=%d", n_fact);
+         for (int k = 0; k < nsub_; ++k)
+            std::printf(" %.3e/%.1e", kap[k], (opt_.dual_start >= 0) ? eps_[k] : 0.0);
+         std::printf("\n");
+      }
+      std::vector<double> s = kap;
+      std::sort(s.begin(), s.end());
+      const int kworst = (int)(std::max_element(kap.begin(), kap.end()) - kap.begin());
+      // DDS_COND=vec: where the near-null direction of the worst block lives —
+      // the 12 largest components of its min-|λ| eigenvector, as GLOBAL KKT
+      // indices (decode them with the driver's layout).
+      if (std::string(std::getenv("DDS_COND")) == "vec" && n_fact <= 3) {
+         double a, b;
+         Vec v;
+         extreme_eigs(kworst, a, b, &v);
+         std::vector<int> glob(dimk_[kworst], -1);
+         for (int i = 0; i < dim_; ++i)
+            if (owner_[i] == kworst) glob[lpos_[i]] = i;
+         std::vector<int> idx(v.size());
+         for (int i = 0; i < (int)v.size(); ++i) idx[i] = i;
+         std::partial_sort(idx.begin(), idx.begin() + std::min<int>(12, (int)idx.size()),
+                           idx.end(), [&](int p, int q) { return std::abs(v[p]) > std::abs(v[q]); });
+         std::printf("[dds-cond] fact=%d W_%d min-|lam| eigenvector, largest components "
+                     "(global KKT index:value):", n_fact, kworst);
+         for (int j = 0; j < std::min<int>(12, (int)idx.size()); ++j)
+            std::printf(" %d:%.3f", glob[idx[j]], v[idx[j]]);
+         std::printf("\n");
+      }
+      std::printf("[dds-cond] fact=%d %s nsub=%d dim(W_k) in [%d,%d]  kappa max=%.3e "
+                  "median=%.3e min=%.3e  worst W_%d: |lam|max=%.3e |lam|min=%.3e\n",
+                  n_fact, ipopt_phase::restoration() ? "resto  " : "regular", nsub_,
+                  *std::min_element(dimk_.begin(), dimk_.end()),
+                  *std::max_element(dimk_.begin(), dimk_.end()),
+                  s.back(), s[s.size() / 2], s.front(), kworst, lmx[kworst], lmn[kworst]);
+      std::fflush(stdout);
+   }
+
+   void fill_W(int k) {
+      std::vector<Trip> t;
+      t.reserve(wtrip_[k].size() + wreg_[k].size() + wdual_[k].size() +
+                wkh_[k].size() + wkc_[k].size() + wkr_[k].size());
+      for (const auto& e : wtrip_[k]) t.emplace_back(e.r, e.c, vals_[e.t]);
+      // Options::wk_reg_h / wk_reg_c: the fixed W_k-only shifts (empty = off)
+      // (+ Options::block_inertia: this factorization's δ_H^k / δ_C^k)
+      for (int pos : wkh_[k]) t.emplace_back(pos, pos, opt_.wk_reg_h + dh_[k]);
+      for (int pos : wkc_[k]) t.emplace_back(pos, pos, -(opt_.wk_reg_c + dc_[k]));
+      for (int pos : wkr_[k]) t.emplace_back(pos, pos, dc_link_[k] ? -dc_[k] : 0.0);
+      // Options::dual_start: −ε_k on the dual diagonal. Always present, as an
+      // explicit zero when ε_k = 0, so the pattern the symbolic analysis saw
+      // never changes.
+      for (int pos : wdual_[k]) t.emplace_back(pos, pos, -eps_[k]);
+      for (const auto& g : wreg_[k])
+         t.emplace_back(g.first, g.first, g.second * opt_.border_reg);
+      W_[k].setFromTriplets(t.begin(), t.end());
+      W_[k].makeCompressed();
+   }
+
    // =====================================================================
    //  The solve  (§2 recursion, §6 peel, §7 CG, §9 refinement)
    // =====================================================================
@@ -1549,12 +2258,111 @@ private:
    // This is the ONLY place the true matrix is applied, and it is what the
    // iterative refinement measures its residual against — so refinement checks
    // the decomposition, not just the arithmetic inside it (§9).
+   // The matrix the refinement of solve() measures against. With
+   // Options::drop_corner active (cscale_ = 0) the border–border entries are
+   // left out, so the refinement converges to the same modified system the
+   // arrowhead solves instead of pulling the step back to IPOPT's δ_w·I corner.
    void matvec(const double* x, double* y) const {
       std::fill(y, y + dim_, 0.0);
       for (int t = 0; t < nnz_; ++t) {
          const int i = irow_[t], j = jcol_[t];
-         y[i] += vals_[t] * x[j];
-         if (i != j) y[j] += vals_[t] * x[i];
+         const double v = (owner_[i] < 0 && owner_[j] < 0) ? cscale_ * vals_[t]
+                                                           : vals_[t];
+         y[i] += v * x[j];
+         if (i != j) y[j] += v * x[i];
+      }
+      // Options::block_inertia: the block shifts are part of the matrix solved
+      if (!shift_.empty())
+         for (int i = 0; i < dim_; ++i) y[i] += shift_[i] * x[i];
+   }
+
+   // One W_k factorization through whichever block solver is configured.
+   // False = unusable (sparse: LDLᵀ breakdown; dense: a numerically zero
+   // pivot — the matrix is singular to working precision).
+   bool factor_block(int k) {
+      if (!opt_.dense_blocks) return ldlt_[k]->factorize(W_[k]);
+      const bool good = dbk_[k].factorize(Mat(W_[k])) && dbk_[k].usable();
+      if (!good) ++zhits_[k];
+      return good;
+   }
+   int block_neg(int k) const {
+      return opt_.dense_blocks ? dbk_[k].negative() : ldlt_[k]->negative_eigenvalues();
+   }
+   void block_solve(int k, double* b, int nrhs) const {
+      if (opt_.dense_blocks) dbk_[k].solve(b, nrhs);
+      else ldlt_[k]->solve(b, dimk_[k], nrhs);
+   }
+
+   // Options::block_inertia: factorize W_k with its own inertia correction
+   // (see the option). Leaves dh_[k], dc_[k], tries_[k] and the factorization
+   // of the accepted W̃_k; false = no shift on the ladder gave the inertia.
+   bool factorize_block_inertia(int k) {
+      const Ladder& L = ladder();
+      const double kDhFirst = L.first, kDhMin = 1e-20, kDhMax = 1e20;
+      const double kIncFirst = L.inc_first, kInc = L.inc, kDec = L.dec;
+      const double mu = ipopt_phase::mu() > 0.0 ? ipopt_phase::mu() : 0.1;
+      const double dc_val = 1e-8 * std::pow(mu, 0.25);
+      dh_[k] = 0.0;
+      dc_[k] = 0.0;
+      dc_link_[k] = 0;
+      tries_[k] = 0;
+      for (;;) {
+         fill_W(k);
+         const bool good = factor_block(k);
+         ++tries_[k];
+         const int neg = good ? block_neg(k) : -1;
+         if (good && neg == ndual_[k]) break;
+         if (!good || neg < ndual_[k]) {
+            // a zero pivot or too few negative directions: rank, not
+            // curvature — δ_C^k first, once; δ_H^k cannot add negatives.
+            // Lueg's ρρ = 0 is an exact zero pivot whenever the (unpivoted)
+            // ordering eliminates a ρ row before its copy y, which no primal
+            // shift repairs: if δ_C^k on λ_k alone is not enough, put it on ρ_k
+            // too (dc_link_) — the only departure from Lueg's block form.
+            // (Forcing y right before ρ in the ordering was tried, 2026-10-04:
+            // worse — d_y is often 0 or tiny there; the pair needs the 2×2
+            // pivot [d_y 1; 1 0], which an unpivoted LDLᵀ cannot take.)
+            if (dc_[k] == 0.0) { dc_[k] = dc_val; continue; }
+            if (!dc_link_[k] && !wkr_[k].empty()) { dc_link_[k] = 1; continue; }
+            if (good) return false;
+         }
+         if (dh_[k] == 0.0)
+            dh_[k] = (last_dh_[k] == 0.0) ? kDhFirst : std::max(kDhMin, kDec * last_dh_[k]);
+         else
+            dh_[k] *= (last_dh_[k] == 0.0 || 1e5 * last_dh_[k] < dh_[k]) ? kIncFirst : kInc;
+         if (dh_[k] > kDhMax) return false;
+      }
+      if (dh_[k] > 0.0) last_dh_[k] = dh_[k];
+      return true;
+   }
+
+   // The δ_H^k / δ_S ladder: IPOPT's defaults (first_hessian_perturbation,
+   // perturb_inc_fact_first, perturb_inc_fact, perturb_dec_fact), overridable
+   // for exploration by DDS_BI_FIRST / DDS_BI_INCFIRST / DDS_BI_INC / DDS_BI_DEC.
+   struct Ladder { double first, inc_first, inc, dec; };
+   static const Ladder& ladder() {
+      static const Ladder L = [] {
+         auto env = [](const char* n, double d) {
+            const char* v = std::getenv(n);
+            return v ? std::atof(v) : d;
+         };
+         return Ladder{env("DDS_BI_FIRST", 1e-4), env("DDS_BI_INCFIRST", 100.0),
+                       env("DDS_BI_INC", 8.0), env("DDS_BI_DEC", 1.0 / 3.0)};
+      }();
+      return L;
+   }
+
+   // Options::block_inertia: the per-unknown shift of the matrix solved
+   void update_shift() {
+      shift_.assign(dim_, 0.0);
+      for (int i = 0; i < dim_; ++i) {
+         const int k = owner_[i];
+         if (k < 0) continue;
+         if (i < opt_.wk_dual_start) shift_[i] = opt_.wk_reg_h + dh_[k];
+         else if (!(i >= opt_.link_begin && i < opt_.link_end))
+            shift_[i] = -(opt_.wk_reg_c + dc_[k]);
+         else if (dc_link_[k])
+            shift_[i] = -dc_[k];
       }
    }
 
@@ -1579,7 +2387,7 @@ private:
 #endif
       for (int k = 0; k < nsub_; ++k) {
          wk[k] = rk[k];
-         ldlt_[k]->solve(wk[k].data(), dimk_[k], 1);
+         block_solve(k, wk[k].data(), 1);
          if (!Nk_[k].empty()) contrib[k].noalias() = B_[k] * wk[k];
       }
       for (int k = 0; k < nsub_; ++k)
@@ -1603,7 +2411,7 @@ private:
             rk[k].noalias() -= B_[k].transpose() * dyk;
          }
          wk[k] = rk[k];
-         ldlt_[k]->solve(wk[k].data(), dimk_[k], 1);
+         block_solve(k, wk[k].data(), 1);
       }
 
       // -- gather the pieces back into the KKT ordering --
@@ -1628,6 +2436,67 @@ private:
    // one-reduction communication pattern; only the local cost model differs.
    // Their per-iteration-back-solve regime is what dd_solver.hpp's
    // APPLY_MATFREE measures.
+   // EXPERIMENT (Options::sff_direct): S_ff assembled as a sparse matrix —
+   // C restricted to the kept positions plus every S_k block scattered onto
+   // them — and factorized by Eigen's SimplicialLDLT.  Same unpivoted LDLᵀ
+   // caveat as §4; S_ff is meant to be SPD (that is what the peel is for),
+   // and when it is, the factorization is safe and D > 0 confirms it.  A
+   // non-positive pivot is the direct-solve analogue of CG's pAp <= 0 and is
+   // refused the same way, so the §8 prediction keeps its guarantees.
+   bool factorize_Sff_direct() {
+      const int nf = (int)kept_.size();
+      std::vector<Trip> t;
+      {
+         size_t est = ctrip_.size() * 2;
+         for (int k = 0; k < nsub_; ++k) est += Nk_[k].size() * Nk_[k].size();
+         t.reserve(est);
+      }
+      for (const auto& e : ctrip_) {
+         const int i = keptpos_[e.r], j = keptpos_[e.c];
+         if (i < 0 || j < 0) continue;
+         const double v = cscale_ * vals_[e.t];      // Options::drop_corner
+         t.emplace_back(i, j, v);
+         if (i != j) t.emplace_back(j, i, v);
+      }
+      for (int k = 0; k < nsub_; ++k) {
+         const int pk = (int)Nk_[k].size();
+         if (pk == 0) continue;
+         const Mat& S = Sk_[k];
+         for (int a = 0; a < pk; ++a) {
+            const int i = keptpos_[Nk_[k][a]];
+            if (i < 0) continue;
+            for (int b = 0; b < pk; ++b) {
+               const int j = keptpos_[Nk_[k][b]];
+               if (j >= 0) t.emplace_back(i, j, S(a, b));
+            }
+         }
+      }
+      Sff_.resize(nf, nf);
+      Sff_.setFromTriplets(t.begin(), t.end());    // duplicates are summed
+      Sff_.makeCompressed();
+      if (!sff_analyzed_) { sff_ldlt_.analyzePattern(Sff_); sff_analyzed_ = true; }
+      sff_ldlt_.factorize(Sff_);
+      if (sff_ldlt_.info() != Eigen::Success) {
+         warn(Warn::CgPeelColumn,
+              "sparse LDLT of the assembled S_ff did not succeed; no peel "
+              "cache ⇒ no predicted inertia ⇒ SINGULAR");
+         return false;
+      }
+      const Vec D = sff_ldlt_.vectorD();
+      int nonpos = 0;
+      for (int i = 0; i < nf; ++i) if (!(D[i] > 0.0)) ++nonpos;
+      if (nonpos) {
+         ++stats_.indef_before;
+         std::ostringstream m;
+         m << nonpos << " of " << nf << " pivots of the S_ff LDLT are not "
+              "positive: S_ff is not SPD here (the direct analogue of CG's "
+              "pAp <= 0); no peel cache ⇒ no predicted inertia ⇒ SINGULAR";
+         warn(Warn::CgPeelColumn, m.str());
+         return false;
+      }
+      return true;
+   }
+
    void apply_S(const Vec& y, Vec& out) const {
       out.noalias() = C_ * y;
       for (int k = 0; k < nsub_; ++k) {
@@ -1658,6 +2527,11 @@ private:
    // taken anyway and §9's refinement judges it against the true triplets;
    // only a solve that produced no iterate at all is reported as failed.
    bool solve_interface(const Vec& ry, Vec& dy) {
+      if (opt_.dense_blocks) {
+         dy = ry;
+         dS_.solve(dy.data(), 1);
+         return dy.allFinite();
+      }
       if (interface_cg(ry, dy)) return true;
       if (dy.size() == p_ && dy.allFinite()) return true;
       warn(Warn::CgUnusable,
@@ -1679,6 +2553,14 @@ private:
       peel_valid_ = true;
       peel_ok_ = false;
       ++stats_.cache_builds;
+      const auto t0 = std::chrono::steady_clock::now();
+      struct Tally {
+         double& acc; std::chrono::steady_clock::time_point t0;
+         ~Tally() {
+            acc += std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t0).count();
+         }
+      } tally{stats_.t_peel, t0};
       const int nf = (int)kept_.size(), nP = (int)peel_.size();
 
       // The ASd preconditioner (§7).  It needs diag(S) on the kept positions —
@@ -1723,6 +2605,11 @@ private:
                  "off for this factorization (CG falls back to one-level ASd)");
       }
 
+      // EXPERIMENT (Options::sff_direct): assemble and factorize S_ff.  Done
+      // before the nP == 0 early return because mode 2 needs the
+      // factorization for the interface solve even with nothing peeled.
+      if (opt_.sff_direct > 0 && !factorize_Sff_direct()) return false;
+
       t_neg_ = 0;
       if (nP == 0) { peel_ok_ = true; return true; }   // In(T) of a 0×0 block
 
@@ -1752,26 +2639,87 @@ private:
       const TwoLevel P2{&pc_, this};
       Z_.resize(nf, nP);
       if (Zwarm_.rows() != nf || Zwarm_.cols() != nP) Zwarm_ = Mat::Zero(nf, nP);
+      // THE loop worth threading.  The columns are independent — one operator,
+      // one preconditioner, a different right-hand side each — and this loop is
+      // ~90% of a factorization against 0.2% in the W_k loop of factorize(),
+      // which is why OMP=1 alone buys nothing measurable (1.00 cores at every
+      // OMP_NUM_THREADS before this was threaded).
+      //
+      // Thread safety: apply_Sff_into, apply_S and Precond::apply are const,
+      // write only their output argument and keep every scratch vector on the
+      // stack; distinct j touch distinct columns of a column-major Z_.  What is
+      // NOT safe is the shared state the serial body used freely — stats_, the
+      // Warnings singleton behind warn(), and the early return — so all three
+      // move to the serial tail below.
+      //
+      // DETERMINISM.  The serial loop returned at the FIRST bad column, so
+      // columns after it were never solved and never banked a warm start.  An
+      // OpenMP loop cannot break, and a "skip once someone failed" flag would
+      // make which columns bank a warm start depend on thread timing — i.e.
+      // make the whole run nondeterministic.  So every column is solved, and
+      // the tail then reproduces the serial semantics exactly: warm starts are
+      // banked only up to the first failure, and the counters see only the
+      // columns the serial loop would have seen.  Identical state out, at the
+      // cost of work that is discarded on a failing build.
+      std::vector<long> it_j(nP, 0);
+      std::vector<char> indef_j(nP, 0), bad_j(nP, 0), fin_j(nP, 1);
+      std::vector<double> rel_j(nP, 1.0);
+      if (opt_.sff_direct > 0) {
+         // One multi-RHS back-solve through the sparse LDLᵀ instead of nP
+         // CG solves.  Judged by the same per-column residual bar as CG.
+         Z_ = sff_ldlt_.solve(SfP_);
+         const Mat R = Sff_ * Z_ - SfP_;
+         for (int j = 0; j < nP; ++j) {
+            rel_j[j] = R.col(j).norm() / std::max(SfP_.col(j).norm(), 1e-300);
+            fin_j[j] = Z_.col(j).allFinite() ? 1 : 0;
+            bad_j[j] = (!(rel_j[j] < 1e-2) || !fin_j[j]) ? 1 : 0;
+         }
+      } else {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
       for (int j = 0; j < nP; ++j) {
          Vec z;
          const Vec w0 = Zwarm_.col(j);
          const CgResult r = cg_solve(applyA, P2, Vec(SfP_.col(j)), z,
                                      opt_.peel_cg_tol, opt_.cg_maxit, &w0);
-         stats_.iters += r.iters;
-         if (r.indefinite) ++stats_.indef_before;
-         if (!(r.rel < 1e-2) || !z.allFinite()) {
-            std::ostringstream m;
-            m << "column " << j << " of " << nP << " stopped at rel=" << r.rel
-              << " after " << r.iters << " iterations"
-              << (r.indefinite ? " (pAp <= 0: S_ff is PROVED indefinite here)" : "")
-              << (z.allFinite() ? "" : " (non-finite iterate)")
-              << "; no peel cache ⇒ no predicted inertia ⇒ SINGULAR";
-            warn(Warn::CgPeelColumn, m.str());
-            return false;                       // peel_ok_ stays false
-         }
-         Z_.col(j) = z;
-         Zwarm_.col(j) = z;                    // the next build's starting point
+         it_j[j] = r.iters;
+         indef_j[j] = r.indefinite ? 1 : 0;
+         rel_j[j] = r.rel;
+         fin_j[j] = z.allFinite() ? 1 : 0;
+         // A breakdown (pAp <= 0) fails the column too: S_ff is then not SPD,
+         // so the §8 count #neg(T) would not be #neg(S).  Refuse, let IPOPT
+         // raise δ_w, and predict on the next attempt instead.
+         bad_j[j] = (!(r.rel < 1e-2) || !z.allFinite() || indef_j[j]) ? 1 : 0;
+         if (!bad_j[j]) Z_.col(j) = z;
       }
+      }   // sff_direct == 0
+
+      // -- serial tail: the shared state, in the serial loop's order ---------
+      int first_bad = nP;
+      for (int j = 0; j < nP; ++j) if (bad_j[j]) { first_bad = j; break; }
+      const int seen = (first_bad < nP) ? first_bad + 1 : nP;
+      for (int j = 0; j < seen; ++j) {
+         stats_.iters += it_j[j];
+         if (indef_j[j]) ++stats_.indef_before;
+      }
+      // Bank the warm starts the serial loop would have banked BEFORE it
+      // returned: every column strictly before the first bad one.  Missing
+      // this throws away the warm start on exactly the builds that most need
+      // it next time — the ones IPOPT is about to retry with a larger δ_w.
+      for (int j = 0; j < first_bad; ++j) Zwarm_.col(j) = Z_.col(j);
+      if (first_bad < nP) {
+         const int j = first_bad;
+         std::ostringstream m;
+         m << "column " << j << " of " << nP << " stopped at rel=" << rel_j[j]
+           << " after " << it_j[j] << " iterations"
+           << (indef_j[j] ? " (pAp <= 0: S_ff is PROVED indefinite here)" : "")
+           << (fin_j[j] ? "" : " (non-finite iterate)")
+           << "; no peel cache ⇒ no predicted inertia ⇒ SINGULAR";
+         warn(Warn::CgPeelColumn, m.str());
+         return false;                          // peel_ok_ stays false
+      }
+      // (the success path banked every column just above: first_bad == nP)
       const Mat T = SPP - SfP_.transpose() * Z_;
       if (!T.allFinite()) return false;
       Tlu_.compute(T);
@@ -1836,9 +2784,18 @@ private:
       for (int a = 0; a < nf; ++a) rf[a] = ry[kept_[a]];
 
       Vec g;                                    // g = S_ff⁻¹ r_f
-      auto applyA = [this](const Vec& v, Vec& out) { apply_Sff_into(v, out); };
-      const TwoLevel P2{&pc_, this};
-      const CgResult r = cg_solve(applyA, P2, rf, g, opt_.cg_tol, opt_.cg_maxit);
+      CgResult r;
+      if (opt_.sff_direct >= 2) {
+         // EXPERIMENT: the sparse LDLᵀ built in build_peel_cache.  Its
+         // residual is reported through the same `rel` CG would report.
+         g = sff_ldlt_.solve(rf);
+         r.rel = (Sff_ * g - rf).norm() / std::max(rf.norm(), 1e-300);
+         r.iters = 0;
+      } else {
+         auto applyA = [this](const Vec& v, Vec& out) { apply_Sff_into(v, out); };
+         const TwoLevel P2{&pc_, this};
+         r = cg_solve(applyA, P2, rf, g, opt_.cg_tol, opt_.cg_maxit);
+      }
       const double rel = r.rel;
       stats_.iters += r.iters;
       // A pAp <= 0 event is evidence against the §8 premise that S_ff is SPD.
@@ -1905,12 +2862,35 @@ private:
 
    // ---- routed triplets (pattern only) ----------------------------------
    std::vector<std::vector<Entry>> wtrip_, btrip_;
+   // (local index, sign) per block: the structurally uncoupled unknowns
+   // whose diagonal border_reg fills in.  Empty unless border_reg > 0.
+   std::vector<std::vector<std::pair<int, double>>> wreg_;
+   std::vector<int> reg_rows_;             // KKT indices to regularize
+   int n_reg_ = 0;                         // how many landed in a block
    std::vector<Entry> ctrip_;
+   double cscale_ = 1.0;                   // 0 when Options::drop_corner zeroed C
+   // Options::dual_start: per-block dual positions, current and last good ε_k
+   std::vector<std::vector<int>> wdual_;
+   std::vector<double> eps_, last_eps_;
+   // Options::wk_reg_h / wk_reg_c: local positions carrying +δ_H^W / −δ_C^W
+   std::vector<std::vector<int>> wkh_, wkc_;
+   // Options::block_inertia: per block target #negatives, current δ_H^k /
+   // δ_C^k, last accepted δ_H^k > 0, LDLᵀ attempts; shift_ = matrix solved − A
+   // wkr_ = linking-multiplier positions, shifted only when dc_link_[k]
+   std::vector<int> ndual_, tries_;
+   std::vector<std::vector<int>> wkr_;
+   std::vector<char> dc_link_;
+   std::vector<double> dh_, dc_, last_dh_, shift_;
+   static constexpr double kRegMin = 1e-10, kRegMax = 1e-4;
 
    // ---- blocks and factorizations (per Newton step) ---------------------
    std::vector<SpMat> W_, B_;
    std::vector<Mat> Sk_;                   // local Schur complements (§5)
    std::vector<std::unique_ptr<Ldlt>> ldlt_;   // one per subdomain
+   std::vector<DenseBK> dbk_;                  // Options::dense_blocks: one per subdomain
+   DenseBK dS_;                                // Options::dense_blocks: S̃
+   std::vector<int> zhits_;                    // per block, this factorization
+   double last_ds_ = 0.0;                      // Options::interface_inertia
    SpMat C_;                               // the corner block
    Vec diagS_;                             // diag(S), assembled without S
    int n_neg_ = 0;                         // the (8.3) total
@@ -1950,6 +2930,10 @@ private:
       }
    };
    Mat SfP_, Z_;                           // S_fP and Z = S_ff⁻¹ S_fP
+   // EXPERIMENT (Options::sff_direct): the assembled S_ff and its sparse LDLᵀ.
+   SpMat Sff_;
+   Eigen::SimplicialLDLT<SpMat> sff_ldlt_;
+   bool sff_analyzed_ = false;
    Mat Zwarm_;                             // last accepted Z columns (warm starts)
    Eigen::PartialPivLU<Mat> Tlu_;          // the dense peel complement T, factorized
    bool peel_valid_ = false, peel_ok_ = false;
@@ -1986,10 +2970,16 @@ public:
       cfg_nsub() = nsub;
    }
    static void config_options(const ddsimple::Arrowhead::Options& o) { cfg_opt() = o; }
+   // The rank-1 pair multipliers --border-reg regularizes in place.
+   static void config_reg_rows(std::vector<int> r) { cfg_reg_rows() = std::move(r); }
    static std::vector<int>& cfg_owner() { static std::vector<int> v; return v; }
    static int& cfg_nsub() { static int v = 1; return v; }
    static ddsimple::Arrowhead::Options& cfg_opt() {
       static ddsimple::Arrowhead::Options v;
+      return v;
+   }
+   static std::vector<int>& cfg_reg_rows() {
+      static std::vector<int> v;
       return v;
    }
    // Interface telemetry for the whole run.  Static because one solver object
@@ -2017,6 +3007,7 @@ public:
          irow[t] = ia[t] - 1;
          jcol[t] = ja[t] - 1;
       }
+      a_.set_reg_rows(cfg_reg_rows());
       if (!a_.set_structure((int)dim, std::move(irow), std::move(jcol),
                             cfg_owner(), cfg_nsub(), cfg_opt()))
          return SYMSOLVER_FATAL_ERROR;
@@ -2028,14 +3019,25 @@ public:
    ESymSolverStatus MultiSolve(bool new_matrix, const Index*, const Index*,
                                Index nrhs, Number* rhs_vals, bool check_NegEVals,
                                Index numberOfNegEVals) override {
-      if (new_matrix && a_.factorize() != ddsimple::Arrowhead::OK) {
-         stats() = a_.stats();
-         return SYMSOLVER_SINGULAR;              // IPOPT answers by raising δ_w (§1)
+      if (new_matrix) {
+         const auto st = a_.factorize();
+         if (st != ddsimple::Arrowhead::OK) {
+            stats() = a_.stats();
+            // --block-dual-reg: a refused inertia prediction is a curvature
+            // problem; let IPOPT answer it with δ_w alone (wrong inertia).
+            if (st == ddsimple::Arrowhead::WRONG_INERTIA && check_NegEVals) {
+               a_.note_wrong_inertia();
+               stats() = a_.stats();
+               return SYMSOLVER_WRONG_INERTIA;
+            }
+            return SYMSOLVER_SINGULAR;           // IPOPT answers by raising δ_w (§1)
+         }
       }
       // The inertia is not the one IPOPT wants: everything factorized fine,
       // the curvature is simply wrong, and δ_w is the correct cure.  This is
       // IPOPT working as designed, not a failure of the decomposition.
       if (check_NegEVals && a_.negative_eigenvalues() != numberOfNegEVals) {
+         a_.note_wrong_inertia();
          stats() = a_.stats();
          return SYMSOLVER_WRONG_INERTIA;
       }

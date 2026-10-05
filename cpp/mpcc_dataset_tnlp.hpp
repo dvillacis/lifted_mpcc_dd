@@ -123,10 +123,10 @@ public:
          for (int b = 0; b < nc; ++b) {
             const int cell = a * nc + b;
             if (!averaged) {
-               Kx_.push_back({cell, node(a + 1, b), -1.0});
-               Kx_.push_back({cell, node(a + 1, b + 1), 1.0});
-               Ky_.push_back({cell, node(a, b + 1), -1.0});
-               Ky_.push_back({cell, node(a + 1, b + 1), 1.0});
+               Kx_.push_back({cell, node(a, b), -1.0});
+               Kx_.push_back({cell, node(a, b + 1), 1.0});
+               Ky_.push_back({cell, node(a, b), -1.0});
+               Ky_.push_back({cell, node(a + 1, b), 1.0});
             } else {
                Kx_.push_back({cell, node(a, b), -0.5});
                Kx_.push_back({cell, node(a, b + 1), 0.5});

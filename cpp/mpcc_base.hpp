@@ -21,10 +21,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
 #include "IpTNLP.hpp"
+#include "ipopt_phase.hpp"
 // For reading the CURRENT iterate inside intermediate_callback (the documented
 // IPOPT recipe: ip_cq → OrigIpoptNLP → TNLPAdapter → ResortX). Internal
 // headers, same dependency class as dd_solver.hpp's AlgorithmBuilder use.
@@ -193,6 +195,7 @@ public:
                               Number, Number, Number, Index,
                               const IpoptData* ip_data,
                               IpoptCalculatedQuantities* ip_cq) override {
+      ipopt_phase::mu() = mu;
       // The Scholtes level gate (see the member comment).  Ahead of the
       // μ-coupled bookkeeping below, because it serves both continuations.
       if (level_tol_scale_ > 0.0 && mode == RegularMode && iter > 0 &&
@@ -210,6 +213,19 @@ public:
             }
          } else {
             level_gate_seen_ = 0;
+         }
+      }
+      // DDS_VERIFY_WK: record the iterate the next KKT system is built at.
+      if (std::getenv("DDS_VERIFY_WK") && mode != RegularMode)
+         ipopt_phase::iterate().fresh = false;
+      if (std::getenv("DDS_VERIFY_WK") && mode == RegularMode && ip_data && ip_cq) {
+         ipopt_phase::Iterate& it = ipopt_phase::iterate();
+         it.x.assign(n, 0.0); it.z_L.assign(n, 0.0); it.z_U.assign(n, 0.0);
+         it.lambda.assign(mcon, 0.0);
+         if (get_curr_iterate(ip_data, ip_cq, false, n, it.x.data(), it.z_L.data(),
+                              it.z_U.data(), mcon, nullptr, it.lambda.data())) {
+            it.iter = iter;
+            it.fresh = true;
          }
       }
       if (t_mu_scale_ <= 0.0) return true;

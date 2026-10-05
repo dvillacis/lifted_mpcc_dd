@@ -15,8 +15,9 @@
 // The 2D sibling of dd_solve_1d.cpp; see that file for the design. Two things are
 // 2D-specific:
 //
-//   * **the anchor rule** — node (i,j) belongs to the tile of cell (i−1,j−1),
-//     clamped: the cell the node anchors under the one-sided stencil. Measured in
+//   * **the anchor rule** — node (i,j) belongs to the tile of cell (i,j),
+//     clamped: the cell the node anchors under the one-sided (forward-difference)
+//     stencil (cell (i−1,j−1) before the 2026-10-02 stencil switch). Measured in
 //     Python, it is what keeps only ONE dual component crossing each cut
 //     (qx at vertical cuts, qy at horizontal), and it cuts the interface from
 //     p=90 to p=60 at N=16 k=2 (538 → 364 at N=32 k=4).
@@ -54,6 +55,7 @@
 // on the same MPCC, selected by --formulation consensus. Same solutions; a
 // different KKT sparsity in which the border is purely primal.
 #include "mpcc_2d_consensus_tnlp.hpp"
+#include "verify_wk.hpp"
 // struct Partition2D — the tile/strip cell ownership and the anchor rule, now
 // shared with dd_solve_dataset.cpp (which partitions each training pair with it).
 #include "partition_2d.hpp"
@@ -67,10 +69,15 @@ using namespace Ipopt;
 // goes to tile 0 — its slack and multiplier are dual directions, and bordering them
 // would make S indefinite by construction and defeat the δ_w loop). Only primal
 // columns can be complicating, and which ones is read off the Jacobian sparsity.
+// rank1_rows_out, when non-null, receives the KKT indices of the rank-1 pair
+// multipliers this routine WOULD promote, whether or not promote_corners is on.
+// That is what --border-reg regularizes in place instead of bordering (see
+// Arrowhead::Options::border_reg): same detection, same rows, other cure.
 static std::vector<int> kkt_owner(const Mpcc2DTNLP& p, const Partition2D& part,
                                   bool promote_corners = true,
                                   std::vector<int>* col_owner_out = nullptr,
-                                  int* n_promoted = nullptr) {
+                                  int* n_promoted = nullptr,
+                                  std::vector<int>* rank1_rows_out = nullptr) {
    const int m_u = p.m_u, m_q = p.m_q;
    std::vector<int> row_owner(p.mcon, 0), col_owner(p.n, 0);
 
@@ -132,7 +139,7 @@ static std::vector<int> kkt_owner(const Mpcc2DTNLP& p, const Partition2D& part,
    // 2 border entries per corner each; blocks keep full rank with NO artificial
    // shift and the Haynsworth inertia stays exact.
    int promoted = 0;
-   if (promote_corners) {
+   if (promote_corners || rank1_rows_out) {
       const int lam_c0 = p.n + p.n_ineq;         // start of the λ_c block
       // which u columns each cell's h2x/h2y rows touch — read off the Jacobian
       // structure, so it is stencil-agnostic like the border rule itself
@@ -146,18 +153,30 @@ static std::vector<int> kkt_owner(const Mpcc2DTNLP& p, const Partition2D& part,
             if (e >= 0) { ++u_cols[e]; if (col_owner[c] < 0) ++u_bord[e]; }
          }
       }
+      // The pair (h3x,h3y) restricted to W_k keeps only its (δ,θ) columns,
+      //     [ −cosθ   δ sinθ ]
+      //     [ −sinθ  −δ cosθ ],   det = δ,
+      // so it collapses to rank 1 exactly as δ → 0; (h2x,h2y) does the same in
+      // (r,θ) with det = r.  The deficiency is NUMERICAL, not structural — the
+      // rows are fully populated — which is why a pattern test cannot find it
+      // and the detection has to be this geometric one.
+      auto mark = [&](int idx) {
+         if (promote_corners) owner[idx] = -1;
+         if (rank1_rows_out) rank1_rows_out->push_back(idx);
+      };
       for (int e = 0; e < m_q; ++e) {
          if (col_owner[p.oqx + e] < 0 && col_owner[p.oqy + e] < 0) {
-            owner[lam_c0 + p.rh3x + e] = -1;     // δ≈0 rank-1 pair
-            owner[lam_c0 + p.rh3y + e] = -1;
+            mark(lam_c0 + p.rh3x + e);           // δ≈0 rank-1 pair
+            mark(lam_c0 + p.rh3y + e);
             promoted += 2;
          }
          if (u_cols[e] > 0 && u_bord[e] == u_cols[e]) {
-            owner[lam_c0 + p.rh2x + e] = -1;     // r≈0 rank-1 pair
-            owner[lam_c0 + p.rh2y + e] = -1;
+            mark(lam_c0 + p.rh2x + e);           // r≈0 rank-1 pair
+            mark(lam_c0 + p.rh2y + e);
             promoted += 2;
          }
       }
+      if (!promote_corners) promoted = 0;
    }
    if (col_owner_out) *col_owner_out = col_owner;
    if (n_promoted) *n_promoted = promoted;
@@ -235,6 +254,7 @@ static void save_solution_npz(const std::string& fn, const Mpcc2DTNLP& p,
    w.scalar_d("t_last", t_last);
    w.scalar_i("weight_exp", p.weight_exp ? 1 : 0);
    w.scalar_i("averaged", p.averaged ? 1 : 0);
+   w.scalar_i("collocated", p.collocated ? 1 : 0);   // cell arrays are N×N then
    w.scalar_i("consensus", cons ? 1 : 0);
 
    // -- the instance (so the file is self-contained) ---------------------
@@ -366,6 +386,16 @@ int main(int argc, char** argv) {
    // Peel-cache columns do not need the interface solve's 1e-10; 1e-7 is
    // the measured knee (see Arrowhead::Options::peel_cg_tol).
    double peel_cg_tol = 1e-7;
+   // Regularize the structurally empty W_k diagonals instead of promoting the
+   // corner duals to the border (Arrowhead::Options::border_reg).  Pair it
+   // with --no-promote-corners; 0 = off.
+   double border_reg = 0.0;
+   std::vector<int> rank1_rows;   // filled by kkt_owner when --border-reg is on
+   // --sff-solver cg|direct|direct-all (ddsimple only): the CG-vs-Eigen A/B
+   // for the systems with S_ff (Arrowhead::Options::sff_direct).  `direct`
+   // takes the peel columns Z through a sparse LDLT of the assembled S_ff;
+   // `direct-all` the interface solve too.
+   std::string sff_solver = "cg";
    int nsub = 2, maxiter = 3000, printlevel = 0, size = 0, seed = 0, cg_maxit = 500;
    int minres_lag = 1;
    int schur_lag = 1;
@@ -386,6 +416,12 @@ int main(int argc, char** argv) {
    std::string t_update = "mu";
    double t_mu_scale = 10.0;
    std::string weight = "linear", stencil = "onesided", normalize = "255";
+   // --grid staggered|collocated (2026-10-02): where q, r, δ, θ live. staggered
+   // (default, every validated run) puts them on the (N−1)² cells between the
+   // pixels; collocated puts them on the N² pixels with u, using the
+   // Neumann forward difference (zero K rows on the last column/row) — see the
+   // GRIDS note in mpcc_2d_tnlp.hpp. Image route only.
+   std::string grid = "staggered";
    // TILE is the default (k×k subdomains, the Python probe's geometry); its
    // cut-corner rank deficiency is handled by border promotion, and its
    // interface indefiniteness under --interface cg by the dual peel (also on by
@@ -405,6 +441,42 @@ int main(int argc, char** argv) {
    // duplicate-and-link form so every complicating variable is primal and
    // appears only in linear linking rows (see mpcc_2d_consensus_tnlp.hpp).
    std::string formulation = "permutation";
+   // --objective consensus|copies (consensus formulation only): where the
+   // upper-level objective is evaluated.  consensus (default) leaves it on the
+   // original indices, so the corner block C is a PSD diagonal; copies
+   // distributes it over the local copies (1/|T(u_i)| per border node,
+   // 1/n_tiles for the alpha ridge) and moves the alpha box with it, giving
+   // strict Lueg form, C = delta_w*I. Same problem either way -- the weights
+   // make the two objectives agree wherever the linking rows hold.
+   std::string objective = "consensus";
+   // --drop-corner-reg (needs --solver ddsimple, --formulation consensus,
+   // --objective copies, --hessian exact): in that Lueg form the corner block C
+   // that IPOPT hands over is exactly delta_w*I in every regular iteration;
+   // replace it by Lueg's C = 0 there (see Options::drop_corner in
+   // dd_solver_simple.hpp). Restoration iterations are left alone.
+   bool drop_corner_reg = false;
+   // --block-dual-reg (needs --solver ddsimple): regularize a W_k that fails to
+   // factorize with -eps_k on ITS dual diagonal only, instead of reporting
+   // SINGULAR and letting IPOPT switch on a global delta_c for every block
+   // (Lueg et al. 2026 §3.5; see Options::dual_start in dd_solver_simple.hpp).
+   bool block_dual_reg = false;
+   // --wk-reg-h <d> / --wk-reg-c <d> (need --solver ddsimple): fixed W_k-only
+   // regularization, Lueg's delta_H on the primal and delta_C on the
+   // non-linking multiplier diagonals of every subdomain block, independent of
+   // IPOPT's delta_w/delta_c (see Options::wk_reg_h in dd_solver_simple.hpp).
+   double wk_reg_h = 0.0, wk_reg_c = 0.0;
+   // --block-inertia (needs --solver ddsimple): Lueg's per-block inertia
+   // correction — each W_k gets its own delta_H^k / delta_C^k until it has the
+   // right inertia; IPOPT's global delta_w only when S is not PD (see
+   // Options::block_inertia in dd_solver_simple.hpp).
+   bool block_inertia = false;
+   // --block-solver sparse|dense (ddsimple): dense = Bunch–Kaufman (LAPACK)
+   // W_k and S with EXACT inertia, direct interface solve — the reference
+   // route (see Options::dense_blocks in dd_solver_simple.hpp).
+   std::string block_solver = "sparse";
+   // --interface-inertia (needs --block-solver dense --block-inertia): shift
+   // C by delta_S until S is PD instead of reporting a wrong inertia to IPOPT.
+   bool interface_inertia = false;
    // --solver ddsimple has no --interface/--inertia knobs left: it is CG on
    // the peeled interface with the PREDICTED inertia, full stop (see the
    // dd_solver_simple.hpp header).  We only need to know whether --interface
@@ -444,6 +516,7 @@ int main(int argc, char** argv) {
       else if (a == "--seed")     seed = std::stoi(next());
       else if (a == "--weight")   weight = next();
       else if (a == "--stencil")  stencil = next();
+      else if (a == "--grid")     grid = next();
       else if (a == "--normalize") normalize = next();
       else if (a == "--partition") partition = next();
       else if (a == "--interface") { interface_solver = next(); interface_set = true; }
@@ -451,6 +524,8 @@ int main(int argc, char** argv) {
       else if (a == "--wk-backend") wk_backend = next();
       else if (a == "--cg-tol")   cg_tol = std::stod(next());
       else if (a == "--peel-cg-tol") peel_cg_tol = std::stod(next());
+      else if (a == "--border-reg") border_reg = std::stod(next());
+      else if (a == "--sff-solver") sff_solver = next();
       else if (a == "--cg-max-iter") cg_maxit = std::stoi(next());
       else if (a == "--cg-apply") cg_apply = next();
       else if (a == "--minres-lag") minres_lag = std::stoi(next());
@@ -465,6 +540,14 @@ int main(int argc, char** argv) {
       else if (a == "--no-dual-peel") dual_peel = false;
       else if (a == "--no-cross-peel") cross_peel = false;
       else if (a == "--formulation") formulation = next();
+      else if (a == "--objective") objective = next();
+      else if (a == "--drop-corner-reg") drop_corner_reg = true;
+      else if (a == "--block-dual-reg") block_dual_reg = true;
+      else if (a == "--wk-reg-h") wk_reg_h = std::stod(next());
+      else if (a == "--wk-reg-c") wk_reg_c = std::stod(next());
+      else if (a == "--block-inertia") block_inertia = true;
+      else if (a == "--block-solver") block_solver = next();
+      else if (a == "--interface-inertia") interface_inertia = true;
       else { std::cerr << "unknown argument: " << a << "\n"; return 2; }
    }
    if (data.empty()) {
@@ -492,6 +575,21 @@ int main(int argc, char** argv) {
                    "    complement. Honours --nsub, --partition, --cg-tol,\n"
                    "    --cg-max-iter, --no-alpha-peel, --no-dual-peel and\n"
                    "    --no-cross-peel.\n"
+                   "  --block-dual-reg (ddsimple): a W_k that fails to factorize is\n"
+                   "    regularized on its own dual diagonal (-eps_k), instead of\n"
+                   "    IPOPT's global delta_c on every block.\n"
+                   "  --wk-reg-h d, --wk-reg-c d (ddsimple): fixed W_k-only\n"
+                   "    regularization (Lueg): +d on the primal, -d on the non-linking\n"
+                   "    multiplier diagonals of every W_k; IPOPT's matrix is unchanged.\n"
+                   "  --block-inertia (ddsimple): Lueg's per-block inertia correction,\n"
+                   "    delta_H^k / delta_C^k per W_k until In(W_k) is right; IPOPT's\n"
+                   "    global delta_w only when the Schur complement is not PD.\n"
+                   "  --block-solver sparse|dense (ddsimple, default sparse): dense =\n"
+                   "    Bunch-Kaufman W_k and S (LAPACK), exact inertia, direct\n"
+                   "    interface solve; the reference route, O(n^3) per block.\n"
+                   "  --drop-corner-reg (ddsimple, consensus, --objective copies,\n"
+                   "    --hessian exact): use Lueg's C = 0 for the corner block where\n"
+                   "    IPOPT's is exactly delta_w*I (regular iterations only).\n"
                    "  --formulation permutation|consensus (default permutation):\n"
                    "    permutation decomposes the monolithic KKT in place; consensus\n"
                    "    rebuilds the NLP in Lueg's duplicate-and-link form (one local\n"
@@ -521,6 +619,11 @@ int main(int argc, char** argv) {
                    "    (--t0/--factor; use it to reproduce pre-2026-07-23 tables and\n"
                    "    on suspect instances — it keeps a best-converged-level\n"
                    "    fallback that the single mu solve does not have).\n"
+                   "  --grid staggered|collocated (default staggered): where\n"
+                   "    q, r, delta, theta live. collocated puts them on the N^2\n"
+                   "    pixels with u (Neumann forward differences, zero K rows on\n"
+                   "    the last column/row); image input only, --stencil onesided,\n"
+                   "    no --save-data, --save-solution must be .npz.\n"
                    "  generate the data file first:\n"
                    "    uv run python cpp2/dump_data_2d.py --N 16 --nsub 2 "
                    "-o cpp2/data_2d_16.txt\n"
@@ -584,6 +687,58 @@ int main(int argc, char** argv) {
                       "layout)\n";
          return 2;
       }
+   }
+   if (objective != "consensus" && objective != "copies") {
+      std::cerr << "--objective must be consensus|copies\n";
+      return 2;
+   }
+   if (block_dual_reg && solver != "ddsimple") {
+      std::cerr << "--block-dual-reg needs --solver ddsimple (it changes how the "
+                   "W_k blocks are factorized)\n";
+      return 2;
+   }
+   if ((wk_reg_h != 0.0 || wk_reg_c != 0.0) &&
+       (solver != "ddsimple" || wk_reg_h < 0.0 || wk_reg_c < 0.0)) {
+      std::cerr << "--wk-reg-h/--wk-reg-c need --solver ddsimple and values >= 0\n";
+      return 2;
+   }
+   if (block_solver != "sparse" && block_solver != "dense") {
+      std::cerr << "--block-solver must be sparse|dense\n";
+      return 2;
+   }
+   if (block_solver == "dense") {
+#ifndef DD_HAVE_LAPACK
+      std::cerr << "--block-solver dense needs LAPACK (rebuild: build.sh links OpenBLAS "
+                   "when Homebrew has it; build_linux.sh links the env's liblapack)\n";
+      return 2;
+#endif
+      if (solver != "ddsimple" || block_dual_reg || border_reg > 0.0) {
+         std::cerr << "--block-solver dense needs --solver ddsimple and excludes "
+                      "--block-dual-reg / --border-reg\n";
+         return 2;
+      }
+   }
+   if (interface_inertia && (block_solver != "dense" || !block_inertia)) {
+      std::cerr << "--interface-inertia needs --block-solver dense --block-inertia\n";
+      return 2;
+   }
+   if (block_inertia && (solver != "ddsimple" || block_dual_reg)) {
+      std::cerr << "--block-inertia needs --solver ddsimple and excludes --block-dual-reg\n";
+      return 2;
+   }
+   if (drop_corner_reg &&
+       (solver != "ddsimple" || formulation != "consensus" || objective != "copies" ||
+        hessian != "exact")) {
+      std::cerr << "--drop-corner-reg needs --solver ddsimple --formulation consensus "
+                   "--objective copies --hessian exact (only there is the corner "
+                   "block exactly delta_w*I, and restoration is detected through "
+                   "the exact Hessian's obj_factor)\n";
+      return 2;
+   }
+   if (objective != "consensus" && formulation != "consensus") {
+      std::cerr << "--objective copies needs --formulation consensus (there "
+                   "are no copies to put the objective on otherwise)\n";
+      return 2;
    }
    if (solver == "ddsimple" && precond != "asd") {
       std::cerr << "--precond " << precond << " is not implemented in "
@@ -681,6 +836,36 @@ int main(int argc, char** argv) {
       std::cerr << "--normalize must be 255|minmax\n";
       return 2;
    }
+   if (grid != "staggered" && grid != "collocated") {
+      std::cerr << "--grid must be staggered|collocated\n";
+      return 2;
+   }
+   const bool collocated = (grid == "collocated");
+   if (collocated) {
+      // Python's dump_data_2d.py, the .txt solution format and its readers all
+      // assume the staggered (N−1)² cell layout.
+      if (image_io::ends_with(data, ".txt")) {
+         std::cerr << "--grid collocated needs an image input (the .txt instances "
+                      "are staggered)\n";
+         return 2;
+      }
+      if (stencil != "onesided") {
+         std::cerr << "--grid collocated uses its own (Neumann forward-difference) "
+                      "stencil; --stencil averaged is staggered-only\n";
+         return 2;
+      }
+      if (!save_data.empty()) {
+         std::cerr << "--save-data writes dump_data_2d.py's staggered format; not "
+                      "available with --grid collocated\n";
+         return 2;
+      }
+      if (!save_sol.empty() &&
+          !(save_sol.size() >= 4 && save_sol.compare(save_sol.size() - 4, 4, ".npz") == 0)) {
+         std::cerr << "--grid collocated saves .npz only (the legacy .txt solution "
+                      "format is staggered)\n";
+         return 2;
+      }
+   }
 
    // An image path needs --size (and takes --sigma/--seed/--weight/--stencil);
    // a .txt dump carries all of that already and ignores them.
@@ -699,8 +884,9 @@ int main(int argc, char** argv) {
    }
    const bool consensus = (formulation == "consensus");
    SmartPtr<Mpcc2DTNLP> mpcc = consensus
-      ? new Mpcc2DConsensusTNLP(data, iopt, weight == "exp", stencil == "averaged")
-      : new Mpcc2DTNLP(data, iopt, weight == "exp", stencil == "averaged");
+      ? new Mpcc2DConsensusTNLP(data, iopt, weight == "exp", stencil == "averaged",
+                                collocated)
+      : new Mpcc2DTNLP(data, iopt, weight == "exp", stencil == "averaged", collocated);
    mpcc->w_max_ = wmax;
    mpcc->reg_alpha_ = reg_alpha;
    if (!nsub_set && mpcc->file_nsub > 0) nsub = mpcc->file_nsub;
@@ -721,7 +907,7 @@ int main(int argc, char** argv) {
    mpcc->set_theta_ref(mpcc->x_start_.data());
    mpcc->t_ = t0;
 
-   Partition2D part(mpcc->N, nsub, partition == "strip");
+   Partition2D part(mpcc->N, nsub, partition == "strip", mpcc->collocated);
    std::vector<int> col_owner;
    int n_promoted = 0;
    std::vector<int> owner;
@@ -731,13 +917,21 @@ int main(int argc, char** argv) {
       // No corner promotion is needed — rows are never cut, so the rank
       // deficiencies that forced it cannot arise.
       Mpcc2DConsensusTNLP* c = static_cast<Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc));
+      c->split_objective_ = (objective == "copies");   // must precede init
       c->init_consensus(part);
       owner = c->kkt_owner_consensus();
    } else {
-      owner = kkt_owner(*mpcc, part, promote, &col_owner, &n_promoted);
+      owner = kkt_owner(*mpcc, part, promote, &col_owner, &n_promoted,
+                        border_reg > 0.0 ? &rank1_rows : nullptr);
    }
 
-   std::cout << "2D lifted TV-MPCC (staggered, C++)  N=" << mpcc->N
+   // DDS_VERIFY_WK=1: rebuild each W_k from the TNLP's derivatives at every
+   // iteration and compare with what ddsimple assembled (verify_wk.hpp).
+   if (std::getenv("DDS_VERIFY_WK") && solver == "ddsimple")
+      verify_wk::install(GetRawPtr(mpcc), owner);
+
+   std::cout << "2D lifted TV-MPCC (" << (mpcc->collocated ? "collocated" : "staggered")
+             << ", C++)  N=" << mpcc->N
              << "  nodes=" << mpcc->m_u << "  cells=" << mpcc->m_q
              << "  n=" << mpcc->n << "  m_con=" << mpcc->mcon
              << " (" << mpcc->n_eq << " eq + " << mpcc->n_ineq << " ineq)"
@@ -753,7 +947,9 @@ int main(int argc, char** argv) {
          const Mpcc2DConsensusTNLP* c =
             static_cast<const Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc));
          std::cout << "  formulation=consensus (+" << c->n_link
-                   << " copies/links, no promoted duals)";
+                   << " copies/links, no promoted duals)"
+                   << "  objective=" << objective
+                   << (c->split_objective_ ? " (C=0)" : " (C=PSD diag)");
       }
       else if (n_promoted) std::cout << "  +" << n_promoted << " promoted corner duals";
       else if (!promote) std::cout << "  (corner promotion OFF)";
@@ -894,17 +1090,60 @@ int main(int argc, char** argv) {
       o.peel_cross_points = cross_peel;
       o.cg_tol = cg_tol;
       o.peel_cg_tol = peel_cg_tol;
+      o.border_reg = border_reg;
+      o.drop_corner = drop_corner_reg;
+      // multipliers start after primal + slacks (primal | slacks | λ_c | λ_d)
+      o.dual_start = block_dual_reg ? mpcc->n + mpcc->n_ineq : -1;
+      // W_k-only regularization; the linking multipliers (consensus only) are
+      // KKT rows n + n_ineq + [rlink, rlink + n_link) and stay unregularized
+      o.wk_reg_h = wk_reg_h;
+      o.wk_reg_c = wk_reg_c;
+      o.wk_dual_start = mpcc->n + mpcc->n_ineq;
+      o.block_inertia = block_inertia;
+      o.dense_blocks = (block_solver == "dense");
+      o.interface_inertia = interface_inertia;
+      if (auto* c = dynamic_cast<Mpcc2DConsensusTNLP*>(GetRawPtr(mpcc))) {
+         o.link_begin = o.wk_dual_start + c->rlink;
+         o.link_end = o.link_begin + c->n_link;
+      }
       o.cg_maxit = cg_maxit;
+      if (sff_solver == "cg") o.sff_direct = 0;
+      else if (sff_solver == "direct") o.sff_direct = 1;
+      else if (sff_solver == "direct-all") o.sff_direct = 2;
+      else {
+         std::cerr << "unknown --sff-solver " << sff_solver
+                   << " (cg|direct|direct-all)\n";
+         return 2;
+      }
       DDSimpleSolver::config(owner, part.n_sub);
       DDSimpleSolver::config_options(o);
+      DDSimpleSolver::config_reg_rows(rank1_rows);
       std::cout << "  interface=cg(asd"
                 << (alpha_peel ? ",alpha-peel" : ",no-alpha-peel")
                 << (dual_peel ? ",dual-peel" : ",no-dual-peel")
                 << (cross_peel ? ",cross-peel" : ",no-cross-peel")
                 << ",tol=" << cg_tol << ",peel-tol=" << peel_cg_tol
-                << ",maxit=" << cg_maxit << ")\n"
+                << ",maxit=" << cg_maxit << ")"
+                << (o.sff_direct == 1 ? "  sff-solver=direct (Z by sparse LDLT of S_ff)"
+                  : o.sff_direct == 2 ? "  sff-solver=direct-all (Z and interface by sparse LDLT of S_ff)"
+                  : "") << "\n"
                 << "  inertia=PREDICTED: S is never assembled or factorized; "
                    "In(S) = In(T) from the |P|x|P| peel complement\n";
+      if (block_solver == "dense")
+         std::cout << "  block solver: DENSE Bunch-Kaufman (LAPACK) W_k and S, exact inertia, "
+                      "direct interface solve (overrides the CG/peel route above)\n";
+      if (block_inertia)
+         std::cout << "  block inertia: per-W_k delta_H^k/delta_C^k (Lueg), "
+                      "IPOPT delta_w only when S is not PD\n";
+      if (border_reg > 0.0) {
+         std::cout << "  border-reg=" << border_reg << " on "
+                   << rank1_rows.size() << " rank-1 pair multipliers";
+         if (promote)
+            std::cout << "  (WARNING: corner promotion still ON — those rows "
+                         "went to the border, so there is nothing to "
+                         "regularize; add --no-promote-corners)";
+         std::cout << "\n";
+      }
    }
    auto optimize = [&]() -> ApplicationReturnStatus {
 #ifdef DD_HAVE_MA57
@@ -947,12 +1186,58 @@ int main(int argc, char** argv) {
       if (st.solves) std::cout << " (" << (double)st.iters / (double)st.solves << "/solve)";
       std::cout << "  rejected=" << st.rejected
                 << "  peel caches=" << st.cache_builds << "\n";
+      std::cout << "  ddsimple wall: factorize=" << st.t_factor << " s"
+                << " (peel cache " << st.t_peel << " s)"
+                << "  solve=" << st.t_solve << " s\n";
       if (st.pc_blocks_indef)
          std::cout << "  ASd preconditioner: indefinite blocks (LDLT, not LLT)="
                    << st.pc_blocks_indef << "  positions affected="
                    << st.pc_positions_indef
                    << "  singular blocks skipped=" << st.pc_blocks_singular
                    << "\n";
+      if (block_dual_reg)
+         std::cout << "  per-block dual reg (--block-dual-reg): blocks regularized="
+                   << st.blockreg_used << "  largest eps="
+                   << [&] { std::ostringstream e; e << std::scientific << std::setprecision(1)
+                                                    << st.blockreg_max; return e.str(); }()
+                   << "  still broken at the cap=" << st.blockreg_failed << "\n";
+      if (block_solver == "dense")
+         std::cout << "  dense blocks: W_k attempts with a zero pivot=" << st.dense_w_zero
+                   << "  S indefinite=" << st.dense_s_indef << "  S singular="
+                   << st.dense_s_zero << "\n";
+      if (interface_inertia)
+         std::cout << "  interface inertia (--interface-inertia): delta_S>0 in " << st.sfix_used
+                   << " factorizations  largest delta_S="
+                   << [&] { std::ostringstream e; e << std::scientific << std::setprecision(1)
+                                                    << st.sfix_max; return e.str(); }()
+                   << "  S refactorizations=" << st.sfix_retries << "\n";
+      if (block_inertia) {
+         const double fr = st.binert_blocks ? 100.0 / (double)st.binert_blocks : 0.0;
+         std::cout << "  per-block inertia (--block-inertia): block factorizations="
+                   << st.binert_blocks << "  delta_H^k>0 in " << st.binert_dh << " ("
+                   << [&] { std::ostringstream e; e << std::fixed << std::setprecision(1)
+                                                    << fr * st.binert_dh << "%)  delta_C^k>0 in "
+                                                    << st.binert_dc << " (" << fr * st.binert_dc
+                                                    << "%, on rho_k too in " << st.binert_dc_link
+                                                    << ")  largest delta_H^k=" << std::scientific
+                                                    << st.binert_dh_max; return e.str(); }()
+                   << "\n    extra LDLT=" << st.binert_retries << "  no shift found="
+                   << st.binert_failed << "  IPOPT wrong inertia (S not PD)="
+                   << st.binert_wrong << "  factorizations with IPOPT's own delta_c on="
+                   << st.binert_ipopt_dc << "\n";
+      }
+      if (wk_reg_h > 0.0 || wk_reg_c > 0.0)
+         std::cout << "  W_k-only regularization: "
+                   << [&] { std::ostringstream e; e << std::scientific << std::setprecision(1)
+                                                    << "delta_H^W=" << wk_reg_h
+                                                    << " (primal)  delta_C^W=" << wk_reg_c;
+                            return e.str(); }()
+                   << " (multipliers, linking rows excluded)\n";
+      if (drop_corner_reg)
+         std::cout << "  corner block (--drop-corner-reg): delta_w dropped="
+                   << st.corner_dropped << "  already zero=" << st.corner_zero
+                   << "  kept in restoration=" << st.corner_kept_resto
+                   << "  kept (not c*I)=" << st.corner_kept_nonscalar << "\n";
       // The §10 tally: silent unless something actually warned during the run.
       ddsimple::Warnings::get().report(std::cout);
    }

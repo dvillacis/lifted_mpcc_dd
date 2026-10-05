@@ -15,6 +15,183 @@
 > `../python/dump_data*.py` instance generators (backed by `../python/mpcc_utils.py`).
 > For a clean orientation start from the [top-level README](../README.md).
 
+> **Stencil convention (2026-10-02).** The staggered 2D `onesided` stencil is now
+> forward differences anchored at each cell's **top-left** node,
+> `(Kx u)_{a,b} = u[a,b+1] − u[a,b]`, `(Ky u)_{a,b} = u[a+1,b] − u[a,b]`, with the
+> matching anchor rule node `(i,j)` → cell `(i,j)` (clamped). Before that date it
+> was the mirror image (anchored at the bottom-right node `(a+1,b+1)`, anchor rule
+> cell `(i−1,j−1)`), and **every 2D number recorded below predates the switch**.
+> The two are exact mirror images: the new code on an image reproduces the old
+> code on the image rotated by 180° (same α\*, same iteration count — checked at
+> N=16 with the permutation formulation and at N=17 with consensus, MUMPS and
+> ddsimple), and the border sizes and copy counts are unchanged. Individual 2D
+> runs on the same, unrotated image do change (e.g. cameraman N=32 4×4 consensus:
+> 34 its, α\* = 0.070402, 26.40 dB). The uniform-grid driver (`dd_solve`) and the
+> 1D drivers are unaffected.
+
+> **Collocated grid (`--grid collocated`, 2026-10-02).** `dd_solve_2d` can also
+> put `qx, qy, r, δ, θ` on the N² pixels with `u` (Chambolle's forward
+> difference with a Neumann boundary: zero K rows on the last column and row;
+> see the GRIDS note in `mpcc_2d_tnlp.hpp`). The partition is then the identity
+> anchor rule — a pixel and all its rows belong to its tile. Image input only,
+> `--stencil onesided`, `.npz` solutions only; the staggered grid stays the
+> default. Measured on cameraman (consensus formulation):
+>
+> | check | N=16, 2×2 | N=32, 4×4 |
+> |---|---|---|
+> | copies (staggered → collocated) | 123 → 131 | 751 → 775 |
+> | ddsimple vs MUMPS α\*, t_min=1e-4 | 0.062067 / 0.062156 | 0.068724 / 0.068553 |
+> | ddsimple vs MUMPS α\*, t_min=1e-6, `DD_LEVEL_TOL=0` | 0.061400 / 0.061399 | 0.068495 / 0.068495 |
+> | argmin of an independent ROF scan of ½‖u(α)−u_clean‖² | 0.06143 | 0.06733 |
+>
+> The derivative checker flags only two FD artifacts (both `grad_f`, on the
+> quadratic θ-ridge and α terms; no Jacobian or Hessian entries). The C++ `u`
+> matches an independent NumPy ROF solve at the C++ α\* to 2e-4. Two things to
+> know: (i) the collocated α\* moves more with t than the staggered one (1% at
+> t=1e-4 at N=16, gone at 1e-6), so run it with `--t-min 1e-6` and
+> `DD_LEVEL_TOL=0` when α\* matters; (ii) at N=32 both the DD and the
+> monolithic solve converge to α\*=0.068495, a C-stationary point 1.7% from the
+> minimiser of the reduced loss (L higher by 3.4e-4 relative) — a property of the
+> relaxed NLP, not of the decomposition. The staggered grid lands within 0.2% of
+> its scan minimiser at both sizes. Not ported to `cpp_minimal` or to the Python
+> reference.
+
+> **Corner block and `--drop-corner-reg` (2026-10-02).** In the consensus
+> formulation the corner block C of the arrowhead is diagonal at every
+> factorization (`DDS_CHECK_C=1` prints it). With `--objective consensus` it is
+> the objective's curvature on the consensus variables (1 on border u, 1e-4 on
+> α) plus IPOPT's δ_w; with `--objective copies` (Lueg's form) it is exactly
+> δ_w·I, and ζ·D_R² in restoration. Lueg et al. have C = 0 because their own
+> interior-point code regularizes the W_k blocks only; IPOPT adds δ_w to every
+> primal diagonal. `--drop-corner-reg` (ddsimple, consensus, copies, exact
+> Hessian) replaces C by 0 where it is exactly δ_w·I, outside restoration
+> (detected through obj_factor = 0, `ipopt_phase.hpp`). Measured, staggered
+> N=32 4×4 cameraman: with IPOPT's default iterative refinement the drop is
+> undone — IPOPT refines against its own δ_w matrix, so the trace is identical
+> and the interface solves go 284 → 1012; with refinement disabled
+> (`ipopt.opt`: `min_refinement_steps 0`, `max_refinement_steps 0`) the drop
+> takes effect and costs 34 → 48 iterations, 69 → 120 factorizations and
+> 21 → 37 refused predictions, for the same α\* (0.070402 vs 0.070431). The
+> δ_w on C is part of how IPOPT's inertia correction makes S positive
+> definite; without it only the W_k regularization does that job. Off by
+> default; kept as an experiment.
+
+> **Conditioning of W_k and `--block-dual-reg` (2026-10-02).** `DDS_COND=1`
+> estimates κ₂(W_k) at every factorization (power / inverse iteration through
+> the LDLᵀ; validated against dense eigenvalues to 1e-4; `=dense0` gives the
+> exact spectrum of each attempt, `=vec` the near-null eigenvector, `=blocks`
+> per-block κ). Consensus, 4×4 tiles, cameraman: κ(W_k) is 1e10–1e14 (peaks
+> 1e17), and min|λ| equals IPOPT's δ_c = 1e-8·μ^{1/4} — raising
+> `jacobian_regularization_value` 100× raises min|λ| 100×. The full KKT never
+> needs δ_c (monolithic MUMPS: 0 of 1101 factorizations); IPOPT switches it on
+> because the unpivoted LDLᵀ of some W_k breaks down on the first factorization
+> (N=16: three of four blocks nonsingular with κ 2e5–2e7, one numerically
+> singular, min|λ| 1.6e-12 — the multipliers of gradient rows next to a cut,
+> whose copied nodes are fixed inside the block). `--block-dual-reg` instead
+> refactorizes a failing block with −ε_k on its own dual diagonal (Lueg et al.
+> §3.5; ε_k from 1e-10 up), refines against the original matrix, and reports a
+> refused inertia prediction as wrong inertia rather than SINGULAR. Measured:
+> IPOPT's δ_c stays 0 throughout, no block breakdowns, ε = 1e-10 always enough,
+> same α\* (N=32 0.070397 vs 0.070402, N=64 0.070031 vs 0.070042); but 88%
+> (N=32) and 99% (N=64) of the block factorizations need the shift, blocks that
+> factorize without it still have median κ 4e10 / 2e13, refused predictions go
+> 21→56 and 23→61, and iterations 34→62 (N=32) and 73→61 (N=64). The
+> ill-conditioning of W_k is intrinsic (barrier terms on top, near-degeneracy
+> at the bottom); δ_c only floored it. Off by default.
+
+> **What W_k contains (`DDS_VERIFY_WK=1`, 2026-10-02).** At every
+> factorization of a regular iteration the driver rebuilds each W_k from the
+> TNLP's own `eval_h` / `eval_jac_g` at the IPOPT iterate (`verify_wk.hpp`) and
+> compares it entry by entry with what ddsimple assembled. Consensus, cameraman
+> N=16 2×2 and N=32 4×4, both `--objective` modes, 50–71 factorizations each:
+> no missing or unexpected entries; Hessian off-diagonals and Jacobian entries
+> exact (max deviation 0); (ρ, y) = I in every linking row; W_ii − ∇²L_ii − Σ_i
+> one constant over all primal unknowns (IPOPT's δ_H, 0 or 1e-4…7.1); the
+> λ_c, ρ and λ_d diagonals one constant −δ_C (0 or 5.4e-10…1.6e-9). So W_k is
+> the block of the bordered system with δ_H on the x_k AND y_k diagonals and
+> −δ_C on the λ_k AND ρ_k diagonals — the last one differing from Lueg's form,
+> which leaves the linking block unregularized — plus IPOPT's explicit
+> inequality slacks (diagonal Σ_s + δ_H, coupled to their multiplier by −1).
+>
+> **W_k-only regularization (`--wk-reg-h d --wk-reg-c d`, ddsimple,
+> 2026-10-04).** Lueg's fixed δ_H^W / δ_C^W, separate from IPOPT's δ_w/δ_c:
+> +δ_H^W on every primal diagonal of W_k (x_k, y_k, slacks), −δ_C^W on every
+> multiplier diagonal except the linking ρ_k; C and B_k untouched. Only the
+> factorization changes (S is formed from W̃_k, In from W̃_k and S̃); solve()
+> refines against IPOPT's triplets. `DDS_VERIFY_WK=1` confirms the shifts land
+> exactly (ρ diag 0). Cameraman, consensus, 4×4, `--hessian exact`:
+>
+> | δ_H^W / δ_C^W | N=32 its / κ med / CG per solve / step-res warn | N=64 its / κ med / CG / warn / wall |
+> |---|---|---|
+> | 0 / 0          | 34 / 4.3e10 / 269 / 19  | 73 / 2.9e11 / 393 / 65 / 23.4 s |
+> | 1e-8 / 0       | identical to 0 / 0      | identical to 0 / 0 |
+> | 0 or 1e-8 / 1e-8 | 34 / 4.0e10 / 247 / 33 | 63 / 9.1e10 / 343 / 67 / 18.1 s |
+> | 1e-6 / 1e-6    | 40 / 4.8e9 / 155 / 130  | 64 / 4.8e11 / 146 / 582 / 33.1 s |
+> | 1e-4 / 1e-4    | 33 / 9.0e8 / 66 / 403   | 50 / 1.0e12 / 34 / 603 / 19.9 s |
+>
+> Max κ stays 1e13–1e17 in every case: |λ|max is the barrier Σ (1e8–1e10) and
+> |λ|min is NOT bounded below by the shifts, because H_k is indefinite — a
+> fixed δ_H^W does not make W_k quasi-definite (that needs H_k + δ_H^W I ≻ 0,
+> which is why Lueg's δ_H^k is an inertia-correcting, adaptive quantity). The
+> unpivoted LDLᵀ still breaks down (3 at N=32, 4–6 at N=64), so IPOPT's global
+> δ_c still switches on. Large shifts cut CG work but the 3 refinement sweeps
+> no longer recover IPOPT's step (step-residual warnings ×10–20).
+>
+> **Per-block inertia correction (`--block-inertia`, ddsimple, 2026-10-04).**
+> Lueg's δ_H^k / δ_C^k chosen per W_k: try 0; breakdown or too few negative
+> pivots → δ_C^k = 1e-8·μ^¼ on λ_k, then also on ρ_k; too many → δ_H^k ladder
+> (1e-4 or last/3, ×100 then ×8, IPOPT's defaults) until In(W̃_k) = (#primal,
+> #multipliers). The shifts are part of the matrix solved (solve() refines
+> against IPOPT's triplets + shifts); when S̃ is not PD the count is off and
+> IPOPT raises its global δ_w. Cameraman, consensus, `--hessian exact`:
+>
+> | | N=16 2×2 base / bi | N=32 4×4 base / bi | N=64 4×4 base / bi |
+> |---|---|---|---|
+> | IPOPT its | 26 / 48 | 34 / 40 | 73 / 86 |
+> | factorizations | 47 / 87 | 69 / 80 | 95 / 164 |
+> | κ(W_k) median | 2.2e9 / 5.6e8 | 4.3e10 / 1.5e9 | 2.9e11 / 6.9e9 |
+> | W_k breakdowns | 4 / 0 | 3 / 0 | 5 / 0 |
+> | CG its per solve | 62 / 53 | 269 / 190 | 393 / 333 |
+> | ddsimple wall (fact+solve) | 0.13 / 0.40 s | 2.1 / 3.7 s | 21.9 / 39.6 s |
+>
+> δ_H^k > 0 in 5–24% of block factorizations (max 2.7), δ_C^k in 55–74% —
+> and in EVERY one of those δ_C^k on λ_k alone was not enough: ρ_k needed it
+> too, i.e. Lueg's ρρ = 0 is not attainable with an unpivoted LDLᵀ (forcing y
+> right before ρ in the ordering was tried and is worse: d_y is often 0 there;
+> the pair needs a 2×2 pivot). Extra LDLᵀ ≈ 1.2–1.7 per block factorization.
+> IPOPT's own δ_c is on in 21/80 factorizations at N=32 (its degeneracy test
+> on wrong inertia) vs 47/69 without. Max κ stays 1e16–1e17 (barrier Σ). The
+> shifts change the Newton step, S̃ is not PD more often (22 / 73 wrong-inertia
+> returns), so iterations and wall time go UP: conditioning improves, the
+> solve does not get cheaper. α* within 1e-4 of the baseline, same PSNR.
+>
+> **Block inertia with EXACT inertia (`--block-solver dense`, LAPACK,
+> 2026-10-04).** Dense Bunch–Kaufman (`dsytrf`, Ruiz-equilibrated) for every
+> W_k and for S̃: exact inertia (2×2 pivots take ρρ = 0), S̃'s exact inertia in
+> Haynsworth, direct interface solve. Reference route only (O(n³) per block).
+> `--interface-inertia` shifts C by δ_S until S̃ is PD instead of handing IPOPT
+> a wrong inertia. Ladder tunable by DDS_BI_FIRST/INCFIRST/INC/DEC. Parallel
+> sweep, cameraman, consensus, `--hessian exact` (IPOPT its / α*):
+>
+> | | N=16 2×2 | N=32 4×4 | N=64 8×8 |
+> |---|---|---|---|
+> | IPOPT MUMPS (monolithic) | 31 / .072374 | 236 / .070463 | 65 / .070098 |
+> | sparse ddsimple (default) | 26 / .072250 | 34 / .070402 | 50 / .070051 |
+> | dense, global δ only | 31 / .072374 | 150 / .070419 | 64 / .070117 |
+> | sparse + block inertia | 48 / .072356 | 40 / .070441 | 233 / .070097 |
+> | dense + block inertia | 57 / .072355 | 49 / .070452 | 73 / .070025 |
+> | dense + block + interface inertia | 104 / .072357 | 98 / .070401 | 902 / .070030 |
+>
+> Dense + global δ reproduces MUMPS exactly at N=16 (validates the exact
+> inertia path). With exact inertia, δ_C^k is essentially never needed (0, 0,
+> 35 block factorizations) — the 55–74% δ_C (on ρ too) of the sparse route was
+> the unpivoted LDLᵀ — and δ_H^k only in 25% / 3.4% / 1.1% of block
+> factorizations (max ≈ 3). S̃ is still indefinite after every W̃_k is right in
+> 23 / 30 / 54 factorizations (IPOPT's global δ_w takes over); fixing that on C
+> alone needs δ_S up to 1e9 and blows the iteration count up — the remaining
+> negative curvature is genuinely coupled across the interface. DDS_BI_FIRST
+> 1e-8 vs 1e-4 is identical (the ×100 ladder lands on the same grid ≥ 1e-4).
+
 A cleaned-up rewrite of `../cpp`: the same three validated solvers (uniform 2D,
 staggered 1D, staggered 2D), the same arrowhead domain decomposition as IPOPT's
 actual linear solver, with the shared machinery factored out and the

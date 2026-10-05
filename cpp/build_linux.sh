@@ -210,14 +210,23 @@ fi
 #     toolchain's sysroot cannot see (libxml2); the runtime loader resolves
 #     them. Undefined symbols in OUR objects still error, so it masks nothing.
 # shellcheck disable=SC2086  # HSL_EXTRA_LIBS is deliberately word-split
+# LAPACK (optional): dd_solve_2d --block-solver dense needs dsytrf/dsytrs;
+# conda-forge's ipopt pulls in liblapack (netlib or OpenBLAS-backed).
+LAPACK_DEFS=()
+LAPACK_LIBS=()
+if [ -f "$CONDA_PREFIX/lib/liblapack.so" ]; then
+  LAPACK_DEFS=(-DDD_HAVE_LAPACK)
+  LAPACK_LIBS=(-llapack)
+fi
 exec "$CXX" -std=c++17 -O2 \
   $EIGEN_CFLAGS -I"$ROOT" -I"$ROOT/third_party" $(pkg-config --cflags ipopt) \
   -isystem "$CONDA_PREFIX/include" \
-  "${HSL_DEFS[@]}" "${OMPFLAGS[@]}" \
+  "${HSL_DEFS[@]}" "${OMPFLAGS[@]}" "${LAPACK_DEFS[@]}" \
   "$@" \
   "${HSL_LIBS[@]}" \
   ${HSL_EXTRA_LIBS:-} \
   -L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib" \
   -Wl,-rpath-link,"$CONDA_PREFIX/lib" -Wl,--allow-shlib-undefined \
+  "${LAPACK_LIBS[@]}" \
   -lz \
   $(pkg-config --libs ipopt)

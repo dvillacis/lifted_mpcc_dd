@@ -585,8 +585,11 @@ def grad_operators_2d(N: int, stencil: str = "onesided"):
     e = np.ones(N - 1)
     D = sp.diags([-e, e], [0, 1], shape=(N - 1, N), format="csr")
     if stencil == "onesided":
-        Sh = sp.hstack([sp.csr_matrix((N - 1, 1)), sp.identity(N - 1)], format="csr")
-        return sp.kron(Sh, D, format="csr"), sp.kron(D, Sh, format="csr")
+        # forward differences anchored at the cell's top-left node (a, b):
+        # (Kx u)_{a,b} = u[a,b+1] − u[a,b],  (Ky u)_{a,b} = u[a+1,b] − u[a,b].
+        # (Before 2026-10-02: Sh = [0 | I], the bottom-right-anchored mirror.)
+        S0 = sp.hstack([sp.identity(N - 1), sp.csr_matrix((N - 1, 1))], format="csr")
+        return sp.kron(S0, D, format="csr"), sp.kron(D, S0, format="csr")
     if stencil == "averaged":
         A = sp.diags([0.5 * e, 0.5 * e], [0, 1], shape=(N - 1, N), format="csr")
         return sp.kron(A, D, format="csr"), sp.kron(D, A, format="csr")
@@ -1035,10 +1038,11 @@ class Partition2D:
     ``dd_structure.build``).
 
     **Node ownership — the ``anchor`` rule**: node ``(i,j)`` belongs to the tile
-    of cell ``(i−1, j−1)`` (clamped to the grid), i.e. the cell the node anchors
-    under the one-sided stencil. See the module docstring for the measured
-    interface sizes; the naive "node follows cell ``i``" rule inflates ``p`` by
-    ~1.5× because it makes *both* dual components cross every cut.
+    of cell ``(i, j)`` (clamped to the grid), i.e. the cell whose top-left corner
+    the node is — the cell the node anchors under the one-sided stencil. Any
+    other rule (e.g. the bottom-right ``(i−1, j−1)`` rule that matched the
+    pre-2026-10-02 stencil) inflates ``p`` by ~1.5× because it makes *both* dual
+    components cross every cut.
     """
 
     def __init__(self, N: int, k: int):
@@ -1051,7 +1055,7 @@ class Partition2D:
             for c in range(k):
                 self.cell_owner_2d[b[a]:b[a + 1], b[c]:b[c + 1]] = a * k + c
         self.cell_owner = self.cell_owner_2d.ravel()
-        idx = np.clip(np.arange(N) - 1, 0, self.nc - 1)          # anchor rule
+        idx = np.clip(np.arange(N), 0, self.nc - 1)              # anchor rule
         self.node_owner_2d = self.cell_owner_2d[np.ix_(idx, idx)]
         self.node_owner = self.node_owner_2d.ravel()
         # cut lines, in node coordinates (the first node past each cut)
