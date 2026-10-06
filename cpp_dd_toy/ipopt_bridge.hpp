@@ -31,8 +31,11 @@ class DDLinearSolver : public Ipopt::SparseSymLinearSolverInterface {
 public:
    // IPOPT constructs the solver itself, so the partition is handed over through
    // static state set before the solve starts.
-   static void configure(std::vector<int> owner, int n_tiles, const dd::SchurDD::Options& opt) {
+   static void configure(std::vector<int> owner, int n_x, int n_tiles,
+                         const dd::SchurDD::Options& opt, dd::SchurDD::Hints hints = {}) {
       owner_map() = std::move(owner);
+      hints_() = std::move(hints);
+      primals() = n_x;
       tiles() = n_tiles;
       options() = opt;
    }
@@ -45,7 +48,11 @@ public:
 
    bool InitializeImpl(const Ipopt::OptionsList&, const std::string&) override { return true; }
    EMatrixFormat MatrixFormat() const override { return Triplet_Format; }
-   bool ProvidesInertia() const override { return true; }
+   // In inertia-free mode IPOPT's curvature test (neg_curv_test_tol) replaces
+   // the inertia, so the solver does not claim to provide one.
+   bool ProvidesInertia() const override {
+      return options().inertia != dd::SchurDD::Inertia::Free;
+   }
    bool IncreaseQuality() override { return false; }
    Index NumberOfNegEVals() const override { return s_.negative_eigenvalues(); }
 
@@ -56,7 +63,8 @@ public:
          irow[t] = ia[t] - 1;
          jcol[t] = ja[t] - 1;
       }
-      return s_.set_structure((int)dim, irow, jcol, owner_map(), tiles(), options())
+      return s_.set_structure((int)dim, irow, jcol, owner_map(), primals(), tiles(), options(),
+                              &hints_())
                 ? Ipopt::SYMSOLVER_SUCCESS
                 : Ipopt::SYMSOLVER_FATAL_ERROR;
    }
@@ -82,9 +90,15 @@ public:
          // solve (iterative refinement) that breaks down keeps the CG iterate;
          // refusing there makes IPOPT abort.  So the check is not rigorous, as
          // the paper says.
+         // Without inertia (inertia-free mode) the refusal is "singular", which
+         // makes IPOPT regularize as well.
          if (fresh_ && check_inertia) {
             ++wrong_inertia();
             return Ipopt::SYMSOLVER_WRONG_INERTIA;
+         }
+         if (fresh_ && !ProvidesInertia()) {
+            ++wrong_inertia();
+            return Ipopt::SYMSOLVER_SINGULAR;
          }
          ++late_breakdowns();
       }
@@ -95,6 +109,8 @@ public:
 private:
    static std::vector<int>& owner_map() { static std::vector<int> v; return v; }
    static int& tiles() { static int v = 1; return v; }
+   static int& primals() { static int v = 0; return v; }
+   static dd::SchurDD::Hints& hints_() { static dd::SchurDD::Hints h; return h; }
    static dd::SchurDD::Options& options() { static dd::SchurDD::Options v; return v; }
 
    dd::SchurDD s_;

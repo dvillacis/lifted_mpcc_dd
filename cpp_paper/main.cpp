@@ -64,11 +64,17 @@ static void usage() {
       "             (defaults: mumps/mumps if built with MUMPS, else sparse/dense)\n"
       "             --max-iter 3000  --threads n  --line-search filter|none  --restoration on|off\n"
       "             --stall-iter K (0 = off)  --alpha-y primal|bound-mult|full|min-dual-infeas\n"
+      "             --delta-start zero|last (each iteration tries delta = 0 first, IPOPT; or,\n"
+      "               after an iteration that needed delta > 0, delta_last/3)\n"
       "             --kappa-sigma 1e10  --bounds rows|vars\n"
       "             --kappa-eps 1000 (μ decreases while E_μ <= κ_ε·μ)  --mu-steps S (at most\n"
       "               S decreases per iteration; 0 = no limit)\n"
       "             --t-mu-scale 10 (t = max(t_min, scale*mu); Raghunathan-Biegler: 1)\n"
+      "             --mu-min M (floor of mu; default t_min/t-mu-scale, so mu/t >= 1/scale\n"
+      "               at t_min; 0: the IPM's tol/10)  --resto-mu-steps S (at most S decreases\n"
+      "               of mu right after a restoration phase; default 1, 0: no cap)\n"
       "             --t-rate 0.5 (t falls by at most this factor per iteration; 0: no limit)\n"
+      "             --t-comp-ratio K (> 0: t never below max r(1-d)/K; 0: off)\n"
       "             --vw-mu M (> 0: their modified step, eq. 3.7 with 3.8(ii), once mu <= M;\n"
       "               IPOPT-C: 5e-6)  --vw-bounds all|comp (every bound, as in the paper,\n"
       "               or only r >= 0, 1-delta >= 0)  --vw-linesearch modified|plain (the\n"
@@ -118,13 +124,14 @@ static int run(int argc, char** argv) {
    int N = 32, nsub = 4, max_iter = 3000, threads = 0, stall_iter = 0;
    double kappa_sigma = 1e10, dual_reg = 1e-6, dual_reg_exp = 0.0;
    double kappa_eps = 1000.0;
-   int mu_steps = 0;
+   int mu_steps = 0, resto_mu_steps = 1;
+   double mu_min = -1.0;   // < 0: t_min / t_mu_scale
    bool t_on_solved = false;
    std::string cleanup = "off";
    double cleanup_dual_reg = -1.0, cleanup_mu = 0.0;   // < 0 / 0: as in the continuation
    int cleanup_biactive = 0;
    double penalty = 0.0, penalty_max = 1e8;
-   double vw_mu = 0.0, t_mu_scale = 10.0, t_rate = 0.5;
+   double vw_mu = 0.0, t_mu_scale = 10.0, t_rate = 0.5, t_comp_ratio = 0.0;
    bool vw_comp_only = false, vw_ls_grad = true;
    bool penalty_hessian = true;
    double cleanup_eps = 0.0;
@@ -134,6 +141,7 @@ static int run(int argc, char** argv) {
    double sigma = 0.1, t_min = 1e-4;
    unsigned seed = 0;
    bool quiet = false, line_search = true, restoration = true, diag = false, bounds_rows = true;
+   bool delta_from_last = false;
    bool classify = false;
    std::string classify_file;
    dd::SchurDD::Options dopt;
@@ -171,9 +179,12 @@ static int run(int argc, char** argv) {
       else if (a == "--line-search") line_search = v != "none";
       else if (a == "--restoration") restoration = v != "off";
       else if (a == "--stall-iter") stall_iter = std::stoi(v);
+      else if (a == "--delta-start") delta_from_last = v == "last";
       else if (a == "--kappa-sigma") kappa_sigma = std::stod(v);
       else if (a == "--kappa-eps") kappa_eps = std::stod(v);
       else if (a == "--mu-steps") mu_steps = std::stoi(v);
+      else if (a == "--mu-min") mu_min = std::stod(v);
+      else if (a == "--resto-mu-steps") resto_mu_steps = std::stoi(v);
       else if (a == "--t-update") t_on_solved = v == "solved";
       else if (a == "--cleanup") cleanup = v;
       else if (a == "--penalty") penalty = std::stod(v);
@@ -182,6 +193,7 @@ static int run(int argc, char** argv) {
       else if (a == "--vw-linesearch") vw_ls_grad = v != "plain";
       else if (a == "--t-mu-scale") t_mu_scale = std::stod(v);
       else if (a == "--t-rate") t_rate = std::stod(v);
+      else if (a == "--t-comp-ratio") t_comp_ratio = std::stod(v);
       else if (a == "--penalty-max") penalty_max = std::stod(v);
       else if (a == "--penalty-hessian") penalty_hessian = v != "off";
       else if (a == "--cleanup-dual-reg") cleanup_dual_reg = std::stod(v);
@@ -261,6 +273,7 @@ static int run(int argc, char** argv) {
    problem.t_min = t_min;
    problem.t_mu_scale = t_mu_scale;
    problem.t_rate = t_rate;
+   problem.t_comp_ratio = t_comp_ratio;
    problem.t = std::max(t_min, problem.t_mu_scale * mu0);
    problem.eps_theta = problem.c_theta * problem.t;
    problem.gate_floor = tol_target;
@@ -272,6 +285,10 @@ static int run(int argc, char** argv) {
    ipm.opt.mu0 = mu0;
    ipm.opt.kappa_eps = kappa_eps;
    ipm.opt.mu_max_steps = mu_steps;
+   // μ's floor keeps the continuation's coupling t = scale·μ at t_min (μ/t ≥ 1/scale);
+   // the IPM's own default, tol/10, let μ/t fall to 0.01 (mariposa N=640)
+   ipm.opt.mu_min = mu_min >= 0.0 ? mu_min : t_min / t_mu_scale;
+   ipm.opt.resto_mu_steps = resto_mu_steps;
    ipm.opt.vw_mu = vw_mu;
    ipm.opt.vw_comp_only = vw_comp_only;
    ipm.opt.vw_ls_grad = vw_ls_grad;
@@ -284,6 +301,7 @@ static int run(int argc, char** argv) {
    ipm.opt.line_search = line_search;
    ipm.opt.restoration = restoration;
    ipm.opt.stall_iter = stall_iter;
+   ipm.opt.delta_from_last = delta_from_last;
    ipm.opt.alpha_y = alpha_y;
    ipm.opt.kappa_sigma = kappa_sigma;
    ipm.opt.dual_reg = dual_reg;
@@ -383,8 +401,9 @@ static int run(int argc, char** argv) {
                s.n_tiles, s.dim, s.p, s.max_pk, s.max_tk, s.factorizations, s.fallbacks);
    if (dopt.interface == dd::SchurDD::Interface::Pcg)
       std::printf("        pcg: solves %ld, iterations mean %.1f max %ld, negative curvature %ld,"
-                  " unconverged %ld\n",
-                  s.solves, cg_mean, s.cg_max, s.cg_breakdowns, s.cg_unconverged);
+                  " unconverged %ld;  refused before PCG (some S~_k not SPD) %ld\n",
+                  s.solves, cg_mean, s.cg_max, s.cg_breakdowns, s.cg_unconverged,
+                  s.s_tilde_indefinite);
    std::printf("time:   factorize %.2fs [blocks %.2f, S %.2f, preconditioner %.2f]  solve %.2fs"
                " [tiles %.2f, interface %.2f]  rest %.2fs   (max over ranks)\n",
                tf, tb, ts, tp, tsol, tts, ti, wall - tf - tsol);

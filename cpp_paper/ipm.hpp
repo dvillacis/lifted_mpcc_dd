@@ -14,8 +14,11 @@
 //     halved in stall_iter iterations with θ ≤ θ_min;
 //   · one regularization δ for all tile primals (IPOPT's δ_w schedule), raised
 //     when some In(W_k) is wrong (eq. 24) or S is not positive definite (eq. 25,
-//     seen through the PCG curvature test or the direct factorization);
-//     nothing on the consensus variables;
+//     seen through the PCG curvature test, an indefinite Schwarz block S̃_k, or
+//     the direct factorization); nothing on the consensus variables.  With
+//     δ_c > 0 the factorization stops at the first tile with a wrong
+//     inertia.  Each iteration tries δ = 0 first (IPOPT), or, with
+//     delta_from_last, δ_last/3 after an iteration that needed δ > 0;
 //   · a dual regularization δ_c when a tile has too FEW negative eigenvalues
 //     (its own Jacobian is rank-deficient: no δ can fix that) or a pivot is zero;
 //   · elastic variables (nlp.hpp; the restoration phase's p and n) are
@@ -39,7 +42,8 @@
 //   dz_U = μ/(u−p) − z_U + Σ_U dp.
 //
 // μ follows IPOPT's monotone rule: once the barrier problem is solved to κ_ε·μ,
-// μ ← max(tol/10, min(κ_μ·μ, μ^θ)).  Error measures use IPOPT's s_d, s_c.  The
+// μ ← max(μ_min, min(κ_μ·μ, μ^θ)), μ_min = tol/10 unless set (tv_dd: t_min/10),
+// with at most resto_mu_steps decreases right after a restoration phase.  Error measures use IPOPT's s_d, s_c.  The
 // constraint multipliers start from IPOPT's least-squares estimate.  The
 // problem's iteration() hook runs once per iteration; returning false stops
 // the solve (status 2).
@@ -90,6 +94,12 @@ public:
                                     // modified step (false: plain ∓μ/s)
       int mu_max_steps = 0;         // > 0: at most this many μ decreases per iteration
                                     // (0: as many as E_μ ≤ κ_ε·μ allows, IPOPT)
+      double mu_min = 0.0;          // > 0: the floor of μ (0: tol/10, IPOPT)
+      int resto_mu_steps = 1;       // > 0: at most this many μ decreases in the iteration
+                                    // right after a successful restoration phase (0: no cap).
+                                    // The phase ends with least-squares λ, which can make E_μ
+                                    // look small for that one iteration and let μ fall to its
+                                    // floor at once (mariposa N=640: 3.2e-4 → 5e-6)
       double bound_push = 1e-2;     // IPOPT bound_push = bound_frac
       double acceptable_tol = 0.0;  // > 0: also stop at E₀ ≤ this ...
       double acceptable_dual = 1e10;//     ... with inf_du ≤ this, for acceptable_iter its
@@ -107,6 +117,9 @@ public:
       double dual_reg = 0.0;        // > 0: δ_c = dual_reg·μ^dual_reg_exp in EVERY Newton
       double dual_reg_exp = 0.25;   //   system (stabilization for rank-deficient rows);
                                     //   0: δ_c only when a tile asks for it (IPOPT)
+      bool delta_from_last = false; // after an iteration that needed δ > 0, start from
+                                    // δ_last/3 instead of trying δ = 0 first (IPOPT tries 0;
+                                    // here δ > 0 is needed in most iterations)
       int stall_iter = 0;           // > 0: restoration also when the barrier error E_μ
                                     // has not halved in this many iterations (θ ≤ θ_min,
                                     // μ > its floor)
@@ -389,6 +402,7 @@ public:
       int acc_count = 0;
       bool fail = false;
       int pr_block = -1, du_block = -1;   // which bound limited the last step
+      bool just_restored = false;     // the last iteration ended with a restoration phase
       double stall_best = HUGE_VAL;   // lowest E_μ of the current barrier problem ...
       int stall_count = 0;            // ... and iterations since it last halved
 
@@ -481,6 +495,7 @@ public:
          IPM phase;
          phase.opt = o;
          phase.opt.mu0 = mu_r;
+         phase.opt.mu_min = 0.0;   // the phase keeps IPOPT's floor, tol/10
          phase.opt.bound_push = 0.0;
          phase.opt.ls_mult_init = false;
          phase.opt.restoration = false;
@@ -616,10 +631,14 @@ public:
          evaluate(false);
          bool new_problem = moved || f != f_before || dd::Comm::any(A != A_before);   // the problem changed itself
          if (new_problem) filter.clear();
-         // monotone μ update
-         const double mu_min = o.tol / 10.0;
+         // monotone μ update (capped right after a restoration phase)
+         const double mu_min = o.mu_min > 0.0 ? o.mu_min : o.tol / 10.0;
+         int max_steps = o.mu_max_steps;
+         if (just_restored && o.resto_mu_steps > 0)
+            max_steps = max_steps > 0 ? std::min(max_steps, o.resto_mu_steps) : o.resto_mu_steps;
+         just_restored = false;
          for (int steps = 0; mu > mu_min && scaled(mu) <= o.kappa_eps * mu &&
-                             (o.mu_max_steps <= 0 || steps < o.mu_max_steps); ++steps)
+                             (max_steps <= 0 || steps < max_steps); ++steps)
          {
             const double mu_old = mu;
             mu = std::max(mu_min, std::min(o.kappa_mu * mu, std::pow(mu, o.theta_mu)));
@@ -650,7 +669,10 @@ public:
                if (o.print_level > 0)
                   std::printf("%s%4d  slow progress: restoration phase\n", o.label.c_str(),
                               res.iters);
-               if (restore(theta_of(A), phi_of(p, f))) continue;
+               if (restore(theta_of(A), phi_of(p, f))) {
+                  just_restored = true;
+                  continue;
+               }
             }
          }
 
@@ -688,6 +710,7 @@ public:
 
          const long cg0 = stats->cg_iters;
          std::fill(delta.begin(), delta.end(), 0.0);
+         if (o.delta_from_last && dmax > 0.0) raise_all(delta, last);   // dmax: the last iteration's δ
          if (o.dual_reg > 0.0) delta_c = o.dual_reg * std::pow(mu, o.dual_reg_exp);
          bool solved = false;
          for (int attempt = 0; attempt < 60 && !solved; ++attempt) {
@@ -700,10 +723,19 @@ public:
             write_jacobian();
             write_rowdiag(-delta_c);
 
-            if (!dd.factorize()) {
+            // With δ_c > 0, every wrong In(W_k) leads to the same decision
+            // (raise δ), so the factorization may stop at the first such tile.
+            // With δ_c = 0 the tiles with too FEW negatives matter: all are
+            // factorized.
+            if (!dd.factorize(delta_c > 0.0)) {
                ++res.singular;
                if (delta_c == 0.0) delta_c = 1e-8 * std::pow(mu, 0.25);
                else if (!raise_all(delta, last)) break;
+               continue;
+            }
+            if (dd.inertia_stopped()) {   // eq. (24) violated (stopped at that tile)
+               ++res.tile_corrections;
+               if (!raise_all(delta, last)) break;
                continue;
             }
             std::vector<int> bad;
@@ -887,7 +919,10 @@ public:
             }
             res.ls_backtracks += nback;
          }
-         if (restored) continue;
+         if (restored) {
+            just_restored = true;
+            continue;
+         }
 
          for (int i = 0; i < np; ++i) {
             p[i] += ap * d[i];

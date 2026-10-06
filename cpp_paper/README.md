@@ -22,14 +22,23 @@ The folder is self-contained: nothing is included from the rest of the repositor
 - **Restoration on slow progress** (opt-in, `--stall-iter K`). The same phase also starts, before the step, when the IPM is nearly feasible (θ ≤ θ_min, the filter's switching threshold) but the barrier error E_μ has not halved in K iterations of the same barrier problem (same μ, same t, μ above its floor). If the phase fails there, the IPM simply goes on.
 - Inequality rows get slacks.
 - μ follows IPOPT's monotone rule with κ_ε = 1000, κ_μ = 0.7, θ_μ = 1.1, starting from μ₀ = 0.1.
+  - **Floor t_min/10** (`--mu-min`; with `--t-mu-scale s`, t_min/s), not IPOPT's tol/10, so that μ/t stays ≥ 0.1 at t = t_min, as the continuation t = 10μ intends. With tol/10, mariposa N=640 (t_min = 5·10⁻⁴) sat at μ/t = 0.01 for 216 of its 251 iterations.
+  - **At most one decrease right after a restoration phase** (`--resto-mu-steps`). The phase ends with least-squares multipliers, which can make E_μ look small for that one iteration: on mariposa N=640 (inf_du 7.5·10⁻³ there), μ fell 13× in that iteration (6.3·10⁻⁵ → 5·10⁻⁶, the old floor). t followed to t_min within three iterations, and 123k complementarity rows were suddenly violated. With the new floor, that run's next decrease reaches the floor anyway, so the cap did not act there; it guards the case of a restoration well above the floor.
 - The constraint multipliers start from the least-squares estimate.
 - **Regularization:** one δ on all tile primals (IPOPT's δ_w schedule), raised when some In(W_k) is wrong (eq. 24) or S is not positive definite (eq. 25). A dual δ_c = 10⁻⁶ is in every Newton system (`--dual-reg`; stabilization for the near-singular rows at flattened single-pixel features, see "The end game"); with `--dual-reg 0` it is added only when a tile has too *few* negative eigenvalues (its Jacobian is rank-deficient, and no δ fixes that), as IPOPT does. Nothing is added on the consensus variables.
+  - Each iteration first tries δ = 0, as IPOPT does. With `--delta-start last`, an iteration that follows one with δ > 0 starts from δ_last/3 instead (δ > 0 is needed in most iterations here). This changes the path, so it is not the default.
+  - With δ_c > 0, every wrong In(W_k) leads to the same decision (raise δ). So each rank stops factorizing its tiles at the first tile with a wrong inertia; the rest would be refused anyway. The run is unchanged. Only the counters can differ: which of "singular" and "wrong In(W_k)" is reported, and the count of tiles with too few negatives.
 
 **Linear algebra** (`schur_dd.hpp`, `blocks.hpp`, `precond.hpp`):
 - **Tile blocks, default when built with MUMPS.** MUMPS factorizes the augmented tile matrix [W_k B_kᵀ; B_k 0] with its Schur-complement feature. That returns S_k directly and gives In(W_k) exactly through its pivoted (1×1/2×2) LDLᵀ (`mumps_block.hpp`).
+  - **Pivot threshold** CNTL(1) = 10⁻⁵ (MUMPS's default is 0.01). At 0.01 about 15% of the pivots of a tile were delayed, which grows the fronts; 10⁻⁵ cuts the tile flops by about 40%.
+    - IPOPT's 10⁻⁶ gains little more and fails `mumps_check`'s accuracy test (1.3·10⁻⁹; IPOPT relies on iterative refinement). The measurements are in `mumps_block.hpp`.
+  - **Tile solves** go through MUMPS's condensation and expansion (ICNTL(26) = 1, then 2): one forward sweep gives B_k W_k⁻¹ r_k, one backward sweep W_k⁻¹(r_k − B_kᵀ u_y). This is half the work of two full solves. The self-test checks both.
 - **Tile blocks without MUMPS.** A sparse unpivoted LDLᵀ in a KKT-aware level order. A tile falls back to dense Bunch–Kaufman for one factorization when a pivot is zero or tiny relative to its row (a rank-deficient −JH⁻¹Jᵀ block, which needs 2×2 pivots). The inertia stays exact here too.
 - **Interface.** The local Schur complements S_k = −B_k W_k⁻¹ B_kᵀ (from MUMPS, or by forward solves) give S = C + Σ N_k S_k N_kᵀ (eqs. 14–15).
 - **Interface solve, default `--schur pcg`.** PCG on S, applied through the stored S_k, with the additive Schwarz preconditioner on the local assembled complements S̃_k = N_kᵀ S N_k (eqs. 18–19), at tolerance 1e-10. A direction with pᵀSp ≤ 0 is the paper's Sec. 3.5 test for S not positive definite.
+  - **Indefinite S̃_k.** S̃_k is a principal submatrix of S, so if its Cholesky factorization fails, S is not positive definite. The solve is then refused before any tile solve or PCG iteration. In every run measured, such an S̃_k was followed by a PCG breakdown anyway. The eigenvalue clipping is kept only for `--precond asd`, whose blocks are not submatrices of S.
+  - **Lazy build.** The preconditioner (the S̃_k exchange and the block factorizations) is built by the first solve after a factorization. A factorization refused for In(W_k) therefore costs none of it. Its time still counts as "factorize".
 - **`--schur direct`.** The assembled S is factorized: exact, and the reference for checking PCG.
 - **Parallelism: MPI over tiles** (`MPI=1`, `comm.hpp`). Each rank owns a contiguous range of tiles and **holds only their part of the problem**: their variables, rows and KKT unknowns, plus the consensus variables (the border), which every rank holds and updates identically. A rank evaluates the functions and derivatives of its own rows, runs the IPM's elementwise work on its own entries, factorizes its W_k with its own MUMPS, forms its S_k and does its tile solves. The PCG vectors live on the border and are the same on every rank.
   - **Exchange.** Never MPI sums of floating-point values:
@@ -106,9 +115,13 @@ Elsewhere, give the flags directly: `MUMPS_CFLAGS="-I…/include" MUMPS_LIBS="-L
 | `--line-search` | `filter` | `none` = fraction-to-the-boundary steps only (the paper's setting) |
 | `--restoration` | `on` | `off` = full step when the line search fails |
 | `--stall-iter` | 0 (off) | K: restoration also after K iterations without progress (see the method) |
+| `--delta-start` | `zero` | `last`: after an iteration that needed δ > 0, start from δ_last/3 instead of 0 (see the method) |
 | `--alpha-y` | `primal` | step of λ: `primal` (α_pr), `bound-mult` (α_du), `full` (1), `min-dual-infeas` (IPOPT's `alpha_for_y`) |
 | `--kappa-sigma` | 1e10 | after each step μ/(κ_Σ s) ≤ z ≤ κ_Σ μ/s |
 | `--kappa-eps`, `--mu-steps` | 1000, 0 | μ decreases while E_μ ≤ κ_ε·μ, at most S times per iteration (0: no limit); experiment, see "The end game" |
+| `--mu-min` | t_min / t-mu-scale | floor of μ; 0 = IPOPT's tol/10 (the behaviour before 2026-10-06) |
+| `--resto-mu-steps` | 1 | at most this many μ decreases in the iteration after a restoration phase; 0 = no cap |
+| `--t-comp-ratio` | 0 (off) | K > 0: t is never lowered below max r(1−δ)/K, so it cannot run ahead of an iterate whose products lag (experiment, see "The end game") |
 | `--t-mu-scale` | 10 | t = max(t_min, scale·μ); 1 is Raghunathan–Biegler's μ/t = 1 (fewer iterations on N ≥ 96, see "The end game") |
 | `--precond` | `as` | interface preconditioner: `as` additive Schwarz on S̃_k = N_kᵀ S N_k (eq. 19); `asd` S_k with its diagonal replaced by diag(S) (eq. 21; weaker, see "Known limitations") |
 | `--vw-mu` | 0 (off) | M > 0: Raghunathan–Biegler's modified step (eq. 3.7, choice (ii) of 3.8) once μ ≤ M, as in IPOPT-C's source: every bound, η = 0.1·μ_prev/(1 + max(‖c‖∞, ‖z‖∞)), off in restoration, matching line-search gradient (IPOPT-C: M = 5·10⁻⁶); `--vw-bounds comp` restricts it to r ≥ 0, 1−δ ≥ 0, `--vw-linesearch plain` keeps the plain barrier gradient |
@@ -135,6 +148,8 @@ Times and memory are the maximum over the ranks; memory is per rank.
 Status codes: 0 converged, 1 iteration limit, 2 stopped by the level gate (the normal finish), 3 acceptable, −1 failure. `ok` is 1 for 0, 3, or a level-gate stop.
 
 ## Validated results
+
+> **The tables below predate the performance changes of 2026-10-06** (MUMPS pivot threshold 10⁻⁵, condensation/expansion tile solves, stopping at a wrong In(W_k), lazy preconditioner, the S̃_k test). In single-rank trials on a loaded machine (with a 10⁻⁶ threshold), the changes ran cam96, mar32 and mar48 identically. Cameraman N=128 8×8 split in its end game by rounding: 90 instead of 104 iterations, PSNR 27.45 dB either way. On that instance, tile factorization flops fell from 1.2·10¹¹ to 2.7·10¹⁰ and wall time from 77 s to 35 s. The tables have not been re-run since.
 
 **Default configuration** (MUMPS tiles, filter line search, PCG; 4 MPI ranks × 1 thread):
 
@@ -240,6 +255,18 @@ Both stop at the level gate (t = 10⁻⁴); the 16×16 log is bit-identical on 4
 
   `full` and `min-dual-infeas` were mixed on the small set (min-dual-infeas: 417 iterations and 20 restoration phases on mariposa N=48). "Mariposa lower" means at least one mariposa run ends at a lower stationary point (23.38 dB at N=32; 24.12 or 24.25 dB at N=48) instead of 23.43/24.26 dB. All N=128/256 runs end at the same PSNR (27.45 / 28.53–28.56 dB).
 - **Reading.** Making λ follow z (`bound-mult`) or recentring z (κ_Σ) treats the symptom and slows the earlier phase. Variable bounds help most (N=128: 91 → 63 iterations) but leave the same cells in the end game. The residual comes from multipliers growing at degenerate cells, which the manuscript handles by gauge fixing (freezing the degenerate angles) and active-set cleanup; this solver has neither. None of the variants is the default.
+- **Re-measured with the μ floor t_min/10 and the post-restoration cap (2026-10-06; 12 ranks; IPM its (+ restoration its), wall, α\*, PSNR).** The matrix was stopped after 7 of 15 runs; cameraman N=256 was not reached.
+
+  | variant | mariposa N=512 16×16, t_min 5·10⁻⁴ | mariposa N=640 16×16, t_min 5·10⁻⁴ |
+  |---|---|---|
+  | defaults | 136 (+11), 82 s, 0.07210, 29.947 dB | 80 (+12), 96 s, 0.07154, 30.472 dB |
+  | `--bounds vars` | 66 (+10), 49 s, 0.07192, 29.939 dB | 100 (+11), 122 s, 0.07257, 30.526 dB |
+  | `--t-mu-scale 1` | 345, 192 s, 0.07150, 29.913 dB | — |
+  | `--dual-reg 1e-5` | **51, 27 s**, 0.07117, 29.912 dB | — |
+  | `--t-comp-ratio 2` | 118 (+11), 83 s, 0.07219, 29.950 dB | — |
+
+  - Before the floor (tol/10, no cap): mariposa N=512 took 209 iterations, N=640 251 (+12).
+  - None of the variants is the default yet. `--dual-reg 1e-5` is 3× faster on N=512 but ends at a different point (α\* −1.3%, −0.035 dB) and is untested elsewhere. `--bounds vars` is faster on N=512 and slower on N=640. `--t-comp-ratio 2` was measured on N=512 only, where t reaches t_min late (iteration 97), so the catch-up it targets is short there anyway; N=640 (catch-up of 28 iterations after t = t_min at iteration 36) is the instance to test it on.
 - **Follow-up** (`endgame_literature.md` has the literature and the numbers). The MPCC multipliers of the final point (`--classify`) are S-stationary to solve accuracy on all but a few clusters of cells: (1) L-shaped triples of flat cells around one node, a single-pixel feature flattened by TV, where the local rows are near-singular and λ_h2 reaches 3·10²; (2) about ten near-biactive cells with both MPCC multipliers negative (C-stationary), where ξ grows like 1/√t. A dual regularization δ_c in every Newton system brings (1) down to 2–4·10¹ and cuts N=256 8×8 from 301 (+56) to 99 (+15) iterations; it is now the default (10⁻⁶). A sign-driven per-cell relaxation for (2) (DeMiguel et al. 2005) made N=256 slower (16×16: 263 iterations, 8×8: 140) and is off.
 - **Where the end game comes from, and the pace of the continuation.** The long stretch at t = t_min is not tied to t_min. It follows the last large drop of μ:
   - **Large drops.** With κ_ε = 1000 a single iterate with a small error lets μ fall to about E_μ/1000 in one iteration: 6× at N=128 (iteration 35), 40× right after the restoration phase at N=256 (iteration 29).

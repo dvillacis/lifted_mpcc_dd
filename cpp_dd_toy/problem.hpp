@@ -37,6 +37,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -97,6 +98,15 @@ public:
                links_.push_back({v, yvar_[g]});
                row_tile_.push_back(t);
             }
+
+      // ---- each PDE row's variables, as its tile sees them (computed once)
+      home_.resize(NN);
+      nbstart_.assign(NN + 1, 0);
+      for (int g = 0; g < NN; ++g) {
+         home_[g] = u_in(tile_of(g), g);
+         for (int nb : neighbours(g)) nbvar_.push_back(u_in(tile_of(g), nb));
+         nbstart_[g + 1] = (int)nbvar_.size();
+      }
    }
 
    // ---------------------------------------------------------------- partition
@@ -115,11 +125,24 @@ public:
       return owner;
    }
 
+   // Coarse-space hints for the solver, per KKT unknown [x | λ]: for each
+   // complicating y, the tile that owns its node (which side of the cut it is
+   // on) and the node's position.  Other entries are unused.
+   void coarse_hints(std::vector<int>& side, std::vector<std::array<double, 2>>& xy) const {
+      side.assign(n_vars() + n_rows(), -1);
+      xy.assign(n_vars() + n_rows(), {0.0, 0.0});
+      for (int g = 0; g < p_.N * p_.N; ++g)
+         if (yvar_[g] >= 0) {
+            side[yvar_[g]] = tile_of(g);
+            xy[yvar_[g]] = {(g % p_.N + 1) * h_, (g / p_.N + 1) * h_};
+         }
+   }
+
    // ---------------------------------------------------------------- results
    std::vector<double> u, f;     // u at the home copy, f
    double objective = 0.0;
    double max_link_gap = 0.0;    // max |copy − y| at the solution
-   int n_at_bound = 0;           // controls with |f| within 1e-4·fmax of the bound
+   int n_at_bound = 0;           // controls with |f| within 1% of the bound (IPM: never exactly on it)
 
    bool save_csv(const std::string& path) const {
       FILE* fp = std::fopen(path.c_str(), "w");
@@ -139,8 +162,7 @@ public:
       n = n_vars();
       m = n_rows();
       nnz_jac = 0;
-      for (int g = 0; g < p_.N * p_.N; ++g) nnz_jac += 2 + (int)neighbours(g).size();
-      nnz_jac += 2 * n_copies();
+      nnz_jac = 2 * p_.N * p_.N + (int)nbvar_.size() + 2 * n_copies();
       nnz_h = 2 * p_.N * p_.N;   // diagonal: home u and f of every node
       style = C_STYLE;
       return true;
@@ -184,10 +206,9 @@ public:
       const int NN = p_.N * p_.N;
       const double h2 = h_ * h_;
       for (int g = 0; g < NN; ++g) {
-         const int t = tile_of(g);
-         const double ug = x[u_in(t, g)];
+         const double ug = x[home_[g]];
          double r = 4.0 * ug + h2 * (p_.kappa * ug * ug * ug - x[fvar_[g]]);
-         for (int nb : neighbours(g)) r -= x[u_in(t, nb)];
+         for (int q = nbstart_[g]; q < nbstart_[g + 1]; ++q) r -= x[nbvar_[q]];
          c[g] = r;
       }
       for (size_t l = 0; l < links_.size(); ++l)
@@ -203,15 +224,14 @@ public:
       const double h2 = h_ * h_;
       int k = 0;
       for (int g = 0; g < NN; ++g) {
-         const int t = tile_of(g);
          if (val == nullptr) {
-            irow[k] = g; jcol[k++] = u_in(t, g);
-            for (int nb : neighbours(g)) { irow[k] = g; jcol[k++] = u_in(t, nb); }
+            irow[k] = g; jcol[k++] = home_[g];
+            for (int q = nbstart_[g]; q < nbstart_[g + 1]; ++q) { irow[k] = g; jcol[k++] = nbvar_[q]; }
             irow[k] = g; jcol[k++] = fvar_[g];
          } else {
-            const double ug = x[u_in(t, g)];
+            const double ug = x[home_[g]];
             val[k++] = 4.0 + 3.0 * p_.kappa * h2 * ug * ug;
-            for (size_t q = 0; q < neighbours(g).size(); ++q) val[k++] = -1.0;
+            for (int q = nbstart_[g]; q < nbstart_[g + 1]; ++q) val[k++] = -1.0;
             val[k++] = -h2;
          }
       }
@@ -255,7 +275,7 @@ public:
       for (int g = 0; g < NN; ++g) {
          u[g] = x[home_u(g)];
          f[g] = x[fvar_[g]];
-         if (std::abs(std::abs(f[g]) - p_.fmax) <= 1e-4 * p_.fmax) ++n_at_bound;
+         if (std::abs(std::abs(f[g]) - p_.fmax) <= 1e-2 * p_.fmax) ++n_at_bound;
       }
       max_link_gap = 0.0;
       for (const auto& l : links_)
@@ -290,7 +310,7 @@ private:
       assert(false && "tile does not use this u");
       return -1;
    }
-   int home_u(int g) const { return u_in(tile_of(g), g); }
+   int home_u(int g) const { return home_[g]; }
 
    Params p_;
    double h_;
@@ -300,4 +320,6 @@ private:
    std::vector<std::vector<std::pair<int, int>>> uvar_; // node → (tile, var) for u
    std::vector<int> fvar_, yvar_;                       // node → f var, y var (−1: none)
    std::vector<Link> links_;
+   std::vector<int> home_;              // node → its home u variable
+   std::vector<int> nbstart_, nbvar_;   // node → neighbour u variables of its row (CSR)
 };

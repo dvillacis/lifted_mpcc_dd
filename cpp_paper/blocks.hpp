@@ -364,6 +364,14 @@ public:
    }
    long fallbacks() const { return fallbacks_; }
 
+   // MUMPS tiles (with border unknowns) solve through condensation and
+   // expansion: reduce(r) gives B_k W_k⁻¹ r, then expand(y) gives
+   // W_k⁻¹(r − B_kᵀ y) for the same r.  One forward and one backward sweep,
+   // instead of two solve()s.
+   bool can_reduce() const { return used_ == Backend::Mumps && p_ > 0; }
+   void reduce(const Vec& r, Vec& bz) { mumps_reduce(r, bz); }
+   void expand(const Vec& y, Vec& x) { mumps_expand(y, x); }
+
 private:
    bool factorize_with(Backend which, const double* values) {
       used_ = which;
@@ -402,6 +410,15 @@ private:
    int mumps_negative() const { return mu_->negative(); }
    void mumps_solve(Vec& b) const { mu_->solve(b.data()); }
    Mat mumps_schur() const { return Eigen::Map<const Mat>(mu_->schur(), p_, p_); }
+   void mumps_reduce(const Vec& r, Vec& bz) {
+      bz.resize(p_);
+      mu_->reduce(r.data(), bz.data());
+      bz = -bz;   // MUMPS returns 0 − B W⁻¹ r
+   }
+   void mumps_expand(const Vec& y, Vec& x) {
+      x.resize(n_);
+      mu_->expand(y.data(), x.data());
+   }
    std::unique_ptr<MumpsBlock> mu_;
    std::vector<double> mval_;
 #else
@@ -409,6 +426,8 @@ private:
    int mumps_negative() const { return 0; }
    void mumps_solve(Vec&) const {}
    Mat mumps_schur() const { return Mat(); }
+   void mumps_reduce(const Vec&, Vec&) {}
+   void mumps_expand(const Vec&, Vec&) {}
 #endif
 
    Backend backend_ = Backend::Sparse, fallback_ = Backend::Dense, used_ = Backend::Sparse;

@@ -1,12 +1,11 @@
 #!/bin/bash
-# Build dd_toy.  Needs IPOPT (through pkg-config), Eigen and LAPACK (dsytrf).
+# Build tv_learn.  Needs IPOPT (found through pkg-config), Eigen and zlib.
 #
 #   ./build.sh            serial
-#   OMP=1 ./build.sh      OpenMP over the tiles in factorize()
+#   OMP=1 ./build.sh      OpenMP: the per-tile loops and the Z columns run in parallel
 #
-# macOS: Homebrew IPOPT and Eigen; LAPACK from the Accelerate framework.
-# Linux: activate a conda env with ipopt, eigen and lapack first
-#        (or set LAPACK_LIBS, e.g. LAPACK_LIBS="-lopenblas").
+# macOS: Homebrew IPOPT, Eigen and (for OMP=1) libomp.
+# Linux: activate a conda env with ipopt and eigen installed first.
 set -e
 cd "$(dirname "$0")"
 
@@ -19,7 +18,6 @@ if [ "$(uname)" = "Darwin" ]; then
   # the Command Line Tools' own libc++ headers can be missing: use the SDK's
   FLAGS+=(-nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK")
   FLAGS+=(-I"$(brew --prefix eigen)/include/eigen3")
-  LIBS+=(${LAPACK_LIBS:--framework Accelerate})
   if [ "${OMP:-0}" = "1" ]; then
     LIBOMP="$(brew --prefix libomp)"
     FLAGS+=(-Xpreprocessor -fopenmp -I"$LIBOMP/include")
@@ -33,17 +31,11 @@ else
   else
     FLAGS+=(-I"${CONDA_PREFIX:-/usr}/include/eigen3")
   fi
-  LIBS+=(${LAPACK_LIBS:--llapack -lblas})
   [ "${OMP:-0}" = "1" ] && FLAGS+=(-fopenmp)
   LIBS+=(-Wl,-rpath,"$(pkg-config --variable=libdir ipopt)")
 fi
 
-# dd_toy (the toy problem) and dd_mpcc (the MPCC of ../cpp_minimal, if present)
-"$CXX" "${FLAGS[@]}" $(pkg-config --cflags ipopt) main.cpp -o "${TARGET:-dd_toy}" \
-  "${LIBS[@]}" $(pkg-config --libs ipopt)
-echo "built $(pwd)/${TARGET:-dd_toy}"
-if [ -f ../cpp_minimal/problem.hpp ]; then
-  "$CXX" "${FLAGS[@]}" $(pkg-config --cflags ipopt) mpcc_main.cpp -o "${TARGET_MPCC:-dd_mpcc}" \
-    "${LIBS[@]}" $(pkg-config --libs ipopt)
-  echo "built $(pwd)/${TARGET_MPCC:-dd_mpcc}"
-fi
+# -lz: zlib compresses the .npz solution files (a system library everywhere)
+"$CXX" "${FLAGS[@]}" $(pkg-config --cflags ipopt) main.cpp -o tv_learn \
+  "${LIBS[@]}" -lz $(pkg-config --libs ipopt)
+echo "built ./tv_learn"

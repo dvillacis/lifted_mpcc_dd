@@ -118,6 +118,10 @@ public:
    double t_min = 1e-4;        // the level the answer is reported at
    double t_mu_scale = 10.0;   // t follows the barrier: t = max(t_min, 10·μ)
    double t_rate = 0.5;        // ... but may at most halve per iteration
+   double t_comp_ratio = 0.0;  // κ_t > 0: ... and never below max r(1−δ)/κ_t, so that t does
+                               // not run ahead of an iterate whose products lag behind
+                               // (mariposa N=640: t fell 7× in 3 iterations while
+                               // r(1−δ) stayed at 6.5·t_min; 40–77 iterations to catch up)
    double penalty = 0.0;       // π > 0: the exact-penalty formulation (see the header)
    double penalty_max = 1e8;
    bool penalty_hessian = true; // false: leave π's (indefinite) r–δ term out of the Hessian
@@ -432,16 +436,18 @@ public:
             return false;
          }
       }
+      double comp = 0.0;   // max r(1 − δ) at this iterate (global)
+      for (const Cell& q : cells_) comp = std::max(comp, it.x[q.r] * (1.0 - it.x[q.d]));
+      comp = dd::Comm::max(comp);
       double t_new = std::max(t_min, t_mu_scale * it.mu);
       if (t_new < t * t_rate) t_new = std::max(t_min, t * t_rate);
+      if (t_comp_ratio > 0.0 && penalty <= 0.0) t_new = std::max(t_new, comp / t_comp_ratio);
       if (t_on_solved && !it.barrier_solved) t_new = t;
       if (t_new < t) {
          t = t_new;
          eps_theta = c_theta * t_new;
       }
-      double comp = 0.0;
-      for (const Cell& q : cells_) comp = std::max(comp, it.x[q.r] * (1.0 - it.x[q.d]));
-      mu_trace.insert(mu_trace.end(), {(double)it.iter, it.mu, t, it.x[la_], dd::Comm::max(comp)});
+      mu_trace.insert(mu_trace.end(), {(double)it.iter, it.mu, t, it.x[la_], comp});
       return true;
    }
 

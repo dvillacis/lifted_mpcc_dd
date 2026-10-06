@@ -39,9 +39,19 @@
 //    the additive Schwarz preconditioner on the local assembled S̃_k (19), or
 //    (precond = ASd) the diagonally assembled one (20, 21): tile k's own S_k
 //    with its diagonal replaced by that of S.  S is taken as positive definite
-//    unless CG meets pᵀSp ≤ 0 (the paper's Sec. 3.5 check): solve() then
-//    returns false.
+//    unless CG meets pᵀSp ≤ 0 (the paper's Sec. 3.5 check), or, with AS, some
+//    S̃_k is not: S̃_k = N_kᵀ S N_k is a principal submatrix of S, so its
+//    Cholesky factorization failing proves S is not positive definite, and
+//    the solve is refused before any tile solve or CG iteration.  In both
+//    cases solve() returns false.  (In all runs measured, every S̃_k that was
+//    not SPD was followed by a CG breakdown anyway.)  The preconditioner is
+//    built at the first solve after a factorization, so that a factorization
+//    refused for In(W_k) costs no S̃_k exchange and no Cholesky.
 //  · direct: factorize the assembled S; its inertia is exact (eq. 25).
+//
+// The IPM refuses every factorization with a wrong In(W_k) (eq. 24).  When it
+// says so (factorize(true)), a rank stops factorizing its tiles at the first
+// one with a wrong inertia, or a singular one: the rest would be thrown away.
 //
 // ============================================================================
 //  4. PARALLELISM (MPI over tiles, OpenMP within a rank)
@@ -68,6 +78,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -98,6 +109,7 @@ public:
       int n_tiles = 0, dim = 0, p = 0, max_pk = 0, max_tk = 0;
       long factorizations = 0, singular = 0, s_not_pd = 0, fallbacks = 0;
       long solves = 0, cg_iters = 0, cg_max = 0, cg_breakdowns = 0, cg_unconverged = 0;
+      long s_tilde_indefinite = 0;   // solves refused: some S̃_k not SPD, so S not PD (AS)
       double t_factor = 0.0, t_solve = 0.0;                    // wall time (s)
       double t_blocks = 0.0, t_sdirect = 0.0, t_precond = 0.0;
       double t_tile_solves = 0.0, t_interface = 0.0;
@@ -260,25 +272,49 @@ public:
    int tile_negative(int k) const { return tile_neg_[k]; }
    int tile_duals(int k) const { return duals_[k]; }
    int s_negative() const { return negS_; }
+   // After factorize(true) returned true: the factorization stopped at a tile
+   // with a wrong In(W_k), and is to be refused (tile_negative() is then not
+   // meaningful).
+   bool inertia_stopped() const { return inertia_stopped_; }
 
    // ---------------------------------------------------------------- factorize
    // false = singular (some W_k or, in direct mode, S has a zero pivot).
-   bool factorize() {
+   // stop_on_inertia: the caller refuses any factorization with a wrong
+   // In(W_k) (#neg(W_k) ≠ #duals(W_k), eq. 24).  Each rank then stops at its
+   // first tile that is singular or has a wrong inertia, and a true return
+   // with inertia_stopped() reports the latter.  Which of the two is reported
+   // when both occur can depend on the number of ranks.
+   bool factorize(bool stop_on_inertia = false) {
       const auto t0 = Clock::now();
       ++st_->factorizations;
       const int p = (int)border_.size();
       const int K = (int)tiles_.size();
       const bool pcg_mode = opt_.interface == Interface::Pcg;
+      inertia_stopped_ = false;
+      precond_ready_ = false;
 
       // ---- this rank's tiles: W_k → In(W_k);  S_k = −B_k W_k⁻¹ B_kᵀ        (14)
-      std::vector<long> info(3 * K, 0);   // per tile: factorized?, #neg(W_k), fallbacks
+      // per tile: status (0 singular, 1 factorized, 2 wrong In(W_k), 3 skipped),
+      // #neg(W_k), fallbacks
+      std::vector<long> info(3 * K, 0);
+      std::atomic<bool> stop(false);
 #pragma omp parallel for schedule(dynamic)
       for (int k = k0_; k < k1_; ++k) {
          Tile& T = tiles_[k];
+         info[3 * k + 2] = T.blk.fallbacks();
+         if (stop.load(std::memory_order_relaxed)) {
+            info[3 * k] = 3;
+            continue;
+         }
          const bool good = T.blk.factorize(values_.data());
          info[3 * k] = good;
          info[3 * k + 1] = good ? T.blk.negative() : 0;
          info[3 * k + 2] = T.blk.fallbacks();
+         if (stop_on_inertia && (!good || T.blk.negative() != duals_[k])) {
+            if (good) info[3 * k] = 2;
+            stop = true;
+            continue;
+         }
          if (!good) continue;
          std::vector<Eigen::Triplet<double>> tb;
          tb.reserve(T.b.size());
@@ -288,14 +324,16 @@ public:
          T.S = T.blk.schur(T.B);
       }
       share_long(info, 3);
-      bool all_ok = true;
-      for (int k = 0; k < K; ++k) all_ok = all_ok && info[3 * k] != 0;
-      // direct: every rank assembles S from every S_k; PCG: the S̃_k need
-      // the parts of the other tiles' S_j on the shared border unknowns
+      bool all_ok = true, wrong = false;
+      for (int k = 0; k < K; ++k) {
+         all_ok = all_ok && info[3 * k] == 1;
+         wrong = wrong || info[3 * k] == 2;
+      }
+      // direct: every rank assembles S from every S_k (PCG: the parts the
+      // S̃_k need are exchanged when the preconditioner is built)
       if (all_ok && !pcg_mode)
          share(lenS_, [&](int k, double* d) { std::copy(tiles_[k].S.data(), tiles_[k].S.data() + lenS_[k], d); },
                [&](int k, const double* d) { tiles_[k].S = Eigen::Map<const Mat>(d, lenP_[k], lenP_[k]); });
-      if (all_ok && pcg_mode && opt_.precond == Precond::AS) exchange_S();
       st_->t_blocks += secs(t0);
       {
          long fb = 0;
@@ -315,6 +353,13 @@ public:
          }
          tile_neg_[k] = (int)info[3 * k + 1];
          negW += tile_neg_[k];
+      }
+      if (wrong) {   // stopped at a wrong In(W_k): the caller refuses it
+         inertia_stopped_ = true;
+         if (opt_.verbose && Comm::root())
+            std::printf("[dd] fact %3ld  stopped: wrong In(W_k)\n", st_->factorizations);
+         st_->t_factor += secs(t0);
+         return true;
       }
 
       // ---- C
@@ -339,39 +384,8 @@ public:
          }
          negS_ = Sf_.negative();
          if (negS_ > 0) ++st_->s_not_pd;
-      } else if (p > 0) {
-         // ---- PCG: the additive Schwarz blocks S̃_k = N_kᵀ S N_k          (18, 19)
-         //      or, ASd, S_k with its diagonal replaced by diag(S)           (20, 21)
-         const auto t1 = Clock::now();
-         M_.reset(K);
-         if (opt_.precond == Precond::ASd) {
-            // diag(S) = diag(C) + Σ_k N_k diag(S_k), in tile order: every rank
-            // needs the diagonals of all S_k (one value per border unknown each)
-            for (int k = k0_; k < k1_; ++k) tiles_[k].sdiag = tiles_[k].S.diagonal();
-            share(lenP_, [&](int k, double* d) { std::copy(tiles_[k].sdiag.data(), tiles_[k].sdiag.data() + lenP_[k], d); },
-                  [&](int k, const double* d) { tiles_[k].sdiag = Eigen::Map<const Vec>(d, lenP_[k]); });
-            diagS_.resize(p);
-            for (int i = 0; i < p; ++i) {
-               double s = cdiag_[i];
-               for (int q = ustart_[i]; q < ustart_[i + 1]; ++q)
-                  s += tiles_[users_[q][0]].sdiag[users_[q][1]];
-               diagS_[i] = s;
-            }
-         }
-#pragma omp parallel for schedule(dynamic)
-         for (int k = k0_; k < k1_; ++k) {
-            const Tile& T = tiles_[k];
-            if (T.nk.empty()) continue;
-            if (opt_.precond == Precond::AS) {
-               M_.set(k, T.nk, local_assembled(k));
-            } else {
-               Mat Mk = T.S;
-               for (size_t a = 0; a < T.nk.size(); ++a) Mk(a, a) = diagS_[T.nk[a]];
-               M_.set(k, T.nk, Mk);
-            }
-         }
-         st_->t_precond += secs(t1);
       }
+      // PCG: the preconditioner is built by the first solve (build_precond())
 
       if (opt_.verbose && Comm::root())
          std::printf("[dd] fact %3ld  Σ#neg(W_k)=%d%s\n", st_->factorizations, negW,
@@ -381,20 +395,36 @@ public:
    }
 
    // ---------------------------------------------------------------- solve
-   // In place.  Returns false if PCG met negative curvature (S not SPD).
+   // In place.  Returns false if S is seen not to be positive definite: PCG
+   // met negative curvature, or (AS) some S̃_k is not SPD.
    bool solve(double* rhs) {
-      const auto t0 = Clock::now();
-      ++st_->solves;
       const int p = (int)border_.size();
-      const int K = (int)tiles_.size();
+      const bool pcg_mode = opt_.interface == Interface::Pcg;
+      if (p > 0 && pcg_mode && !precond_ready_) build_precond();
+      const auto t0 = Clock::now();
+      if (p > 0 && pcg_mode && s_tilde_indefinite_) {
+         // a principal submatrix of S is not positive definite, so S is not
+         // (eq. 25): the answer a CG breakdown would give, without the solve
+         ++st_->s_tilde_indefinite;
+         if (opt_.verbose >= 2 && Comm::root())
+            std::printf("[dd]      some S~_k not SPD: S not positive definite\n");
+         st_->t_solve += secs(t0);
+         return false;
+      }
+      ++st_->solves;
       Eigen::Map<Vec> R(rhs, dim_);
 
       // z_k = W_k⁻¹ r_k,  then r_S = r_y − Σ N_k B_k z_k                    (10)
+      // (MUMPS tiles: B_k z_k by condensation, forward sweep only)
 #pragma omp parallel for schedule(dynamic)
       for (int k = k0_; k < k1_; ++k) {
          Tile& T = tiles_[k];
          T.z.resize(T.glob.size());
          for (size_t l = 0; l < T.glob.size(); ++l) T.z[l] = R[T.glob[l]];
+         if (T.blk.can_reduce()) {
+            T.blk.reduce(T.z, T.buf);
+            continue;
+         }
          T.blk.solve(T.z);
          T.buf = T.B * T.z;
       }
@@ -432,16 +462,22 @@ public:
       st_->t_interface += std::chrono::duration<double>(t2 - t1).count();
 
       // u_k = W_k⁻¹(r_k − B_kᵀ N_kᵀ u_y)                                   (11)
+      // (MUMPS tiles: by expansion of the condensation above, backward sweep only)
       for (int i = 0; i < p; ++i) R[border_[i]] = uy[i];
 #pragma omp parallel for schedule(dynamic)
       for (int k = k0_; k < k1_; ++k) {
          Tile& T = tiles_[k];
          Vec uyk(T.nk.size());
          for (size_t a = 0; a < T.nk.size(); ++a) uyk[a] = uy[T.nk[a]];
-         Vec rk(T.glob.size());
-         for (size_t l = 0; l < T.glob.size(); ++l) rk[l] = R[T.glob[l]];
-         rk -= T.B.transpose() * uyk;
-         T.blk.solve(rk);
+         Vec rk;
+         if (T.blk.can_reduce()) {
+            T.blk.expand(uyk, rk);
+         } else {
+            rk.resize(T.glob.size());
+            for (size_t l = 0; l < T.glob.size(); ++l) rk[l] = R[T.glob[l]];
+            rk -= T.B.transpose() * uyk;
+            T.blk.solve(rk);
+         }
          for (size_t l = 0; l < T.glob.size(); ++l) R[T.glob[l]] = rk[l];
       }
       st_->t_tile_solves += secs(t2);
@@ -530,6 +566,55 @@ private:
       SpMat S(p, p);
       S.setFromTriplets(t.begin(), t.end());
       return S;
+   }
+
+   // ---- PCG: the additive Schwarz blocks S̃_k = N_kᵀ S N_k                (18, 19)
+   //      or, ASd, S_k with its diagonal replaced by diag(S)                 (20, 21)
+   // Built by the first solve after a factorization, so that the factorizations
+   // the IPM refuses for In(W_k) cost no exchange and no block factorizations
+   // (counted in the factorization's time).  AS: whether some S̃_k is not SPD,
+   // which proves S is not (its principal submatrix).  Collective.
+   void build_precond() {
+      const auto t0 = Clock::now();
+      const int p = (int)border_.size();
+      const int K = (int)tiles_.size();
+      const bool as = opt_.precond == Precond::AS;
+      if (as) exchange_S();
+      M_.reset(K);
+      if (!as) {
+         // diag(S) = diag(C) + Σ_k N_k diag(S_k), in tile order: every rank
+         // needs the diagonals of all S_k (one value per border unknown each)
+         for (int k = k0_; k < k1_; ++k) tiles_[k].sdiag = tiles_[k].S.diagonal();
+         share(lenP_, [&](int k, double* d) { std::copy(tiles_[k].sdiag.data(), tiles_[k].sdiag.data() + lenP_[k], d); },
+               [&](int k, const double* d) { tiles_[k].sdiag = Eigen::Map<const Vec>(d, lenP_[k]); });
+         diagS_.resize(p);
+         for (int i = 0; i < p; ++i) {
+            double s = cdiag_[i];
+            for (int q = ustart_[i]; q < ustart_[i + 1]; ++q)
+               s += tiles_[users_[q][0]].sdiag[users_[q][1]];
+            diagS_[i] = s;
+         }
+      }
+      int indefinite = 0;
+#pragma omp parallel for schedule(dynamic) reduction(+ : indefinite)
+      for (int k = k0_; k < k1_; ++k) {
+         const Tile& T = tiles_[k];
+         if (T.nk.empty()) continue;
+         bool spd;
+         if (as) {
+            spd = M_.set(k, T.nk, local_assembled(k), false);
+         } else {   // not a submatrix of S: clip to SPD, as CG needs
+            Mat Mk = T.S;
+            for (size_t a = 0; a < T.nk.size(); ++a) Mk(a, a) = diagS_[T.nk[a]];
+            spd = M_.set(k, T.nk, Mk, true);
+         }
+         if (!spd) ++indefinite;
+      }
+      s_tilde_indefinite_ = as && Comm::any(indefinite > 0);
+      precond_ready_ = true;
+      const double dt = secs(t0);
+      st_->t_precond += dt;
+      st_->t_factor += dt;
    }
 
    // S̃_k = N_kᵀ S N_k, from the parts of the S_j of the tiles that share
@@ -739,6 +824,9 @@ private:
    Options opt_;
    unsigned long long hash_ = 0;   // of the structure (same_structure())
    int dim_ = 0, negS_ = 0;
+   bool inertia_stopped_ = false;      // last factorize(true) stopped at a wrong In(W_k)
+   bool precond_ready_ = false;        // the preconditioner is that of the last factorization
+   bool s_tilde_indefinite_ = false;   // ... and some S̃_k of it is not SPD (AS)
    int k0_ = 0, k1_ = 0;                        // this rank's tiles
    std::vector<int> lenP_, lenS_;               // per tile: p_k, p_k²
    std::vector<int> tile_neg_, duals_;          // #neg(W_k), #duals of W_k: every tile

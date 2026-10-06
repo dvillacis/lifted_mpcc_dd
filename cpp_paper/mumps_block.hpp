@@ -15,7 +15,23 @@
 //
 // Solves with W_k use JOB=3 with ICNTL(26)=0: the interior problem of A_k, the
 // Schur rows of the right-hand side zeroed on the way in and dropped on the way
-// out.
+// out.  The two tile solves of a Newton solve go through MUMPS's condensation
+// and expansion instead (reduce(), expand(): ICNTL(26)=1, then 2): one forward
+// sweep returns B_k W_k⁻¹ r_k, one backward sweep returns W_k⁻¹(r_k − B_kᵀ y),
+// half the work of two full solves.
+//
+// PIVOT THRESHOLD.  CNTL(1) = 1e-5 instead of MUMPS's 0.01.  At 0.01 about
+// 15% of the pivots of a tile were delayed (the zero-diagonal rows of the KKT
+// block), which grows the fronts.  Measured (same iterations, α*, PSNR at
+// every threshold):
+//
+//    CNTL(1)                      0.01    1e-4    1e-5    1e-6
+//    cam64 4×4: flops (10⁹)       7.73    5.21    4.55    4.16
+//               delayed pivots    689k    291k    119k    3.3k
+//    mumps_check max rel. error   6e-12   1e-10   1e-10   1.3e-9 (fails its 1e-9)
+//
+// 1e-6 (IPOPT's mumps_pivtol) gains little more and costs accuracy: IPOPT
+// makes up for it with iterative refinement, which tv_dd does not do.
 //
 // THREADS.  MUMPS's C interface is not thread-safe, even across separate
 // instances: every dmumps_c call hands its arrays to the Fortran side through
@@ -61,6 +77,7 @@ public:
       icntl(4) = 0;    // print level: none
       icntl(13) = 1;   // no ScaLAPACK root: INFOG(12) stays exact
       icntl(24) = 1;   // detect null pivots (report singular, don't abort)
+      id_.cntl[0] = 1e-5;   // CNTL(1), relative pivot threshold (see above)
       icntl(49) = 1;   // after each factorization, move the factors into an array of their
                        // own size and free the workspace (N=256 16×16, 8 ranks: peak RSS
                        // 380 → 331 MB/rank, same iterations)
@@ -167,6 +184,46 @@ public:
       return true;
    }
 
+   // Condensation (JOB=3, ICNTL(26)=1): for b on the interior (length n),
+   // red = 0 − B W⁻¹ b (length p), by forward elimination only.  Must be
+   // followed by expand() on this instance, with no other solve in between.
+   bool reduce(const double* b, double* red) {
+      const int na = n_ + p_;
+      buf_.assign(na, 0.0);
+      std::copy(b, b + n_, buf_.begin());
+      red_.assign(p_, 0.0);
+      id_.rhs = buf_.data();
+      id_.nrhs = 1;
+      id_.lrhs = na;
+      id_.redrhs = red_.data();
+      id_.lredrhs = p_;
+      icntl(26) = 1;
+      id_.job = 3;
+      call();
+      icntl(26) = 0;
+      if (infog(1) < 0) return false;
+      std::copy(red_.begin(), red_.end(), red);
+      return true;
+   }
+   // Expansion (JOB=3, ICNTL(26)=2) after reduce(b): x = W⁻¹(b − Bᵀ y) for
+   // the Schur unknowns y (length p); x has length n.
+   bool expand(const double* y, double* x) {
+      const int na = n_ + p_;
+      std::copy(y, y + p_, red_.begin());
+      id_.rhs = buf_.data();
+      id_.nrhs = 1;
+      id_.lrhs = na;
+      id_.redrhs = red_.data();
+      id_.lredrhs = p_;
+      icntl(26) = 2;
+      id_.job = 3;
+      call();
+      icntl(26) = 0;
+      if (infog(1) < 0) return false;
+      std::copy(buf_.begin(), buf_.begin() + n_, x);
+      return true;
+   }
+
    // Once per process: factorize a small KKT block with a known Schur
    // complement and inertia, and compare.  Guards against a MUMPS build whose
    // Schur layout or inertia reporting differs from what this file assumes.
@@ -197,6 +254,16 @@ public:
       const Eigen::Vector3d x_ref = W.inverse() * x;
       if (!m.solve(x.data())) return false;
       err = std::max(err, (x - x_ref).cwiseAbs().maxCoeff());
+      // condensation and expansion
+      const Eigen::Vector3d b(1.0, 2.0, 3.0);
+      const Eigen::Vector2d y(0.5, -1.0);
+      const Eigen::Vector2d red_ref = -B * W.inverse() * b;
+      const Eigen::Vector3d xe_ref = W.inverse() * (b - B.transpose() * y);
+      Eigen::Vector2d red;
+      Eigen::Vector3d xe;
+      if (!m.reduce(b.data(), red.data()) || !m.expand(y.data(), xe.data())) return false;
+      err = std::max(err, (red - red_ref).cwiseAbs().maxCoeff());
+      err = std::max(err, (xe - xe_ref).cwiseAbs().maxCoeff());
       return err < 1e-12 && m.negative() == neg_ref;
    }
 
@@ -216,7 +283,7 @@ private:
    bool alive_ = false;
    int n_ = 0, p_ = 0, nuser_ = 0, neg_ = 0;
    std::vector<MUMPS_INT> irn_, jcn_, listvar_;
-   std::vector<double> a_, schur_, buf_;
+   std::vector<double> a_, schur_, buf_, red_;
 };
 
 }  // namespace dd

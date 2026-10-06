@@ -1,7 +1,8 @@
 // mumps_check — run once on every machine / MUMPS build before using
 // --block-solver mumps.  Three checks:
 //
-//   1. self_test(): a 3×3 KKT block with a known Schur complement and inertia.
+//   1. self_test(): a 3×3 KKT block with a known Schur complement and inertia,
+//      a solve, and a condensation + expansion (reduce/expand).
 //   2. accuracy: random sparse KKT tiles (indefinite Hessian, rank-full
 //      Jacobian, linking rows to p border unknowns) against dense Eigen:
 //      S_k = −B W⁻¹ Bᵀ, #neg(W), and a multi-RHS solve.
@@ -93,7 +94,7 @@ int main(int argc, char** argv) {
 
    // ---- 1. self test
    const bool st = dd::MumpsBlock::self_test();
-   std::printf("1. self test (Schur layout, inertia, solve): %s\n", st ? "OK" : "FAILED");
+   std::printf("1. self test (Schur layout, inertia, solve, reduce/expand): %s\n", st ? "OK" : "FAILED");
    failures += !st;
 
    // ---- 2. accuracy against dense Eigen

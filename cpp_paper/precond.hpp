@@ -16,15 +16,19 @@ namespace dd {
 
 // =============================================================================
 //  Schwarz — one dense block per tile, each on the border indices idx_k.
-//  SPD blocks use Cholesky; others have their eigenvalues clipped to be
-//  positive (CG needs an SPD preconditioner).  set() may be called for
+//  SPD blocks use Cholesky.  A block that is not SPD makes set() return
+//  false; with clip, its eigenvalues are clipped to be positive (CG needs an
+//  SPD preconditioner), without, the block is left unusable.  The AS blocks
+//  S̃_k = N_kᵀ S N_k are principal submatrices of S, so one that is not SPD
+//  proves S is not positive definite: SchurDD then refuses the factorization
+//  without running PCG, and needs no clipping.  set() may be called for
 //  different k in parallel; apply_blocks() is parallel over blocks.
 // =============================================================================
 class Schwarz {
 public:
    void reset(int nblocks) { blocks_.assign(nblocks, Block()); }
    // Block k on the border indices idx (only the blocks this rank owns are set).
-   bool set(int k, const std::vector<int>& idx, const Mat& M) {
+   bool set(int k, const std::vector<int>& idx, const Mat& M, bool clip) {
       Block& b = blocks_[k];
       b.idx = idx;
       if (idx.empty()) return true;
@@ -32,6 +36,8 @@ public:
       if (chol.info() == Eigen::Success) {
          b.llt = std::move(chol);
          b.spd = true;
+      } else if (!clip) {
+         b.spd = false;
       } else {
          Eigen::SelfAdjointEigenSolver<Mat> es(M);
          Vec d = es.eigenvalues();

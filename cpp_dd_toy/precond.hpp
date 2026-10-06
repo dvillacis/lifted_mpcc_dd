@@ -3,8 +3,7 @@
 //   Schwarz  one level:  M⁻¹ r = Σ_k N_k M_k⁻¹ N_kᵀ r           (paper 17, 19, 21)
 //   Coarse   the coarse term of the two-level method              (paper 22)
 //               Q r = Z S₀⁻¹ Zᵀ r,   S₀ = Zᵀ S Z
-//            where the columns of Z span a coarse space (here: one column per
-//            interface "face", optionally enriched with local eigenvectors).
+//            where the columns of Z span a coarse space (see SchurDD::build_Z).
 //
 //   Combined:
 //     additive   M⁻¹ + Q                                           (paper 22)
@@ -113,7 +112,7 @@ public:
       n0_ = (int)S0.rows();
       ok_ = false;
       if (n0_ == 0) return false;
-      dense_ = n0_ <= 4000;
+      dense_ = n0_ <= 300;   // S₀ is sparse: sparse Cholesky beyond a few hundred
       if (dense_) {
          dl_.compute(Mat(S0));
          ok_ = dl_.info() == Eigen::Success;

@@ -20,11 +20,17 @@
 //                 L3 the other primals
 //                 L4 the other constraint rows
 //              each level in the relative order of an AMD ordering of the whole
-//              block.  Eliminating L1 puts −J H⁻¹ Jᵀ on the L2 diagonal; that in
-//              turn puts a nonzero on each L3 copy, and that on its linking row.
-//              No pivot is structurally zero, and since LDLᵀ is a congruence the
+//              block, except that every L4 row comes right after its L3 partner.
+//              Eliminating L1 puts −J H⁻¹ Jᵀ on the L2 diagonal; that in turn
+//              puts a nonzero on the L3 copies.  Not on all of them: at an
+//              interior tile corner two foreign copies sit in one row only, so
+//              their block is rank one and the second one would get an exact zero
+//              pivot (the corner null mode of S_k again).  Taking each copy
+//              together with its linking row fixes that, since the pair
+//              [m 1; 1 0] has determinant −1: the pivots are m, then −1/m, which
+//              restores the partner's diagonal.  Since LDLᵀ is a congruence the
 //              signs of D give the exact inertia (Sylvester).  A pivot that is
-//              still exactly zero returns "singular" and IPOPT regularizes.
+//              still exactly zero sends that factorization to DenseBK (TileBlock).
 //              The levels depend on which diagonals are zero (δ_w switches), so
 //              the order is recomputed only when they change.
 //
@@ -147,6 +153,12 @@ public:
       }
       SpMat pat(n, n);
       pat.setFromTriplets(t.begin(), t.end());
+      adj_.assign(n, {});
+      for (const Entry& e : w)
+         if (e[0] != e[1]) {
+            adj_[e[0]].push_back(e[1]);
+            adj_[e[1]].push_back(e[0]);
+         }
       Eigen::AMDOrdering<int>::PermutationType perm;
       Eigen::AMDOrdering<int>()(pat, perm);
       amd_.assign(perm.indices().data(), perm.indices().data() + n);   // new → old
@@ -174,7 +186,23 @@ public:
       for (size_t t = 0; t < w.size(); ++t) A_.valuePtr()[pos_[t]] += values[w[t][2]];
       f_.factorize(A_);
       if (f_.info() != Eigen::Success) return false;
-      return count_pivots(f_.vectorD(), neg_);
+      if (!count_pivots(f_.vectorD(), neg_)) return false;
+      // A pivot that is not zero but tiny relative to ITS OWN ROW of W_k signals
+      // the same cancellation polluted by round-off; without pivoting the
+      // factors would be inaccurate.  Refuse it too (TileBlock falls back).
+      // The scale is per row on purpose: late in the barrier W_k legitimately
+      // spans many orders of magnitude (Σ on active bounds), and a test against
+      // the largest pivot of the block would refuse healthy factorizations.
+      std::vector<double> rowmax(n_, 0.0);
+      for (const Entry& e : w) {
+         const double v = std::abs(values[e[2]]);
+         rowmax[e[0]] = std::max(rowmax[e[0]], v);
+         rowmax[e[1]] = std::max(rowmax[e[1]], v);
+      }
+      const Vec& D = f_.vectorD();
+      for (int i = 0; i < n_; ++i)
+         if (std::abs(D[o2n_[i]]) < 1e-14 * rowmax[i]) return false;
+      return true;
    }
 
    int negative() const { return neg_; }
@@ -217,9 +245,25 @@ private:
       level_ = std::move(lev);
       std::vector<int> order;   // new → old
       order.reserve(n_);
-      for (int l = 1; l <= 4; ++l)
+      for (int l = 1; l <= 2; ++l)
          for (int i : amd_)
             if (level_[i] == l) order.push_back(i);
+      // L3 in AMD order, each followed by the L4 rows whose L3 partners are all placed
+      std::vector<char> placed(n_, 0);
+      for (int i : order) placed[i] = 1;
+      for (int i : amd_) {
+         if (level_[i] != 3) continue;
+         order.push_back(i);
+         placed[i] = 1;
+         for (int j : adj_[i]) {
+            if (level_[j] != 4 || placed[j]) continue;
+            bool ready = true;
+            for (int q : adj_[j]) ready = ready && (level_[q] != 3 || placed[q]);
+            if (ready) { order.push_back(j); placed[j] = 1; }
+         }
+      }
+      for (int i : amd_)
+         if (!placed[i]) order.push_back(i);
       o2n_.assign(n_, 0);
       for (int k = 0; k < n_; ++k) o2n_[order[k]] = k;
 
@@ -249,12 +293,18 @@ private:
    const std::vector<Entry>* w_ = nullptr;
    std::vector<char> primal_, level_;
    std::vector<int> amd_, o2n_, pos_;
+   std::vector<std::vector<int>> adj_;
    SpMat A_;
    OpenLDLT<Eigen::NaturalOrdering<int>> f_;
 };
 
 // =============================================================================
-//  TileBlock — one W_k with either backend.
+//  TileBlock — one W_k with either backend.  The sparse backend falls back to
+//  dense Bunch–Kaufman for one factorization when its static order meets a zero
+//  pivot.  No static 1×1 order can rule that out in general: two constraint
+//  rows that lean on the same L1 variable get a rank-deficient −J H⁻¹ Jᵀ block,
+//  which MA27/MUMPS handle with 2×2 pivots.  The fallback keeps the inertia
+//  exact instead of making IPOPT regularize.
 // =============================================================================
 class TileBlock {
 public:
@@ -265,28 +315,43 @@ public:
       if (sparse_) sp_.set_pattern(n, w, std::move(primal));
    }
    bool factorize(const double* values) {
-      if (sparse_) return sp_.factorize(values);
-      Mat W = Mat::Zero(n_, n_);
-      for (const Entry& e : *w_) {
-         W(e[0], e[1]) += values[e[2]];
-         if (e[0] != e[1]) W(e[1], e[0]) += values[e[2]];
+      use_dense_ = !sparse_;
+      if (sparse_ && sp_.factorize(values)) {
+         bk_ = DenseBK();   // release a previous fallback's dense factor (t_k² doubles)
+         return true;
       }
-      return bk_.factorize(std::move(W));
+      if (sparse_) { use_dense_ = true; ++fallbacks_; }
+      bool ok = false;
+      // A dense tile costs t_k² doubles (≈100 MB at t_k = 3500).  Fallbacks are
+      // rare, so build them one at a time: otherwise every thread holds one at
+      // once and the peak memory multiplies by the thread count.
+#pragma omp critical(dd_dense_tile)
+      {
+         Mat W = Mat::Zero(n_, n_);
+         for (const Entry& e : *w_) {
+            W(e[0], e[1]) += values[e[2]];
+            if (e[0] != e[1]) W(e[1], e[0]) += values[e[2]];
+         }
+         ok = bk_.factorize(std::move(W));
+      }
+      return ok;
    }
-   int negative() const { return sparse_ ? sp_.negative() : bk_.negative(); }
-   void solve(Vec& b) const { sparse_ ? sp_.solve(b) : bk_.solve(b); }
+   int negative() const { return use_dense_ ? bk_.negative() : sp_.negative(); }
+   void solve(Vec& b) const { use_dense_ ? bk_.solve(b) : sp_.solve(b); }
    Mat schur(const SpMat& B) const {
-      if (sparse_) return sp_.schur(B);
+      if (!use_dense_) return sp_.schur(B);
       const Mat Bd(B);
       Mat X = Bd.transpose();
       bk_.solve(X);
       Mat S = -Bd * X;
       return 0.5 * (S + S.transpose());
    }
+   long fallbacks() const { return fallbacks_; }
 
 private:
-   bool sparse_ = true;
+   bool sparse_ = true, use_dense_ = false;
    int n_ = 0;
+   long fallbacks_ = 0;
    const std::vector<Entry>* w_ = nullptr;
    SparseKKT sp_;
    DenseBK bk_;
