@@ -1,6 +1,6 @@
 """Schematic of the discretization and the consensus split, per variable.
 
-Three panels, drawn from the same index arithmetic as ``cpp_minimal``:
+Three panels, drawn from the same index arithmetic as ``archive/cpp_minimal``:
 
   (a) the staggered grid: u on the N² nodes, (qx, qy, r, δ, θ) on the (N−1)²
       cells, and the forward-difference stencils Kx, Ky anchored at each cell's
@@ -28,11 +28,11 @@ from matplotlib.patches import FancyArrowPatch, Rectangle
 from plot_style import PALETTE, apply_style, figure_size, savefig
 
 TILE_COLORS = [PALETTE[c] for c in ("blue", "teal", "orange", "purple")]
-# `copies=` printed by cpp_minimal/tv_learn for these (N, k).
+# `copies=` printed by archive/cpp_minimal/tv_learn for these (N, k).
 KNOWN_COPIES = {(9, 2): 67, (10, 3): 149, (13, 3): 197, (17, 4): 391}
 
 
-# --- the index arithmetic of cpp_minimal -------------------------------------
+# --- the index arithmetic of archive/cpp_minimal -------------------------------------
 def partition(N, k):
     """cell_tile (nc×nc) and node_tile (N×N), as in partition.hpp."""
     nc = N - 1

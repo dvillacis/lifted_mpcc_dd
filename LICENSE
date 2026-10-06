@@ -39,9 +39,12 @@ Third-party components bundled with this distribution
 External dependencies that are NOT distributed with this software and must be
 obtained separately under their own terms:
 
-* IPOPT (EPL-2.0) and its bundled MUMPS linear solver.
-* HSL MA57 / MA97 (proprietary; free for academic use under the HSL licence,
-  https://licences.stfc.ac.uk/product/coin-hsl). The build links against these
-  but does not include them.
+* Eigen (MPL-2.0) and a LAPACK implementation, used by the solver in cpp/.
+* MUMPS (CeCILL-C), optional but recommended for cpp/ (COIN-OR ThirdParty-Mumps),
+  and an MPI implementation, optional, for distributed runs.
+* Only for the archived code in archive/: IPOPT (EPL-2.0) and HSL MA57 / MA97
+  (proprietary; free for academic use under the HSL licence,
+  https://licences.stfc.ac.uk/product/coin-hsl). Those builds link against these
+  but do not include them.
 * The bundled test image (images/cameraman.png) is the classic "cameraman"
   photograph, a standard image-processing benchmark in wide public circulation.

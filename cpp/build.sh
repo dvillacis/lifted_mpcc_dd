@@ -1,100 +1,86 @@
 #!/bin/bash
-# Build helper (macOS) for the domain-decomposition custom-IPOPT-linear-solver.
-# Direct interface solve by default; opt-in CG interface via --interface cg.
+# Build tv_dd.  Needs Eigen, LAPACK (dsytrf) and zlib — no IPOPT, no HSL.
+# MUMPS is optional: it enables --block-solver mumps / --fallback mumps.
 #
-# Handles three environment quirks:
-#   * IPOPT 3.14 (Homebrew) via `pkg-config ipopt`. The custom-solver path links
-#     against IPOPT's *internal* symbols (SparseSymLinearSolverInterface,
-#     TSymLinearSolver, AlgorithmBuilder) — these ARE exported by the Homebrew
-#     dylib, so no IPOPT rebuild is needed.
-#   * Eigen (`brew --prefix eigen`) for the local sparse assembly.
-#   * macOS CLT quirk: the toolchain's usr/include/c++/v1 is empty on this box, so
-#     force the SDK's libc++ via -nostdinc++ -isystem ... -isysroot. Without this
-#     even #include <iostream> fails.
+#   ./build.sh            serial
+#   OMP=1 ./build.sh      OpenMP over the tiles (then set OMP_NUM_THREADS or --threads)
+#   MUMPS=0 ./build.sh    build without MUMPS even if it is found
+#   MPI=1 ./build.sh      distribute the tiles over MPI ranks (run with mpirun -np R)
 #
-# OpenMP is optional (parallel W_k factorizations): pass OMP=1 to enable it. It is
-# OFF by default and the code compiles to a serial loop without it.
+# MUMPS is found through pkg-config "coinmumps" (COIN-OR ThirdParty-Mumps;
+# ~/.local/coinmumps is searched by default), or given explicitly with
+#   MUMPS_CFLAGS="-I/path/include" MUMPS_LIBS="-L/path/lib -ldmumps_seq -lmumps_common_seq ..."
+# (e.g. conda-forge's mumps-seq).  With MUMPS, mumps_check is built too: run it
+# once on every machine before using MUMPS tiles.
 #
-#   ./build.sh dd_solve.cpp    -o dd_solve
-#   ./build.sh dd_solve_1d.cpp -o dd_solve_1d
-#   ./build.sh dd_solve_2d.cpp -o dd_solve_2d
-#   OMP=1 ./build.sh dd_solve.cpp -o dd_solve
+# macOS: Homebrew Eigen (and libomp for OMP=1); LAPACK from Accelerate.
+# Linux: Eigen through pkg-config eigen3 (or $CONDA_PREFIX/include/eigen3) and
+#        -llapack -lblas; override with LAPACK_LIBS="-lopenblas" etc.
 set -e
-SDK="$(xcrun --show-sdk-path)"
-EIGEN="$(brew --prefix eigen)/include/eigen3"
+cd "$(dirname "$0")"
 
-# image_io.hpp + third_party/stb_image.h. In this standalone package they are
-# vendored next to the sources; the parent-dir case is kept so the script also
-# works inside the original development monorepo.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -f "$SCRIPT_DIR/image_io.hpp" ]; then
-  ROOT="$SCRIPT_DIR"
-elif [ -f "$SCRIPT_DIR/../image_io.hpp" ]; then
-  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FLAGS=(-std=c++17 -O2)
+LIBS=()
+
+if [ "$(uname)" = "Darwin" ]; then
+  CXX="${CXX:-clang++}"
+  SDK="$(xcrun --show-sdk-path)"
+  # the Command Line Tools' own libc++ headers can be missing: use the SDK's
+  FLAGS+=(-nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK")
+  FLAGS+=(-I"$(brew --prefix eigen)/include/eigen3")
+  LIBS+=(${LAPACK_LIBS:--framework Accelerate})
+  if [ "${OMP:-0}" = "1" ]; then
+    LIBOMP="$(brew --prefix libomp)"
+    FLAGS+=(-Xpreprocessor -fopenmp -I"$LIBOMP/include")
+    LIBS+=(-L"$LIBOMP/lib" -lomp)
+  fi
 else
-  echo "error: image_io.hpp not found next to the sources or one level up" >&2
-  exit 1
+  CXX="${CXX:-g++}"
+  [ -n "${CONDA_PREFIX:-}" ] && export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  if pkg-config --exists eigen3 2>/dev/null; then
+    FLAGS+=($(pkg-config --cflags eigen3))
+  else
+    FLAGS+=(-I"${CONDA_PREFIX:-/usr}/include/eigen3")
+  fi
+  [ -n "${CONDA_PREFIX:-}" ] && LIBS+=(-L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib")
+  LIBS+=(${LAPACK_LIBS:--llapack -lblas})
+  [ "${OMP:-0}" = "1" ] && FLAGS+=(-fopenmp)
 fi
 
-OMPFLAGS=()
-if [ "${OMP:-0}" = "1" ]; then
-  LIBOMP="$(brew --prefix libomp)"
-  OMPFLAGS=(-Xpreprocessor -fopenmp -I"$LIBOMP/include" -L"$LIBOMP/lib" -lomp)
+# ---- optional MPI.  The MPI library must come BEFORE MUMPS on the link line:
+# MUMPS's sequential build exports its own stand-ins for MPI_Init, MPI_Comm_rank,
+# ... (libseq), and the linker binds each symbol to the first library that
+# exports it.  So the mpicxx wrapper (which appends -lmpi last) is not used;
+# its flags are, in the right order.
+PFLAGS=()
+PLIBS=()
+if [ "${MPI:-0}" = "1" ]; then
+  if mpicxx --showme:compile >/dev/null 2>&1; then          # Open MPI
+    PFLAGS=(-DDD_HAVE_MPI $(mpicxx --showme:compile))
+    PLIBS=($(mpicxx --showme:link))
+  else                                                       # MPICH and derivatives
+    PFLAGS=(-DDD_HAVE_MPI $(mpicxx -compile_info | cut -d' ' -f2-))
+    PLIBS=($(mpicxx -link_info | cut -d' ' -f2-))
+  fi
 fi
 
-# zlib (-lz): compresses the .npz solution files --save-solution writes
-# (npz_writer.hpp). A system library on macOS and every Linux, so there is
-# nothing to install. To drop it, build with -DNPZ_NO_ZLIB and remove -lz —
-# the archives are then uncompressed but still valid .npz.
-#
-# COIN ThirdParty-Mumps (optional): enables the --wk-backend mumps W_k backend
-# (partial-factorization Schur, mumps_block.hpp). Detected via pkg-config;
-# without it the build is byte-identical to before and the flag errors cleanly
-# at runtime.
-MUMPSFLAGS=()
-MUMPSLIBS=()
-if pkg-config --exists coinmumps 2>/dev/null; then
-  MUMPSFLAGS=($(pkg-config --cflags coinmumps) -DDD_HAVE_MUMPS)
-  MUMPSLIBS=($(pkg-config --libs coinmumps) -Wl,-rpath,"$(pkg-config --variable=libdir coinmumps)")
+# ---- optional MUMPS
+MFLAGS=()
+MLIBS=()
+if [ "${MUMPS:-1}" != "0" ]; then
+  export PKG_CONFIG_PATH="$HOME/.local/coinmumps/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  if [ -n "${MUMPS_LIBS:-}" ]; then
+    MFLAGS=(-DDD_HAVE_MUMPS ${MUMPS_CFLAGS:-})
+    MLIBS=(${MUMPS_LIBS})
+  elif pkg-config --exists coinmumps 2>/dev/null; then
+    MFLAGS=(-DDD_HAVE_MUMPS $(pkg-config --cflags coinmumps))
+    MLIBS=($(pkg-config --libs coinmumps) -Wl,-rpath,"$(pkg-config --variable=libdir coinmumps)")
+  fi
 fi
 
-# HSL MA57 — the DD solver factorizes each subdomain block W_k with it. Override
-# the prefix with HSLDIR if the library lives elsewhere. The dylib pulls in
-# openblas / libfakemetis / libgfortran through its own absolute-path load
-# commands, so only MA57 itself needs to be named here.
-# MA57 is OPTIONAL since the ddsimple simplification: without it the build
-# defines no DD_HAVE_MA57, dd_solve_2d.cpp compiles out --solver dd, and the
-# Eigen-only --solver ddsimple (plus IPOPT's own mumps) still works. Targets
-# that hard-require dd_solver.hpp (dd_solve.cpp, dd_solve_1d.cpp,
-# dd_solve_dataset.cpp) will fail to link without HSL — that is expected.
-HSLDIR="${HSLDIR:-$HOME/.local/hsl-ma57}"
-HSLFLAGS=()
-HSLLIBS=()
-if [ -f "$HSLDIR/lib/libhsl_ma57.dylib" ]; then
-  HSLFLAGS=(-DDD_HAVE_MA57)
-  HSLLIBS=(-L"$HSLDIR/lib" -lhsl_ma57 -Wl,-rpath,"$HSLDIR/lib")
-else
-  echo "note: HSL MA57 not found at $HSLDIR/lib/libhsl_ma57.dylib" >&2
-  echo "      building WITHOUT it: --solver dd is disabled, --solver ddsimple" >&2
-  echo "      and mumps still work (set HSLDIR to re-enable MA57)" >&2
+"$CXX" "${FLAGS[@]}" "${PFLAGS[@]}" "${MFLAGS[@]}" main.cpp -o tv_dd "${LIBS[@]}" "${PLIBS[@]}" "${MLIBS[@]}" -lz
+echo "built $(pwd)/tv_dd ($([ ${#MFLAGS[@]} -gt 0 ] && echo "with" || echo "without") MUMPS, $([ ${#PFLAGS[@]} -gt 0 ] && echo "with" || echo "without") MPI)"
+if [ ${#MFLAGS[@]} -gt 0 ]; then
+  "$CXX" "${FLAGS[@]}" "${MFLAGS[@]}" mumps_check.cpp -o mumps_check "${LIBS[@]}" "${MLIBS[@]}"
+  echo "built $(pwd)/mumps_check  (run it once on this machine)"
 fi
-
-# LAPACK (optional): dd_solve_2d --block-solver dense (dense Bunch–Kaufman
-# blocks, exact inertia) needs dsytrf/dsytrs. Homebrew's OpenBLAS carries them.
-LAPACKFLAGS=()
-LAPACKLIBS=()
-if OPENBLAS="$(brew --prefix openblas 2>/dev/null)" && [ -f "$OPENBLAS/lib/libopenblas.dylib" ]; then
-  LAPACKFLAGS=(-DDD_HAVE_LAPACK)
-  LAPACKLIBS=(-L"$OPENBLAS/lib" -lopenblas -Wl,-rpath,"$OPENBLAS/lib")
-fi
-
-exec clang++ -std=c++17 -O2 \
-  -nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK" \
-  -I"$EIGEN" -I"$ROOT" -I"$ROOT/third_party" $(pkg-config --cflags ipopt) \
-  "${OMPFLAGS[@]}" "${MUMPSFLAGS[@]}" "${HSLFLAGS[@]}" "${LAPACKFLAGS[@]}" \
-  "$@" \
-  "${HSLLIBS[@]}" \
-  "${LAPACKLIBS[@]}" \
-  "${MUMPSLIBS[@]}" \
-  -lz \
-  $(pkg-config --libs ipopt)

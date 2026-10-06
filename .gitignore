@@ -1,31 +1,30 @@
-# Compiled C++ drivers & artifacts
-cpp/dd_solve
-cpp/dd_solve_1d
-cpp/dd_solve_2d
-cpp_minimal/tv_learn
-cpp/dd_solve_dataset
-cpp/dd_solve*_omp
-cpp/dd_solve*_prof
-cpp/ma97_smoke
-cpp/ma97_smoke_par
-cpp/mumps_smoke
+# Compiled C++ binaries (cpp/ has its own .gitignore for tv_dd, mumps_check)
+archive/cpp/dd_solve
+archive/cpp/dd_solve_1d
+archive/cpp/dd_solve_2d
+archive/cpp_minimal/tv_learn
+archive/cpp/dd_solve_dataset
+archive/cpp/dd_solve*_omp
+archive/cpp/dd_solve*_prof
+archive/cpp/ma97_smoke
+archive/cpp/ma97_smoke_par
+archive/cpp/mumps_smoke
 *.o
 *.dSYM/
 *.dwarf
 docs/
 # Solver output (regenerated)
-cpp/results/
+archive/cpp/results/
 /results/
-cpp/plots/
-cpp/sol_*.txt
-cpp/dd_*.txt
-cpp/*.png
+archive/cpp/plots/
+archive/cpp/sol_*.txt
+archive/cpp/dd_*.txt
+archive/cpp/*.png
 
 runs/sols
 
-# SLURM logs. The batch scripts write %x_%j.out/.err into SLURM_SUBMIT_DIR, and
-# since they now locate the repo themselves that can be the repo root, cpp/ or
-# slurm/ — so these are global rather than slurm/-scoped. Nothing tracked has
+# SLURM logs. The (archived) batch scripts write %x_%j.out/.err into
+# SLURM_SUBMIT_DIR, which can be anywhere in the repo, so these are global. Nothing tracked has
 # either extension; re-check before adding one that should be committed.
 *.out
 *.err
@@ -56,6 +55,6 @@ python/*.png
 # how mariposa.png silently failed to be added the first time).
 !images/*.png
 !python/images/*.png
-!cpp/data/*.txt
+!archive/cpp/data/*.txt
 
 runs/sols

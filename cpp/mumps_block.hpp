@@ -1,279 +1,291 @@
-// A RAII wrapper around COIN ThirdParty-Mumps for one subdomain block W_k,
-// computing the local Schur contribution S_k = −B̄_k W_k⁻¹ B̄_kᵀ as a byproduct
-// of the factorization (MUMPS's partial-factorization Schur feature).
+// mumps_block.hpp — one tile block W_k factorized by MUMPS (sequential), with
+// the local Schur complement S_k = −B_k W_k⁻¹ B_kᵀ returned by the
+// factorization itself.  Built only with DD_HAVE_MUMPS (see build.sh).
 //
-// Why MUMPS next to MA57: in direct mode the dominant DD cost is the S_k phase
-// — p_k dense multi-RHS MA57 backsolves per block (measured: backsolves are
-// 97.5% of the phase; the RHS columns are 0.3–1% dense and MA57CD is
-// dense-RHS-only). MUMPS eliminates the interior variables of the AUGMENTED
-// local matrix
+// MUMPS eliminates the interior of the AUGMENTED tile matrix
 //
-//     A_k = [ W_k   B̄_kᵀ ]     Schur list = the p_k appended border indices
-//           [ B̄_k   0    ]
+//     A_k = [ W_k   B_kᵀ ]     Schur variables = the p_k appended border rows
+//           [ B_k   0    ]
 //
-// and returns Schur = 0 − B̄_k W_k⁻¹ B̄_kᵀ directly — BLAS-3 frontal kernels and
-// internal sparsity instead of p_k naive backsolves. That is EXACTLY the Sk_
-// the arrowhead scatter consumes (same sign), and INFOG(12) gives the negative
-// pivots of the factored interior part (= In(W_k)_neg), so the Haynsworth
-// inertia contract is untouched.
+// and returns its Schur complement 0 − B_k W_k⁻¹ B_kᵀ = S_k (ICNTL(19)): BLAS-3
+// frontal kernels instead of p_k triangular solves.  It pivots (1×1 and 2×2),
+// so no level order and no fallback are needed, and INFOG(12) is the number of
+// negative pivots of the factored interior, i.e. #neg(W_k) — exact as long as
+// no ScaLAPACK root is used (ICNTL(13) = 1).
 //
-// Contracts mirrored from Ma57Block (the validated reference wrapper):
-//   * analysis once per block, values-only refresh per Newton step;
-//   * coordinate input, ONE (lower) triangle, 1-based indices, duplicates
-//     summed; a full zero diagonal is appended so every variable — including
-//     Schur variables with only off-diagonal couplings — is structurally
-//     present;
-//   * honest singularity: null-pivot detection (ICNTL(24)=1) reports
-//     singular() without masking, INFO(1)=−10 maps to the same; OOM/workspace
-//     exhaustion is resource_failure(), never singularity;
-//   * solve() = W_k⁻¹ on the INTERIOR problem (JOB=3 with ICNTL(26)=0 on the
-//     augmented system), single or multi RHS, with the per-epoch
-//     solve_failed() latch.
+// Solves with W_k use JOB=3 with ICNTL(26)=0: the interior problem of A_k, the
+// Schur rows of the right-hand side zeroed on the way in and dropped on the way
+// out.  The two tile solves of a Newton solve go through MUMPS's condensation
+// and expansion instead (reduce(), expand(): ICNTL(26)=1, then 2): one forward
+// sweep returns B_k W_k⁻¹ r_k, one backward sweep returns W_k⁻¹(r_k − B_kᵀ y),
+// half the work of two full solves.
 //
-// The Schur array layout was established empirically (mumps_smoke.cpp's
-// sentinel probe): MUMPS writes the lower triangle into the full p×p array
-// and zeroes the upper; factorize() mirrors it to a plain symmetric matrix.
-// Run mumps_smoke on every new machine/library build — it is the layout
-// canary as well as the API validation gate.
+// PIVOT THRESHOLD.  CNTL(1) = 1e-5 instead of MUMPS's 0.01.  At 0.01 about
+// 15% of the pivots of a tile were delayed (the zero-diagonal rows of the KKT
+// block), which grows the fronts.  Measured (same iterations, α*, PSNR at
+// every threshold):
 //
-// THREADING: unproven. MUMPS instances carry library-internal state and this
-// wrapper has not been through a mumps_smoke_par-style concurrency audit (the
-// MA97 lesson: concurrent ma97_factor heap-corrupts). Callers must factorize
-// MumpsSchurBlock objects SERIALLY until such an audit exists.
-#ifndef MUMPS_BLOCK_HPP
-#define MUMPS_BLOCK_HPP
+//    CNTL(1)                      0.01    1e-4    1e-5    1e-6
+//    cam64 4×4: flops (10⁹)       7.73    5.21    4.55    4.16
+//               delayed pivots    689k    291k    119k    3.3k
+//    mumps_check max rel. error   6e-12   1e-10   1e-10   1.3e-9 (fails its 1e-9)
+//
+// 1e-6 (IPOPT's mumps_pivtol) gains little more and costs accuracy: IPOPT
+// makes up for it with iterative refinement, which tv_dd does not do.
+//
+// THREADS.  MUMPS's C interface is not thread-safe, even across separate
+// instances: every dmumps_c call hands its arrays to the Fortran side through
+// global static variables, and an instance table is shared.  Measured with
+// mumps_check (MUMPS 5.9.1): concurrent calls crash or abort with "Instance
+// Error ... MPI_ABORT", even with instances created serially.  So every call
+// here takes one process-wide lock: MUMPS tiles are factorized and solved one
+// at a time, while the rest of the per-tile work stays parallel.
+//
+// The layout of the returned Schur array is checked rather than assumed:
+// MUMPS 5.x fills one triangle of the p×p array; self_test() compares against
+// a dense reference (tv_dd runs it once at startup, mumps_check on demand).
+#pragma once
+
+#ifdef DD_HAVE_MUMPS
 
 #include <algorithm>
 #include <cmath>
-#include <cstddef>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
-#include <limits>
+#include <mutex>
 #include <vector>
+
+#include <Eigen/Dense>
 
 #include "dmumps_c.h"
 
-class MumpsSchurBlock {
-public:
-   MumpsSchurBlock() {
-      std::memset(&id_, 0, sizeof(id_));
-      id_.comm_fortran = -987654;   // USE_COMM_WORLD (COIN libseq stub)
-      id_.par = 1;                  // host works
-      id_.sym = 2;                  // general symmetric indefinite
-      id_.job = -1;                 // initialize
-      dmumps_c(&id_);
-      alive_ = (infog(1) >= 0);
-      icntl(1) = -1;   // error stream    (≤0 suppresses)
-      icntl(2) = -1;   // diagnostic stream
-      icntl(3) = -1;   // global info stream
-      icntl(4) = 0;    // print level: none
-      icntl(13) = 1;   // no ScaLAPACK root — INFOG(12) inertia stays exact
-      icntl(24) = 1;   // null-pivot detection: honest singular(), no hard abort
-      // Scaling/ordering stay at MUMPS defaults — the MA57 record says scaling
-      // OFF is a measured 6.5× blowup on the Scholtes-tail KKTs; don't mimic.
-   }
+namespace dd {
 
-   ~MumpsSchurBlock() {
+class MumpsBlock {
+public:
+   MumpsBlock() {
+      std::memset(&id_, 0, sizeof(id_));
+      id_.comm_fortran = -987654;   // USE_COMM_WORLD: the sequential libseq stub
+      id_.par = 1;                  // the host works
+      id_.sym = 2;                  // general symmetric (indefinite)
+      id_.job = -1;                 // initialize
+      call();
+      alive_ = infog(1) >= 0;
+      icntl(1) = -1;   // error stream: off
+      icntl(2) = -1;   // diagnostics: off
+      icntl(3) = -1;   // global info: off
+      icntl(4) = 0;    // print level: none
+      icntl(13) = 1;   // no ScaLAPACK root: INFOG(12) stays exact
+      icntl(24) = 1;   // detect null pivots (report singular, don't abort)
+      id_.cntl[0] = 1e-5;   // CNTL(1), relative pivot threshold (see above)
+      icntl(49) = 1;   // after each factorization, move the factors into an array of their
+                       // own size and free the workspace (N=256 16×16, 8 ranks: peak RSS
+                       // 380 → 331 MB/rank, same iterations)
+   }
+   ~MumpsBlock() {
       if (alive_) {
          id_.job = -2;
-         dmumps_c(&id_);
+         call();
       }
    }
-   MumpsSchurBlock(const MumpsSchurBlock&) = delete;
-   MumpsSchurBlock& operator=(const MumpsSchurBlock&) = delete;
+   MumpsBlock(const MumpsBlock&) = delete;
+   MumpsBlock& operator=(const MumpsBlock&) = delete;
 
-   const char* version() const { return id_.version_number; }
-
-   // Symbolic analysis of the augmented block. irn/jcn are the USER triplets,
-   // 1-based, one (lower) triangle: interior indices 1..n_int, Schur (border)
-   // indices n_int+1..n_int+pk. Call once; only values change afterwards.
-   bool analyze(int n_int, int pk, const std::vector<int>& irn,
-                const std::vector<int>& jcn) {
+   // Pattern of the augmented matrix, 0-based, any triangle (folded to the
+   // lower one here), duplicates allowed: interior 0..n−1, Schur n..n+p−1.
+   // Call once; afterwards only values change (same order as r/c).
+   bool analyze(int n, int p, const std::vector<int>& r, const std::vector<int>& c) {
       if (!alive_) return false;
-      n_int_ = n_int;
-      pk_ = pk;
-      const int n_aug = n_int + pk;
-      ne_user_ = (int)irn.size();
-      irn_.assign(irn.begin(), irn.end());
-      jcn_.assign(jcn.begin(), jcn.end());
-      // Appended zero diagonal (summed with any user entries — exact): every
-      // variable is structurally present, as in Ma57Block.
-      for (int i = 1; i <= n_aug; ++i) { irn_.push_back(i); jcn_.push_back(i); }
-      ne_ = (int)irn_.size();
-      a_.assign(std::max(ne_, 1), 0.0);
-      id_.n = n_aug;
-      id_.nnz = (MUMPS_INT8)ne_;
+      n_ = n;
+      p_ = p;
+      const int na = n + p;
+      nuser_ = (int)r.size();
+      irn_.clear();
+      jcn_.clear();
+      for (size_t t = 0; t < r.size(); ++t) {
+         irn_.push_back(std::max(r[t], c[t]) + 1);
+         jcn_.push_back(std::min(r[t], c[t]) + 1);
+      }
+      // a zero diagonal for every variable, so each is structurally present
+      for (int i = 1; i <= na; ++i) { irn_.push_back(i); jcn_.push_back(i); }
+      a_.assign(irn_.size(), 0.0);
+      id_.n = na;
+      id_.nnz = (MUMPS_INT8)irn_.size();
       id_.irn = irn_.data();
       id_.jcn = jcn_.data();
       id_.a = a_.data();
-      if (pk_ > 0) {
-         listvar_.resize(pk_);
-         for (int j = 0; j < pk_; ++j) listvar_[j] = n_int_ + 1 + j;
-         schur_.assign((std::size_t)pk_ * pk_, 0.0);
-         id_.size_schur = pk_;
+      if (p_ > 0) {
+         listvar_.resize(p_);
+         for (int j = 0; j < p_; ++j) listvar_[j] = n_ + 1 + j;
+         schur_.assign((size_t)p_ * p_, 0.0);
+         id_.size_schur = p_;
          id_.listvar_schur = listvar_.data();
          id_.schur = schur_.data();
-         icntl(19) = 1;              // centralized Schur on the host
+         icntl(19) = 1;   // centralized Schur complement on the host
       } else {
-         id_.size_schur = 0;
-         id_.listvar_schur = nullptr;
-         id_.schur = nullptr;
          icntl(19) = 0;
       }
       id_.job = 1;
-      dmumps_c(&id_);
-      status_ = infog(1);
-      if (status_ < 0) return false;
-      // Out-of-range entries are dropped silently past the warning (+1 flag):
-      // that would factorize the WRONG matrix. Any hit is an index-mapping bug
-      // upstream — refuse, exactly like Ma57Block's INFO(3) gate.
-      if (status_ > 0 && (status_ & 1)) {
-         std::cerr << "[mumps] analyze: out-of-range triplet(s) (n=" << n_aug
-                   << ") — index-mapping bug, refusing to factorize the "
-                      "reduced matrix\n";
-         return false;
-      }
-      return true;
+      call();
+      return infog(1) >= 0 && !(infog(1) > 0 && (infog(1) & 1));   // +1: dropped entries
    }
 
-   double* values() { return a_.data(); }   // the user's ne triplets
-   int nnz() const { return ne_user_; }
-   int dim() const { return n_int_; }       // INTERIOR dimension (= W_k's)
-   int schur_dim() const { return pk_; }
-
-   // Numeric factorization + Schur formation of the values currently in
-   // values(). Retries with a larger workspace relaxation on the standard
-   // "workspace too small" returns (the MA57 −3/−4 pattern).
-   bool factorize() {
-      resource_failure_ = false;
-      solve_failed_ = false;      // new factorization = new solve epoch
-      singular_ = false;
+   // Factorize with the values of the user entries (in analyze()'s order).
+   // false: singular (zero or null pivot), or MUMPS could not finish.
+   bool factorize(const double* user_values) {
+      std::copy(user_values, user_values + nuser_, a_.begin());
+      std::fill(a_.begin() + nuser_, a_.end(), 0.0);
       neg_ = 0;
-      nullpiv_ = 0;
-      if (!alive_) { resource_failure_ = true; return false; }
       for (int attempt = 0; attempt < 6; ++attempt) {
          id_.job = 2;
-         dmumps_c(&id_);
-         status_ = infog(1);
-         if (status_ == -8 || status_ == -9 || status_ == -19) {
-            // Workspace estimate too small: raise the relaxation and retry.
+         call();
+         const int st = infog(1);
+         if (st == -8 || st == -9 || st == -19) {   // workspace too small: retry larger
             icntl(14) = std::max(2 * icntl(14), 40);
             continue;
          }
-         if (status_ == -13) {     // allocation failure — resources, not math
-            std::cerr << "[mumps] factorize: allocation failure (n="
-                      << n_int_ + pk_ << ", INFOG(2)=" << infog(2) << ")\n";
-            resource_failure_ = true;
-            return false;
-         }
-         if (status_ == -10) {     // numerically singular — the honest answer
-            singular_ = true;
-            return false;
-         }
-         if (status_ < 0) return false;
-         neg_ = infog(12);         // negative pivots of the factored interior
-         nullpiv_ = infog(28);     // null pivots found by ICNTL(24)
-         singular_ = nullpiv_ > 0;
-         return pk_ > 0 ? finish_schur() : true;
+         if (st < 0) return false;                  // −10 singular, −13 memory, ...
+         if (infog(28) > 0) return false;           // null pivots
+         neg_ = infog(12);
+         // MUMPS fills one triangle of the p×p array: symmetrize (the other
+         // triangle is checked to be zero by self_test()).
+         for (int i = 0; i < p_; ++i)
+            for (int j = 0; j < i; ++j) {
+               double& lo = schur_[(size_t)i * p_ + j];
+               double& up = schur_[(size_t)j * p_ + i];
+               const double v = lo != 0.0 ? lo : up;
+               lo = up = v;
+            }
+         return true;
       }
-      resource_failure_ = true;    // six workspace rounds without completing
       return false;
    }
 
-   // The symmetrized pk×pk Schur block, valid after a successful factorize().
-   // Layout: symmetric, so row-/col-major coincide; entry (a,b) at a*pk+b.
+   int negative() const { return neg_; }
+   // S_k (p × p, symmetric), valid after a successful factorize()
    const double* schur() const { return schur_.data(); }
 
-   // In-place solve W_k x = b on the INTERIOR problem, nrhs columns
-   // (column-major, leading dimension n_int). JOB=3 with ICNTL(26)=0 solves
-   // the internal problem of the augmented system; Schur-variable rows of the
-   // MUMPS RHS are zeroed on the way in and dropped on the way out.
-   bool solve(double* rhs, int nrhs = 1) {
-      if (nrhs <= 0) return true;
-      if (!alive_) { solve_failed_ = true; return false; }
-      const int n_aug = n_int_ + pk_;
-      // Chunk very wide RHS batches so the staging buffer stays bounded
-      // (mirrors Ma57Block's LW cap; in the DD solver nrhs is 1 anyway).
-      static constexpr long CAP = 1L << 27;
-      if ((long)n_aug * nrhs > CAP) {
-         const int chunk = std::max(1, (int)(CAP / n_aug));
-         bool ok = true;
-         for (int j0 = 0; j0 < nrhs; j0 += chunk)
-            ok = solve(rhs + (std::size_t)j0 * n_int_,
-                       std::min(chunk, nrhs - j0)) && ok;
-         return ok;
-      }
-      if ((long)rhs_buf_.size() < (long)n_aug * nrhs)
-         rhs_buf_.resize((std::size_t)n_aug * nrhs);
-      for (int c = 0; c < nrhs; ++c) {
-         double* dst = rhs_buf_.data() + (std::size_t)c * n_aug;
-         const double* src = rhs + (std::size_t)c * n_int_;
-         std::copy(src, src + n_int_, dst);
-         std::fill(dst + n_int_, dst + n_aug, 0.0);
-      }
-      id_.rhs = rhs_buf_.data();
+   // In-place solve W x = b for nrhs columns (leading dimension n).
+   bool solve(double* b, int nrhs = 1) {
+      const int na = n_ + p_;
+      buf_.assign((size_t)na * nrhs, 0.0);
+      for (int k = 0; k < nrhs; ++k)
+         std::copy(b + (size_t)k * n_, b + (size_t)(k + 1) * n_, buf_.begin() + (size_t)k * na);
+      id_.rhs = buf_.data();
       id_.nrhs = nrhs;
-      id_.lrhs = n_aug;
-      icntl(26) = 0;               // solve the internal problem
+      id_.lrhs = na;
+      icntl(26) = 0;   // the interior problem only
       id_.job = 3;
-      dmumps_c(&id_);
-      status_ = infog(1);
-      if (status_ < 0) {
-         solve_failed_ = true;
-         static bool warned = false;
-         if (!warned) {
-            std::cerr << "[mumps] solve failed: INFOG(1)=" << status_ << "\n";
-            warned = true;
-         }
-         return false;
-      }
-      for (int c = 0; c < nrhs; ++c) {
-         const double* src = rhs_buf_.data() + (std::size_t)c * n_aug;
-         std::copy(src, src + n_int_, rhs + (std::size_t)c * n_int_);
-      }
+      call();
+      if (infog(1) < 0) return false;
+      for (int k = 0; k < nrhs; ++k)
+         std::copy(buf_.begin() + (size_t)k * na, buf_.begin() + (size_t)k * na + n_,
+                   b + (size_t)k * n_);
       return true;
    }
 
-   int negative_eigenvalues() const { return neg_; }
-   int rank() const { return n_int_ - nullpiv_; }
-   bool singular() const { return singular_; }
-   int status() const { return status_; }
-   // True when the last factorize() failure was workspace/memory, NOT a
-   // property of the matrix (same contract as Ma57Block).
-   bool resource_failure() const { return resource_failure_; }
-   // Sticky per factorization epoch: any solve since the last factorize()
-   // reported INFOG(1) < 0 (its output is garbage).
-   bool solve_failed() const { return solve_failed_; }
+   // Condensation (JOB=3, ICNTL(26)=1): for b on the interior (length n),
+   // red = 0 − B W⁻¹ b (length p), by forward elimination only.  Must be
+   // followed by expand() on this instance, with no other solve in between.
+   bool reduce(const double* b, double* red) {
+      const int na = n_ + p_;
+      buf_.assign(na, 0.0);
+      std::copy(b, b + n_, buf_.begin());
+      red_.assign(p_, 0.0);
+      id_.rhs = buf_.data();
+      id_.nrhs = 1;
+      id_.lrhs = na;
+      id_.redrhs = red_.data();
+      id_.lredrhs = p_;
+      icntl(26) = 1;
+      id_.job = 3;
+      call();
+      icntl(26) = 0;
+      if (infog(1) < 0) return false;
+      std::copy(red_.begin(), red_.end(), red);
+      return true;
+   }
+   // Expansion (JOB=3, ICNTL(26)=2) after reduce(b): x = W⁻¹(b − Bᵀ y) for
+   // the Schur unknowns y (length p); x has length n.
+   bool expand(const double* y, double* x) {
+      const int na = n_ + p_;
+      std::copy(y, y + p_, red_.begin());
+      id_.rhs = buf_.data();
+      id_.nrhs = 1;
+      id_.lrhs = na;
+      id_.redrhs = red_.data();
+      id_.lredrhs = p_;
+      icntl(26) = 2;
+      id_.job = 3;
+      call();
+      icntl(26) = 0;
+      if (infog(1) < 0) return false;
+      std::copy(buf_.begin(), buf_.begin() + n_, x);
+      return true;
+   }
+
+   // Once per process: factorize a small KKT block with a known Schur
+   // complement and inertia, and compare.  Guards against a MUMPS build whose
+   // Schur layout or inertia reporting differs from what this file assumes.
+   static bool self_test() {
+      // W = [[2, 0, 1], [0, −1, 1], [1, 1, 0]] (1 primal of each sign, 1 dual),
+      // B = [[1, 0, 0], [0, 1, 1]] → S = −B W⁻¹ Bᵀ.
+      Eigen::Matrix3d W;
+      W << 2, 0, 1, 0, -1, 1, 1, 1, 0;
+      Eigen::Matrix<double, 2, 3> B;
+      B << 1, 0, 0, 0, 1, 1;
+      const Eigen::Matrix2d S_ref = -B * W.inverse() * B.transpose();
+      const Eigen::Vector3d ev = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(W).eigenvalues();
+      const int neg_ref = (int)(ev.array() < 0).count();
+      std::vector<int> r, c;
+      std::vector<double> v;
+      for (int i = 0; i < 3; ++i)
+         for (int j = 0; j <= i; ++j)
+            if (W(i, j) != 0.0) { r.push_back(i); c.push_back(j); v.push_back(W(i, j)); }
+      for (int a = 0; a < 2; ++a)
+         for (int l = 0; l < 3; ++l)
+            if (B(a, l) != 0.0) { r.push_back(3 + a); c.push_back(l); v.push_back(B(a, l)); }
+      MumpsBlock m;
+      if (!m.analyze(3, 2, r, c) || !m.factorize(v.data())) return false;
+      double err = 0.0;
+      for (int i = 0; i < 2; ++i)
+         for (int j = 0; j < 2; ++j) err = std::max(err, std::abs(m.schur()[i * 2 + j] - S_ref(i, j)));
+      Eigen::Vector3d x(1.0, 2.0, 3.0);
+      const Eigen::Vector3d x_ref = W.inverse() * x;
+      if (!m.solve(x.data())) return false;
+      err = std::max(err, (x - x_ref).cwiseAbs().maxCoeff());
+      // condensation and expansion
+      const Eigen::Vector3d b(1.0, 2.0, 3.0);
+      const Eigen::Vector2d y(0.5, -1.0);
+      const Eigen::Vector2d red_ref = -B * W.inverse() * b;
+      const Eigen::Vector3d xe_ref = W.inverse() * (b - B.transpose() * y);
+      Eigen::Vector2d red;
+      Eigen::Vector3d xe;
+      if (!m.reduce(b.data(), red.data()) || !m.expand(y.data(), xe.data())) return false;
+      err = std::max(err, (red - red_ref).cwiseAbs().maxCoeff());
+      err = std::max(err, (xe - xe_ref).cwiseAbs().maxCoeff());
+      return err < 1e-12 && m.negative() == neg_ref;
+   }
+
+   const char* version() const { return id_.version_number; }
 
 private:
+   // Every MUMPS call goes through here, under one process-wide lock.
+   void call() {
+      static std::mutex lock;
+      std::lock_guard<std::mutex> guard(lock);
+      dmumps_c(&id_);
+   }
    MUMPS_INT& icntl(int i) { return id_.icntl[i - 1]; }
    int infog(int i) const { return (int)id_.infog[i - 1]; }
 
-   // MUMPS 5.5 + SYM=2 + ICNTL(19)=1 returns the LOWER triangle of the Schur
-   // in the full p×p array (row-major reading: entry (i,j), j ≤ i, at i·p+j)
-   // and ZEROES the upper triangle — established empirically by the sentinel
-   // probe in mumps_smoke.cpp (2026-07-24; a NaN pre-fill came back 0.0 above
-   // the diagonal, exact values below). Mirror lower → upper so consumers see
-   // the plain symmetric matrix. mumps_smoke is the canary for any future
-   // library whose layout differs — run it on every new machine/build.
-   bool finish_schur() {
-      const int p = pk_;
-      double* s = schur_.data();
-      for (int i = 0; i < p; ++i)
-         for (int j = 0; j < i; ++j)
-            s[(std::size_t)j * p + i] = s[(std::size_t)i * p + j];
-      return true;
-   }
-
    DMUMPS_STRUC_C id_;
    bool alive_ = false;
-   bool resource_failure_ = false;
-   bool solve_failed_ = false;
-   bool singular_ = false;
-   int n_int_ = 0, pk_ = 0, ne_ = 0, ne_user_ = 0;
-   int status_ = 0, neg_ = 0, nullpiv_ = 0;
+   int n_ = 0, p_ = 0, nuser_ = 0, neg_ = 0;
    std::vector<MUMPS_INT> irn_, jcn_, listvar_;
-   std::vector<double> a_, schur_, rhs_buf_;
+   std::vector<double> a_, schur_, buf_, red_;
 };
 
-#endif  // MUMPS_BLOCK_HPP
+}  // namespace dd
+
+#endif  // DD_HAVE_MUMPS

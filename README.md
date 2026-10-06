@@ -1,58 +1,39 @@
 # lifted-mpcc-dd
 
-A **domain-decomposition linear solver for IPOPT**, applied to bilevel
-total-variation image denoising written as a *lifted mathematical program with
-complementarity constraints* (MPCC) in the unit-ball dual formulation.
+A **domain-decomposition interior point solver** for bilevel total-variation
+image denoising, written as a *lifted mathematical program with complementarity
+constraints* (MPCC).
 
 <!-- TODO after the first Zenodo release: paste the DOI badge here, e.g.
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
 
-This is the companion code for the paper *(see [Citation](#citation))*. It packages
-the C++ solver together with Python helpers that generate byte-identical solver
-inputs (from the extracted reference formulation) and render the result figures.
+This is the companion code for the paper *(see [Citation](#citation))*. It
+packages the C++ solver `tv_dd` together with Python helpers that render the
+result figures.
 
 ## What it does
 
-The lower-level TV-denoising problem is lifted to an MPCC and relaxed with a
-Scholtes ε-continuation; each continuation level is a smooth NLP solved by IPOPT.
-The contribution here is the **linear solver inside IPOPT**: a custom
-`SparseSymLinearSolverInterface` (`DDArrowheadSolver`) that produces every
-interior-point Newton step by **domain decomposition** rather than a monolithic
-factorization —
+`tv_dd` learns the TV-denoising weight α of an image. The lower-level denoising
+problem is replaced by its optimality system, lifted to polar coordinates, with one
+complementarity condition per cell, relaxed in the sense of Scholtes and driven to
+a small level t_min during **one** interior point solve.
 
-- permute the KKT system to **arrowhead** form (a pure permutation — no
-  reformulation), one block per image subdomain plus a shared interface border;
-- factorize each subdomain block `W_k` locally with **HSL MA57** (macOS) or
-  **MA97** (Linux/HPC), form its local Schur complement `S_k`;
-- assemble and solve the interface (Schur) system **directly** by default, or
-  iteratively (**preconditioned CG**, or **MINRES** in 2D) as a distributed-DD
-  prototype;
-- answer IPOPT's **inertia query** from the distributed pieces via the
-  **Haynsworth identity** `In(A) = Σ_k In(W_k) + In(S)` — *without ever
-  factorizing the full KKT*.
+- **Consensus form.** Every variable referenced by two image tiles gets a local
+  copy per tile and a linking row, so the Newton systems take the arrowhead form
+  of Lueg, Bynum, Laird and Biegler (Optim. Eng. 27 (2026) 555–585).
+- **Own interior point method.** A primal-dual barrier method with IPOPT's filter
+  line search, restoration phase and inertia correction, written around the
+  decomposition (why it replaced IPOPT: `docs/cpp_paper_solver`, §7).
+- **Schur-complement domain decomposition** for every Newton system: MUMPS
+  factorizes each tile block and returns its local Schur complement; PCG with
+  additive Schwarz solves the interface system; the inertia is checked tile by
+  tile (Haynsworth).
+- **MPI over tiles**, each rank holding only its part of the problem; runs are
+  bit-identical for any number of ranks.
 
-Three validated drivers are included: a uniform square-grid 2D solver, and
-staggered (cell-centred) 1D and 2D solvers.
-
-> **On performance — an honest result.** On a single node this DD solver is
-> **correct but not faster** than monolithic MA57: the interface factorization is
-> an Amdahl floor, and a sparse direct solve on these 2D image KKTs is already
-> near-linear. Its value is elsewhere — the Haynsworth inertia feasibility result,
-> a large **fill / memory** reduction (the full factor is never formed in one
-> address space), and the path to **distributed memory**. See
-> [`cpp/README.md`](cpp/README.md) for the full measured story, including the
-> no-crossover benchmarks.
->
-> A 2026-07-25 profiling pass cut wall clock **1.5–2.2×** with new defaults that
-> leave every iteration trajectory byte-identical (MA57 BLAS3 multi-RHS, MC64
-> scaling off, and a forward-only Schur formation), and `--hessian exact` — the
-> analytic `eval_h` the drivers previously never used — is worth another 1.4–3.9×
-> up to about N=48. That narrows the gap to monolithic MA57 from 7.0× to 3.1× at
-> N=32, but does not change the conclusion above. The same section records the
-> negative results — including the OpenMP finding, where the subdomain loops do
-> scale **3.8× on 8 threads** but total wall clock still regresses, because the
-> serial remainder grows faster on this 4P+4E laptop. That one needs re-measuring
-> on the homogeneous Linux/MA97 target.
+The full description of the model and the algorithm is
+[`cpp/README.md`](cpp/README.md); the measurements, the end-game studies and the
+options are there too.
 
 ## Repository layout
 
@@ -62,114 +43,75 @@ lifted-mpcc-dd/
 ├── LICENSE                ← BSD-3-Clause (+ third-party notes)
 ├── CITATION.cff           ← how to cite
 ├── .zenodo.json           ← Zenodo deposit metadata
-├── docs/RELEASE.md        ← how to cut a Zenodo release
-├── cpp/                   ← the C++ domain-decomposition solver
-│   ├── dd_solve.cpp          uniform 2D driver
-│   ├── dd_solve_1d.cpp       staggered 1D driver
-│   ├── dd_solve_2d.cpp       staggered 2D driver
-│   ├── dd_solver.hpp         DDArrowheadSolver (the arrowhead solver)
-│   ├── mpcc_*.hpp            the IPOPT TNLPs (problem definitions)
-│   ├── ma57_block.hpp        HSL MA57 wrapper
-│   ├── ma97_block.hpp        HSL MA97 wrapper (HPC backend)
-│   ├── image_io.hpp          image / phantom loader (vendored)
-│   ├── third_party/          stb_image.h (vendored, public-domain/MIT)
-│   ├── build*.sh             build helpers (macOS / Linux / MA57+OMP / MA97+OMP)
-│   ├── data/                 sample 1D instances (.txt)
-│   └── README.md             detailed technical notes & measurements
-├── python/                ← reproduction helpers (data generation + plotting)
-│   ├── mpcc_utils.py         data-gen core extracted from the Python reference
-│   ├── dump_data*.py         write byte-identical instances for the C++ solver
-│   ├── plot_slurm.py         render 2D result figures from --save-solution dumps
-│   ├── pyproject.toml        uv project: dependencies + Python floor
-│   ├── .python-version       pinned CPython 3.11
-│   ├── uv.lock               exact resolved versions (committed)
-│   ├── requirements.txt      generated pip fallback
-│   └── README.md
-├── slurm/                 ← example HPC batch scripts
-└── images/                ← bundled test images (cameraman 512², mariposa 1184²)
+├── cpp/                   ← the solver: tv_dd (see cpp/README.md)
+│   ├── main.cpp              command line, report, CSV line, .npz output
+│   ├── tv_mpcc.hpp           the lifted MPCC in consensus form, continuation, level gate
+│   ├── ipm.hpp               the interior point method
+│   ├── restoration.hpp       the restoration phase's feasibility problem
+│   ├── schur_dd.hpp          the Schur-complement decomposition of each Newton system
+│   ├── blocks.hpp, mumps_block.hpp   tile factorizations (MUMPS, sparse, dense)
+│   ├── precond.hpp           additive Schwarz and PCG
+│   ├── comm.hpp              MPI layer (tile ownership, tile-ordered sums)
+│   ├── endgame_literature.md the end game: literature and measurements
+│   └── build.sh              build (serial, OMP=1, MPI=1, MUMPS optional)
+├── python/                ← plotting helpers (plot_slurm.py reads tv_dd's .npz)
+├── images/                ← bundled test images (cameraman 512², mariposa 1184²)
+├── docs/                  ← technical notes (LaTeX), incl. cpp_paper_solver
+└── archive/               ← earlier solvers, kept for reference (see below)
 ```
 
 ## Requirements
 
-**C++ solver**
-
 - A C++17 compiler (clang on macOS, g++ on Linux).
-- [IPOPT](https://coin-or.github.io/Ipopt/) 3.14 — Homebrew `ipopt` (macOS) or
-  conda-forge `ipopt` (Linux). The custom-solver path links against IPOPT's
-  internal symbols, which the standard shared library exports, so **no IPOPT
-  rebuild is needed**.
-- [Eigen](https://eigen.tuxfamily.org/) 3 (local sparse assembly).
-- **HSL MA57** (macOS/default) or **MA97** (HPC). Proprietary, *free for academic
-  use* under the [HSL licence](https://licences.stfc.ac.uk/product/coin-hsl); not
-  distributed here. Without it, the monolithic reference route still works with
-  IPOPT's bundled MUMPS (`--solver mumps`), but the DD route (`--solver dd`)
-  requires MA57/MA97.
+- [Eigen](https://eigen.tuxfamily.org/) 3, LAPACK, zlib.
+- **MUMPS** (sequential), optional but strongly recommended: COIN-OR
+  [ThirdParty-Mumps](https://github.com/coin-or-tools/ThirdParty-Mumps), found
+  through pkg-config `coinmumps` (`~/.local/coinmumps` is searched by default).
+- **MPI** (Open MPI or MPICH), optional, for distributed runs.
+- No IPOPT and no HSL.
 
-**Python helpers** (data generation + plotting only — no IPOPT needed) — managed
-with [uv](https://docs.astral.sh/uv/):
+Python helpers (plotting only), managed with [uv](https://docs.astral.sh/uv/):
 
 ```bash
 cd python && uv sync
 ```
 
-`uv` fetches the pinned CPython 3.11 itself, so no system Python is needed; the
-dependencies are numpy, scipy, pillow and matplotlib, locked in `python/uv.lock`.
-Without uv, `pip install -r python/requirements.txt` into a 3.11 venv installs the
-same versions. See [`python/README.md`](python/README.md).
-
-## Build
+## Build and run
 
 ```bash
 cd cpp
+MPI=1 ./build.sh                 # also: ./build.sh (serial), OMP=1 ./build.sh, MUMPS=0
+./mumps_check                    # once per machine: must print PASSED
 
-# macOS (Homebrew ipopt/eigen/libomp, HSL MA57 in $HSLDIR):
-./build.sh dd_solve_1d.cpp -o dd_solve_1d
-./build.sh dd_solve_2d.cpp -o dd_solve_2d
-./build.sh dd_solve.cpp    -o dd_solve
-
-# Linux (conda env active; auto-picks MA57 or MA97):
-./build_linux.sh dd_solve_1d.cpp -o dd_solve_1d
-# ... or build everything with OpenMP across the subdomains:
-./build_all_ma57_omp.sh          # MA57 (all parallel regions live)
-./build_all_ma97_omp.sh          # MA97 on the cluster (serial W_k factorization)
+./tv_dd --size 32 --nsub 4                                          # cameraman 32×32, 4×4 tiles
+OMP_NUM_THREADS=1 mpirun -np 8 ./tv_dd --size 128 --nsub 8          # 64 tiles over 8 ranks
+./tv_dd --data ../images/mariposa.png --size 48 --nsub 4 --save-solution run.npz
+./tv_dd --help
 ```
 
-The build scripts document their environment assumptions and the `HSLDIR` /
-`HSLLIB` / `CONDA_PREFIX` overrides at the top of each file.
+Every run ends with one machine-readable `CSV,` line; `--save-solution` writes an
+`.npz` that `python/plot_slurm.py` renders. Build details (MUMPS, MPI linking
+order) and every option are in [`cpp/README.md`](cpp/README.md).
 
-## Quick start
+## The archive
 
-From `cpp/`, after building:
+`archive/` holds the earlier solvers, unchanged and still buildable, for reference
+and for the measurements quoted in `cpp/README.md` and `docs/`:
 
-```bash
-# 1D: solve a bundled instance and check the port against the reference (5 numbers)
-./dd_solve_1d --data data/data_1d_n256_k4.txt --nsub 4 --self-check
+- `archive/cpp/` — the first code: a domain-decomposition **linear solver inside
+  IPOPT** (`DDArrowheadSolver`, HSL MA57/MA97 tiles), with uniform 2D and
+  staggered 1D/2D drivers (`dd_solve*`) and its README of measurements;
+- `archive/cpp_minimal/` — the readable minimal MPCC solver under IPOPT
+  (`tv_learn`), the problem formulation `cpp/` was ported from;
+- `archive/cpp_dd_toy/` — Lueg et al.'s decomposition on a toy problem and on the
+  MPCC under two hosts (IPOPT and a paper-style IPM), where `cpp/`'s configuration
+  was selected;
+- `archive/slurm/`, `archive/python/` — the batch scripts and data dumps of the
+  archived drivers.
 
-# 1D: use domain decomposition as the actual linear solver
-./dd_solve_1d --data data/data_1d_n256_k4.txt --nsub 4 --solver dd
-
-# 1D: opt-in preconditioned-CG interface (the distributed-DD prototype)
-./dd_solve_1d --data data/data_1d_n256_k4.txt --nsub 4 --solver dd --interface cg
-
-# verify every DD Newton step against MA57-on-the-full-matrix
-DD_CHECK=1 ./dd_solve_1d --data data/data_1d_n256_k4.txt --nsub 4 --solver dd
-
-# 2D: denoise the bundled cameraman with the DD solver (image → 32×32)
-./dd_solve_2d --data ../images/cameraman.png --size 32 --nsub 4 --solver dd
-```
-
-To solve the **same instance in Python and C++** (byte-identical), generate the
-dump with the Python helper first:
-
-```bash
-cd python
-uv run python dump_data_1d.py --n 64 --nsub 4 -o ../cpp/data/data_1d_64.txt
-cd ../cpp && ./dd_solve_1d --data data/data_1d_64.txt --nsub 4 --solver dd
-```
-
-Full flag reference and the measured findings (interface preconditioners, the
-dual peel, MA97 threading, the no-crossover benchmarks) are in
-[`cpp/README.md`](cpp/README.md).
+They need IPOPT 3.14 and, for `archive/cpp`'s DD route, HSL MA57/MA97. The full
+history is in git; the state just before the archive was created is commit
+`444f5b9`.
 
 ## Citation
 
@@ -182,5 +124,5 @@ from it. The Zenodo DOI is added to this section after the first release
 ## License
 
 BSD 3-Clause — see [`LICENSE`](LICENSE). The vendored `stb_image.h` is public
-domain / MIT. IPOPT and HSL MA57/MA97 are **not** distributed with this software
-and carry their own licences.
+domain / MIT. MUMPS, Eigen and, for the archived code, IPOPT and HSL MA57/MA97 are
+**not** distributed with this software and carry their own licences.

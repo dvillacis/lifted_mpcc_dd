@@ -35,16 +35,14 @@ Placeholders that MUST be filled or they will appear verbatim on the public DOI 
 - [ ] **Version** — keep the three version fields in sync with the git tag:
       `.zenodo.json` `version`, `CITATION.cff` `version`, and the tag itself
       (all `1.0.0` for the first release).
-- [ ] **Sanity-build** — from a clean checkout, `cd cpp && ./build.sh
-      dd_solve_1d.cpp -o dd_solve_1d && ./dd_solve_1d --data
-      data/data_1d_n256_k4.txt --nsub 4 --self-check` should pass; the Python
-      helpers should sync and import (`cd python && uv sync && uv run python -c
-      "import mpcc_utils"`).
-- [ ] **Byte-identical instances** — the pinned environment must still reproduce
-      the bundled data, or the Python↔C++ comparison the package is built around
-      no longer holds:
-      `cd python && uv run python dump_data_1d.py --n 256 --nsub 4 -o /tmp/r.txt
-      && cmp /tmp/r.txt ../cpp/data/data_1d_n256_k4.txt`
+- [ ] **Sanity-build** — from a clean checkout, `cd cpp && MPI=1 ./build.sh &&
+      ./mumps_check` must print `MUMPS CHECK PASSED`, and
+      `mpirun -np 2 ./tv_dd --size 32 --nsub 4` must stop at the level gate with
+      an iteration log identical to a 1-rank run (the solver is bit-identical for
+      any number of ranks). The Python helpers should sync and import
+      (`cd python && uv sync && uv run python -c "import plot_slurm"`).
+- [ ] **Archive** — `archive/` holds the earlier IPOPT-based solvers for
+      reference; they are not part of the sanity-build (they need IPOPT and HSL).
 
 ## One-time setup
 
