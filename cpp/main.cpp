@@ -70,7 +70,8 @@ static void usage() {
       "             --kappa-eps 1000 (μ decreases while E_μ <= κ_ε·μ)  --mu-steps S (at most\n"
       "               S decreases per iteration; 0 = no limit)\n"
       "             --t-mu-scale 10 (t = max(t_min, scale*mu); Raghunathan-Biegler: 1)\n"
-      "             --gate-scale C (level gate: inf_du <= C*sqrt(t); inf_pr, mu <= sqrt(t))\n"
+      "             --gate primal|kkt (level gate at t = t_min: inf_pr, mu <= sqrt(t); kkt:\n"
+      "               also inf_du <= C*sqrt(t), C = --gate-scale, default 1)\n"
       "             --mu-min M (floor of mu; default t_min/t-mu-scale, so mu/t >= 1/scale\n"
       "               at t_min; 0: the IPM's tol/10)  --resto-mu-steps S (at most S decreases\n"
       "               of mu right after a restoration phase; default 1, 0: no cap)\n"
@@ -134,7 +135,7 @@ static int run(int argc, char** argv) {
    int cleanup_biactive = 0;
    double penalty = 0.0, penalty_max = 1e8;
    double vw_mu = 0.0, gate_du_scale = 1.0, t_mu_scale = 10.0, t_rate = 0.5, t_comp_ratio = 0.0;
-   bool vw_comp_only = false, vw_ls_grad = true;
+   bool vw_comp_only = false, vw_ls_grad = true, gate_dual = false;
    bool penalty_hessian = true;
    double cleanup_eps = 0.0;
    double relax_thr = 0.0, relax_shift = 1e-4;
@@ -194,6 +195,7 @@ static int run(int argc, char** argv) {
       else if (a == "--vw-bounds") vw_comp_only = v == "comp";
       else if (a == "--vw-linesearch") vw_ls_grad = v != "plain";
       else if (a == "--t-mu-scale") t_mu_scale = std::stod(v);
+      else if (a == "--gate") gate_dual = v == "kkt";
       else if (a == "--gate-scale") gate_du_scale = std::stod(v);
       else if (a == "--t-rate") t_rate = std::stod(v);
       else if (a == "--t-comp-ratio") t_comp_ratio = std::stod(v);
@@ -281,6 +283,7 @@ static int run(int argc, char** argv) {
    problem.t = std::max(t_min, problem.t_mu_scale * mu0);
    problem.eps_theta = problem.c_theta * problem.t;
    problem.gate_floor = tol_target;
+   problem.gate_dual = gate_dual;
    problem.gate_du_scale = gate_du_scale;
 
    // ---- the IPM

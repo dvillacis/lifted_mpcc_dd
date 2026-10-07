@@ -11,7 +11,7 @@ The folder is self-contained: nothing is included from the rest of the repositor
 **Problem** (`tv_mpcc.hpp`). This is the bilevel TV-weight learning problem, with the lower level replaced by its optimality system:
 - The gradient and the dual are lifted to polar form (r, θ) and (δ, θ). This leaves smooth equations plus one complementarity r(1 − δ) = 0, relaxed to r(1 − δ) ≤ t (Scholtes).
 - **Consensus form.** Every variable referenced by two tiles (border u, border qx/qy, and α) gets a local copy per tile, plus a linking row `copy − consensus = 0`. Every row then belongs to one tile, and the tiles couple only through the consensus variables. This is the structure (1) of Lueg et al.
-- **μ-coupled continuation.** t = max(t_min, 10μ), at most halving per iteration. A level gate stops the solve once inf_pr, inf_du and μ are all ≤ √t at t = t_min.
+- **μ-coupled continuation.** t = max(t_min, 10μ), at most halving per iteration. A level gate stops the solve once inf_pr and μ are ≤ √t at t = t_min; the dual infeasibility is not tested (`--gate kkt` adds inf_du ≤ √t, the rule before 2026-10-07 and in the measurements below).
 - **Start.** Chambolle–Pock for plain TV denoising, lifted to the MPCC variables.
 
 **IPM** (`ipm.hpp`). Primal-dual barrier method.
@@ -129,7 +129,8 @@ Elsewhere, give the flags directly: `MUMPS_CFLAGS="-I…/include" MUMPS_LIBS="-L
 | `--t-mu-scale` | 10 | t = max(t_min, scale·μ); 1 is Raghunathan–Biegler's μ/t = 1 (fewer iterations on N ≥ 96, see "The end game") |
 | `--precond` | `as` | interface preconditioner: `as` additive Schwarz on S̃_k = N_kᵀ S N_k (eq. 19); `asd` S_k with its diagonal replaced by diag(S) (eq. 21; weaker, see "Known limitations") |
 | `--vw-mu` | 0 (off) | M > 0: Raghunathan–Biegler's modified step (eq. 3.7, choice (ii) of 3.8) once μ ≤ M, as in IPOPT-C's source: every bound, η = 0.1·μ_prev/(1 + max(‖c‖∞, ‖z‖∞)), off in restoration, matching line-search gradient (IPOPT-C: M = 5·10⁻⁶); `--vw-bounds comp` restricts it to r ≥ 0, 1−δ ≥ 0, `--vw-linesearch plain` keeps the plain barrier gradient |
-| `--gate-scale` | 1 | C: the level gate's dual test is inf_du ≤ C·√t; inf_pr and μ stay at √t (experiment) |
+| `--gate` | `primal` | the level gate tests inf_pr, μ ≤ √t; `kkt` also inf_du ≤ C·√t (the rule before 2026-10-07) |
+| `--gate-scale` | 1 | with `--gate kkt`, C: the dual test is inf_du ≤ C·√t; inf_pr and μ stay at √t (experiment) |
 | `--t-rate` | 0.5 | t falls by at most this factor per iteration; 0: no limit (with `--t-mu-scale 1`: t = μ, IPOPT-C) |
 | `--vw-linesearch` | `modified` | with `--vw-mu`: the line search's ∇φ_μᵀd uses the barrier term of the modified step, ∓(z + (μ − sz)/(s + ηz)) instead of ∓μ/s, as IPOPT-C's `filter.F` does; `plain` = the barrier gradient unchanged (the behaviour before) |
 | `--penalty` | 0 (off) | π₀ > 0: exact-penalty formulation f + π Σ r(1−δ), no product rows (experiment, fails from N=128 on; see "The end game"); `--penalty-max 1e8` (cap; = π₀ keeps π fixed), `--penalty-hessian on\|off` |

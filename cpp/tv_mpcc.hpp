@@ -49,8 +49,9 @@
 // One IPM solve, with t following the barrier: t = max(t_min, 10·μ), never
 // loosening and at most halving per iteration.  This is legal mid-solve because
 // t enters only g.  Once t = t_min, the LEVEL GATE stops the solve as soon as
-// the primal and dual infeasibility and μ are all below √t: a relaxation at
-// level t is only accurate to about √t, so solving it more tightly is wasted.
+// the primal infeasibility and μ are below √t (gate_dual: and the dual
+// infeasibility too): a relaxation at level t is only accurate to about √t, so
+// solving it more tightly is wasted.
 //
 // ============================================================================
 //  THE EXACT-PENALTY FORMULATION (penalty > 0, opt-in)
@@ -63,7 +64,7 @@
 // complementarity multiplier is π (bounded).  π grows like LLN's dynamic
 // rule: ×10 when max_e min(r_e, 1 − δ_e) > μ^0.4 and has not decreased by 10%
 // over the last 3 iterations.  t still follows μ, only for the θ ridge.  The
-// gate: once t = t_min, stop when inf_pr, inf_du, μ ≤ √t_min and
+// gate: once t = t_min, stop when inf_pr, μ (gate_dual: inf_du) ≤ √t_min and
 // max r(1 − δ) ≤ t_min (the accuracy class of the relaxation).
 //
 // ============================================================================
@@ -138,7 +139,8 @@ public:
    double c_theta = 1.0;       // ε_θ = c_θ · t
    double eps_theta = 0.0;
    double gate_floor = 1e-8;   // floor on the level gate
-   double gate_du_scale = 1.0; // the gate's dual test is inf_du ≤ scale·√t (inf_pr, μ stay at √t)
+   bool gate_dual = false;     // the gate also tests inf_du (false: primal only) ...
+   double gate_du_scale = 1.0; // ... as inf_du ≤ scale·√t (inf_pr, μ stay at √t)
    bool gate_fired = false;
    bool print = true;          // the gate message (off on all MPI ranks but one)
    bool diag = false;          // per iteration: where the dual residual sits (diagnose())
@@ -425,12 +427,17 @@ public:
       }
       if (it.iter > 0 && t <= t_min * (1.0 + 1e-9)) {
          const double gate = std::max(gate_floor, std::sqrt(t)), gate_du = gate_du_scale * gate;
-         if (it.inf_pr <= gate && it.inf_du <= gate_du && it.mu <= gate &&
+         if (it.inf_pr <= gate && (!gate_dual || it.inf_du <= gate_du) && it.mu <= gate &&
              (penalty <= 0.0 || rw_max <= t_min)) {
             gate_fired = true;
-            if (print) std::printf("  [level gate] t=%.2e  inf_pr=%.1e  inf_du=%.1e  mu=%.1e"
-                        "  <= sqrt(t) = %.1e (inf_du: %.1e): stopping\n",
-                        t, it.inf_pr, it.inf_du, it.mu, gate, gate_du);
+            if (print && gate_dual)
+               std::printf("  [level gate] t=%.2e  inf_pr=%.1e  inf_du=%.1e  mu=%.1e"
+                           "  <= sqrt(t) = %.1e (inf_du: %.1e): stopping\n",
+                           t, it.inf_pr, it.inf_du, it.mu, gate, gate_du);
+            else if (print)
+               std::printf("  [level gate] t=%.2e  inf_pr=%.1e  mu=%.1e  <= sqrt(t) = %.1e"
+                           " (inf_du=%.1e, not tested): stopping\n",
+                           t, it.inf_pr, it.mu, gate, it.inf_du);
             return false;
          }
       }
