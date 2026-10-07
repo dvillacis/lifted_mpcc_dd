@@ -93,8 +93,11 @@ public:
 
    // Pattern of the augmented matrix, 0-based, any triangle (folded to the
    // lower one here), duplicates allowed: interior 0..n−1, Schur n..n+p−1.
-   // Call once; afterwards only values change (same order as r/c).
-   bool analyze(int n, int p, const std::vector<int>& r, const std::vector<int>& c) {
+   // Call once; afterwards only values change (same order as r/c).  schur:
+   // where factorize() puts S_k (p×p, the caller's array, kept alive); null:
+   // an array of this object's own.
+   bool analyze(int n, int p, const std::vector<int>& r, const std::vector<int>& c,
+                double* schur = nullptr) {
       if (!alive_) return false;
       n_ = n;
       p_ = p;
@@ -106,8 +109,13 @@ public:
          irn_.push_back(std::max(r[t], c[t]) + 1);
          jcn_.push_back(std::min(r[t], c[t]) + 1);
       }
-      // a zero diagonal for every variable, so each is structurally present
-      for (int i = 1; i <= na; ++i) { irn_.push_back(i); jcn_.push_back(i); }
+      // a zero diagonal for every variable without one, so each is
+      // structurally present
+      std::vector<char> diag(na + 1, 0);
+      for (size_t t = 0; t < irn_.size(); ++t)
+         if (irn_[t] == jcn_[t]) diag[irn_[t]] = 1;
+      for (int i = 1; i <= na; ++i)
+         if (!diag[i]) { irn_.push_back(i); jcn_.push_back(i); }
       a_.assign(irn_.size(), 0.0);
       id_.n = na;
       id_.nnz = (MUMPS_INT8)irn_.size();
@@ -117,10 +125,14 @@ public:
       if (p_ > 0) {
          listvar_.resize(p_);
          for (int j = 0; j < p_; ++j) listvar_[j] = n_ + 1 + j;
-         schur_.assign((size_t)p_ * p_, 0.0);
+         if (!schur) {
+            schur_.assign((size_t)p_ * p_, 0.0);
+            schur = schur_.data();
+         }
+         sch_ = schur;
          id_.size_schur = p_;
          id_.listvar_schur = listvar_.data();
-         id_.schur = schur_.data();
+         id_.schur = sch_;
          icntl(19) = 1;   // centralized Schur complement on the host
       } else {
          icntl(19) = 0;
@@ -134,6 +146,12 @@ public:
    // false: singular (zero or null pivot), or MUMPS could not finish.
    bool factorize(const double* user_values) {
       std::copy(user_values, user_values + nuser_, a_.begin());
+      return factorize();
+   }
+   // The values of the user entries go here (in analyze()'s order) ...
+   double* user_values() { return a_.data(); }
+   // ... and then this factorizes with them.
+   bool factorize() {
       std::fill(a_.begin() + nuser_, a_.end(), 0.0);
       neg_ = 0;
       for (int attempt = 0; attempt < 6; ++attempt) {
@@ -151,8 +169,8 @@ public:
          // triangle is checked to be zero by self_test()).
          for (int i = 0; i < p_; ++i)
             for (int j = 0; j < i; ++j) {
-               double& lo = schur_[(size_t)i * p_ + j];
-               double& up = schur_[(size_t)j * p_ + i];
+               double& lo = sch_[(size_t)i * p_ + j];
+               double& up = sch_[(size_t)j * p_ + i];
                const double v = lo != 0.0 ? lo : up;
                lo = up = v;
             }
@@ -163,7 +181,7 @@ public:
 
    int negative() const { return neg_; }
    // S_k (p × p, symmetric), valid after a successful factorize()
-   const double* schur() const { return schur_.data(); }
+   const double* schur() const { return sch_; }
 
    // In-place solve W x = b for nrhs columns (leading dimension n).
    bool solve(double* b, int nrhs = 1) {
@@ -284,6 +302,7 @@ private:
    int n_ = 0, p_ = 0, nuser_ = 0, neg_ = 0;
    std::vector<MUMPS_INT> irn_, jcn_, listvar_;
    std::vector<double> a_, schur_, buf_, red_;
+   double* sch_ = nullptr;   // S_k: schur_, or the caller's array
 };
 
 }  // namespace dd

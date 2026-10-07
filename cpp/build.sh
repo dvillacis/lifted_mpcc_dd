@@ -15,9 +15,39 @@
 #
 # macOS: Homebrew Eigen (and libomp for OMP=1); LAPACK from Accelerate.
 # Linux: Eigen through pkg-config eigen3 (or $CONDA_PREFIX/include/eigen3) and
-#        -llapack -lblas; override with LAPACK_LIBS="-lopenblas" etc.
+#        -llapack -lblas; override with LAPACK_LIBS="-lopenblas" etc.  In a
+#        conda env, conda-forge's mumps-seq is picked up when nothing else is.
+#
+# The cluster (OpenHPC, recognized by /opt/ohpc; HPC=1 / HPC=0 forces it on /
+# off) always gets Open MPI and MUMPS, built from inside the conda env:
+#   conda activate mkl_imaging && ./build.sh
+#   * MPI=1 by default; mpicxx comes from the openmpi5 module, loaded here
+#     (HPC_MODULES) when it is not on PATH yet.  The job must load the same.
+#   * the system g++ (HPC_CXX) and, through -B/usr/bin, the system linker.
+#     Conda's compiler and ld link against conda's own sysroot and cannot
+#     resolve what libmpi.so needs (libpmix, libibverbs, libpsm2, ...); conda's
+#     ld is first on PATH, hence the -B.
+#   * no MUMPS is an error, not a quiet fallback to the sparse+dense tiles
+#     (~1000x slower at N=128): conda install -c conda-forge mumps-seq
 set -e
 cd "$(dirname "$0")"
+
+HPC_AUTO=0
+[ "$(uname)" = "Linux" ] && [ -d /opt/ohpc ] && HPC_AUTO=1
+case "${HPC:-}" in 0|1) ;; *) HPC=$HPC_AUTO ;; esac
+if [ "$HPC" = "1" ]; then
+  MPI="${MPI:-1}"
+  CXX="${HPC_CXX:-/usr/bin/g++}"
+  if [ "$MPI" = "1" ] && ! command -v mpicxx >/dev/null 2>&1; then
+    type module >/dev/null 2>&1 || source /etc/profile.d/lmod.sh 2>/dev/null || true
+    module load ${HPC_MODULES:-intel/2025.0.4 openmpi5/5.0.10} 2>/dev/null || true
+    if ! command -v mpicxx >/dev/null 2>&1; then
+      echo "build.sh: no mpicxx; module load openmpi5 (or set HPC_MODULES)" >&2
+      exit 1
+    fi
+  fi
+  echo "HPC build: CXX=$CXX  mpicxx=$(command -v mpicxx || echo none)  conda=${CONDA_PREFIX:-none}"
+fi
 
 FLAGS=(-std=c++17 -O2)
 LIBS=()
@@ -36,6 +66,7 @@ if [ "$(uname)" = "Darwin" ]; then
   fi
 else
   CXX="${CXX:-g++}"
+  [ "$HPC" = "1" ] && FLAGS+=(-B/usr/bin)
   [ -n "${CONDA_PREFIX:-}" ] && export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
   if pkg-config --exists eigen3 2>/dev/null; then
     FLAGS+=($(pkg-config --cflags eigen3))
@@ -75,6 +106,21 @@ if [ "${MUMPS:-1}" != "0" ]; then
   elif pkg-config --exists coinmumps 2>/dev/null; then
     MFLAGS=(-DDD_HAVE_MUMPS $(pkg-config --cflags coinmumps))
     MLIBS=($(pkg-config --libs coinmumps) -Wl,-rpath,"$(pkg-config --variable=libdir coinmumps)")
+  elif [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/include/dmumps_c.h" ] \
+       && [ -e "$CONDA_PREFIX/lib/libdmumps_seq.so" ]; then   # conda-forge mumps-seq
+    MFLAGS=(-DDD_HAVE_MUMPS -isystem "$CONDA_PREFIX/include")
+    MLIBS=(-L"$CONDA_PREFIX/lib")
+    for l in dmumps_seq mumps_common_seq pord_seq mpiseq_seq; do
+      [ -e "$CONDA_PREFIX/lib/lib$l.so" ] && MLIBS+=(-l$l)
+    done
+  fi
+  if [ "$HPC" = "1" ] && [ ${#MFLAGS[@]} -eq 0 ]; then
+    echo "build.sh: no MUMPS found.  In the conda env: conda install -c conda-forge mumps-seq" >&2
+    echo "          (or give MUMPS_CFLAGS / MUMPS_LIBS; MUMPS=0 builds without it)" >&2
+    for f in include/dmumps_c.h lib/libdmumps_seq.so; do
+      [ -e "${CONDA_PREFIX:-/nonexistent}/$f" ] || echo "          missing: ${CONDA_PREFIX:-<no conda env>}/$f" >&2
+    done
+    exit 1
   fi
 fi
 

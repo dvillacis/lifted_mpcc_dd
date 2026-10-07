@@ -131,7 +131,7 @@ public:
                                   // problem's callback, 3 acceptable, −1 failure
       int iters = 0;
       double obj = 0.0, inf_pr = 0.0, inf_du = 0.0, wall = 0.0;
-      long tile_corrections = 0;  // factorizations refused for a wrong In(W_k)
+      long tile_corrections = 0;  // ... refused for a wrong In(W_k) (with δ_c > 0: or a singular W_k)
       long tile_too_few = 0;      // ... of which: some tile had too FEW negative eigenvalues
       long s_corrections = 0;     // ... for S not positive definite
       long singular = 0;          // ... for a zero pivot
@@ -144,7 +144,8 @@ public:
       long resto_iters = 0;       // iterations spent in them (not in iters)
    };
    // A point in the IPM's own layout: p = [x | s], λ in row order [c | d],
-   // bound multipliers for p.  Optional start and end of solve().
+   // bound multipliers for p.  Optional start and end of solve() (the start
+   // is moved from).
    struct Point {
       std::vector<double> p, lam, zl, zu;
    };
@@ -152,7 +153,7 @@ public:
    // shared: a decomposition to reuse if its structure is this problem's KKT
    // pattern (the restoration phase passes the original problem's).
    Result solve(NLP& nlp, const dd::SchurDD::Options& dopt, dd::SchurDD::Stats* stats,
-                const Point* start = nullptr, Point* end = nullptr,
+                Point* start = nullptr, Point* end = nullptr,
                 dd::SchurDD* shared = nullptr) {
       using Index = int;
       const auto t0 = std::chrono::steady_clock::now();
@@ -162,8 +163,15 @@ public:
       // ---- problem data, rows split into [c | d]
       const Index n = nlp.num_vars(), m = nlp.num_rows();
       const int n_tiles = nlp.n_tiles();
-      std::vector<double> xl(n), xu(n), gl(m), gu(m);
-      nlp.bounds(xl.data(), xu.data(), gl.data(), gu.data());
+      std::vector<double> gl(m), gu(m), pl, pu;
+      auto read_bounds = [&](int np_) {   // pl, pu: x's bounds, then the slacks' (set below)
+         std::vector<double> xl(n), xu(n);
+         nlp.bounds(xl.data(), xu.data(), gl.data(), gu.data());
+         pl.assign(np_, 0.0);
+         pu.assign(np_, 0.0);
+         for (Index i = 0; i < n; ++i) { pl[i] = xl[i]; pu[i] = xu[i]; }
+      };
+      read_bounds(n);
       std::vector<int> rowpos(m), drows;
       int mc = 0;
       for (Index r = 0; r < m; ++r)
@@ -179,8 +187,8 @@ public:
       const int npk = np - n_el;      // KKT primals
       const int NK = npk + m;         // KKT dimension
 
-      std::vector<double> pl(np), pu(np);
-      for (Index i = 0; i < n; ++i) { pl[i] = xl[i]; pu[i] = xu[i]; }
+      pl.resize(np);
+      pu.resize(np);
       for (int i = 0; i < md; ++i) { pl[n + i] = gl[drows[i]]; pu[n + i] = gu[drows[i]]; }
       std::vector<double> p(np, 0.0), lam(m, 0.0), zl(np, 0.0), zu(np, 0.0);
       std::vector<double> g(m);
@@ -190,10 +198,10 @@ public:
          hu[i] = pu[i] < 1e19;
       }
       if (start) {   // given (strictly interior) point and multipliers
-         p = start->p;
-         lam = start->lam;
-         zl = start->zl;
-         zu = start->zu;
+         p = std::move(start->p);
+         lam = std::move(start->lam);
+         zl = std::move(start->zl);
+         zu = std::move(start->zu);
       } else if (warm) {   // a point of this or a related problem, in the NLP's layout
          for (Index i = 0; i < n; ++i) {
             p[i] = warm->x[i];
@@ -275,6 +283,8 @@ public:
          ic[off_s + i] = n0 + i;
       }
       for (Index r = 0; r < m; ++r) ir[off_rd + r] = ic[off_rd + r] = npk + r;
+      std::vector<Index>().swap(hr);   // in ir, ic now
+      std::vector<Index>().swap(hc);
 
       // owner of each unknown, full layout [x | s | λ_c | λ_d] and KKT layout
       std::vector<int> owner(N), kowner(NK);
@@ -612,8 +622,7 @@ public:
          }
          bool moved = false;
          if (nlp.bounds_changed()) {   // re-read the bounds (the barrier problem changed)
-            nlp.bounds(xl.data(), xu.data(), gl.data(), gu.data());
-            for (Index i = 0; i < n; ++i) { pl[i] = xl[i]; pu[i] = xu[i]; }
+            read_bounds(np);
             for (int i = 0; i < md; ++i) { pl[n + i] = gl[drows[i]]; pu[n + i] = gu[drows[i]]; }
             for (int i = 0; i < np; ++i) {
                const bool l = pl[i] > -1e19, u = pu[i] < 1e19;
@@ -969,7 +978,6 @@ public:
          evaluate(true);
       }
       if (fail) res.status = -1;
-      if (end) *end = Point{p, lam, zl, zu};
       if (export_point) {
          NLPPoint& e = *export_point;
          e.x.assign(p.begin(), p.begin() + n);
@@ -989,6 +997,7 @@ public:
       }
       for (Index r = 0; r < m; ++r) lam_orig[r] = lam[rowpos[r]];
       nlp.finalize(res.status, p.data(), lam_orig.data(), res.obj);
+      if (end) *end = Point{std::move(p), std::move(lam), std::move(zl), std::move(zu)};
       res.wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       return res;
    }

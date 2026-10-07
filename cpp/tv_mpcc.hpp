@@ -88,8 +88,9 @@
 // interface works on the local vectors, in ascending global order; the local
 // tables (nodes_, cells_, the stencils, the patterns) cover the rank's own
 // nodes and cells.  The objective is separable per variable and goes through
-// a TileSum.  Global tables kept on every rank are O(#variables) integers
-// (col_tile_) or per pixel; nothing of the size of the Jacobian is global.
+// a TileSum.  The tables are built from the grid for the own tiles only; the
+// one per-pixel object, the warm start (computed on every rank for the whole
+// image), is freed after the setup.
 // finalize() gathers the solution and multipliers on rank 0 in the global
 // layout, and so do --diag and --classify for their printouts.
 //
@@ -137,6 +138,7 @@ public:
    double c_theta = 1.0;       // ε_θ = c_θ · t
    double eps_theta = 0.0;
    double gate_floor = 1e-8;   // floor on the level gate
+   double gate_du_scale = 1.0; // the gate's dual test is inf_du ≤ scale·√t (inf_pr, μ stay at √t)
    bool gate_fired = false;
    bool print = true;          // the gate message (off on all MPI ranks but one)
    bool diag = false;          // per iteration: where the dual residual sits (diagnose())
@@ -179,26 +181,22 @@ public:
    int rh1, rh2x, rh2y, rh3x, rh3y, rlink, rhr, rhd, rha, rcomp;
 
    std::vector<double> x_start;     // Chambolle–Pock warm start (local)
-   std::vector<double> solution;    // written by finalize, on rank 0, global: x ...
-   std::vector<double> multipliers; //   ... the constraint multipliers λ
+   std::vector<double> solution;    // written by finalize: x on rank 0, global ...
+   double xi_max = 0.0;             //   ... max |λ| of the product rows (every rank)
    double objective = 0.0;          //   ... and f(x)
 
    // One row (iter, μ, t, weight, max r(1−δ)) per IPM iteration.
    std::vector<double> mu_trace;
 
-   // Build the whole NLP.  Order matters: the warm start and θ_ref are computed
-   // on the unsplit problem, THEN the consensus copies are appended.
+   // Build this rank's part of the NLP.  The warm start and θ_ref are computed
+   // on the unsplit problem, then the consensus copies are appended.
    TvMpcc(const Image& img, const Partition& part, double sigma)
-       : N(img.N), clean_(img.clean), f_(img.noisy), sum_(part.n_tiles) {
+       : N(img.N), part_(part), sum_(part.n_tiles) {
       nc = N - 1;
       m_u = N * N;
       m_q = nc * nc;
       layout_unsplit();
-      build_stencils();
-      warm_start_chambolle_pock(0.7 * sigma);
-      theta_ref_.assign(x_start.begin() + oTh, x_start.begin() + oTh + m_q);
-      split_into_consensus_form(part);
-      build_local(part);
+      build_local(warm_start_chambolle_pock(img.noisy, 0.7 * sigma), img.clean, img.noisy);
    }
 
    // max over cells of r·(1 − δ): how far from exact complementarity x is
@@ -273,9 +271,9 @@ public:
    void grad_f(const double* x, double* g) override {
       for (int l = 0; l < num_vars(); ++l) {
          const int v = gvar_[l];
-         g[l] = v < ou + m_u               ? x[l] - clean_[v - ou]
+         g[l] = v < ou + m_u               ? x[l] - ref_[l]
               : v == oa                    ? kRegAlpha * x[l]
-              : v >= oTh && v < oTh + m_q  ? eps_theta * (x[l] - theta_ref_[v - oTh])
+              : v >= oTh && v < oTh + m_q  ? eps_theta * (x[l] - ref_[l])
                                            : 0.0;
       }
       if (penalty > 0.0)
@@ -293,7 +291,7 @@ public:
       for (const auto& e : grad_y_) kyu[e.r] += e.v * x[e.c];
       for (size_t a = 0; a < nodes_.size(); ++a) {
          const Node& q = nodes_[a];
-         g[q.h1] = x[q.u] - f_[q.i] + x[q.a] * div[a];
+         g[q.h1] = x[q.u] - fnode_[a] + x[q.a] * div[a];
       }
       for (size_t b = 0; b < cells_.size(); ++b) {
          const Cell& q = cells_[b];
@@ -426,13 +424,13 @@ public:
          }
       }
       if (it.iter > 0 && t <= t_min * (1.0 + 1e-9)) {
-         const double gate = std::max(gate_floor, std::sqrt(t));
-         if (it.inf_pr <= gate && it.inf_du <= gate && it.mu <= gate &&
+         const double gate = std::max(gate_floor, std::sqrt(t)), gate_du = gate_du_scale * gate;
+         if (it.inf_pr <= gate && it.inf_du <= gate_du && it.mu <= gate &&
              (penalty <= 0.0 || rw_max <= t_min)) {
             gate_fired = true;
             if (print) std::printf("  [level gate] t=%.2e  inf_pr=%.1e  inf_du=%.1e  mu=%.1e"
-                        "  all <= sqrt(t) = %.1e: stopping\n",
-                        t, it.inf_pr, it.inf_du, it.mu, gate);
+                        "  <= sqrt(t) = %.1e (inf_du: %.1e): stopping\n",
+                        t, it.inf_pr, it.inf_du, it.mu, gate, gate_du);
             return false;
          }
       }
@@ -545,10 +543,30 @@ public:
       return b;
    }
 
-   // Solution and multipliers on rank 0, in the global layout.
+   // The solution on rank 0, in the global layout, and max |ξ|.  Only values
+   // are sent: rank 0 knows every rank's variables from the grid (each rank
+   // holds those of its tiles and the consensus ones, in global order).
    void finalize(int, const double* x, const double* lam, double obj) override {
-      solution = dd::Comm::gather(gvar_long(), x, n);
-      multipliers = dd::Comm::gather(grow_long(), lam, mcon);
+      std::vector<int> counts;
+      const std::vector<double> all = dd::Comm::gather_values(x, num_vars(), counts);
+      solution.clear();
+      if (dd::Comm::root()) {
+         const int nr = dd::Comm::size();
+         std::vector<long> at(nr, 0);   // next value of rank r in `all`
+         for (int r = 1; r < nr; ++r) at[r] = at[r - 1] + counts[r - 1];
+         solution.assign(n, 0.0);
+         for_each_var([&](int v, int k, int) {
+            if (k >= 0) {
+               solution[v] = all[at[dd::Comm::owner_of(k, n_tiles_)]++];
+            } else {   // held by every rank, the same value: rank 0's
+               solution[v] = all[at[0]];
+               for (int r = 0; r < nr; ++r) ++at[r];
+            }
+         });
+      }
+      double xi = 0.0;
+      for (const Cell& q : cells_) xi = std::max(xi, std::abs(lam[q.comp]));
+      xi_max = dd::Comm::max(xi);
       objective = obj;
    }
 
@@ -558,7 +576,8 @@ public:
    //           and copies, and the slacks by row type;
    //   worst — the cell of the largest entry: its state and multipliers.
    void diagnose(const Iterate& it) const {
-      const double gate = std::max(gate_floor, std::sqrt(t));
+      const double gate = gate_du_scale * std::max(gate_floor, std::sqrt(t));
+      global_maps();
       enum { U, UC, Q, QC, R, D, TH, A, CU, CQ, CA, SR, SD, SA, SC, NG };
       static const char* name[NG] = {"u", "u*", "q", "q*", "r", "δ", "θ", "α", "u'", "q'", "α'",
                                      "s_r", "s_δ", "s_α", "s_c"};
@@ -751,7 +770,9 @@ private:
 
    struct Tri { int r, c; double v; };         // one nonzero of a sparse operator
 
-   std::vector<double> clean_, f_, theta_ref_;
+   Partition part_;
+   std::vector<double> ref_;     // per local variable: u_clean (u), θ_ref (θ), else 0
+   std::vector<double> fnode_;   // per own node: the noisy image f
    std::vector<char> relaxed_;   // per local cell: flagged by flag_cells()
    static constexpr char kPinR = 1, kPinD = 2;
    std::vector<char> pinned_;    // per local cell, in the clean-up: r = 0 or δ = 1
@@ -761,19 +782,13 @@ public:
 private:
    std::vector<int> negative_run_;   // ... consecutive iterations with γ or ν < −relax_thr
    bool bounds_moved_ = false;
-   std::vector<Tri> Kx_, Ky_, KxT_, KyT_;      // gradient stencils and transposes (setup only)
    int n_tiles_ = 0;
-
-   // ---- global (every rank, the same)
-   std::vector<int> col_tile_;   // variable → tile, −1 for consensus variables
-   std::vector<int> row_tile_;   // row      → tile (setup only)
-   std::vector<int> link_copy_, link_orig_;   // linking row ℓ: copy − original = 0
-   // "Effective index" tables, global indices (setup only): which variable
-   // (original or copy) each row uses.
-   std::vector<int> u_of_h1_;        // h1 row i  → the u  its tile uses
-   std::vector<int> alpha_of_h1_;    // h1 row i  → the α  its tile uses
-   std::vector<int> alpha_of_tile_;  // tile      → its α copy
-   std::vector<int> qx_of_h3_, qy_of_h3_;   // h3 row e → the qx / qy its tile uses
+   // setup only: where the copies of each shared u, qx, qy (by node / cell)
+   // and of α start, counted from n_orig (seen_by())
+   std::array<std::vector<int>, 4> copy_off_;
+   // global, for --diag on rank 0 only (global_maps()): variable → tile (−1:
+   // consensus), and linking row ℓ: copy n_orig + ℓ − original link_orig_[ℓ] = 0
+   mutable std::vector<int> col_tile_, link_orig_;
 
    // ---- local (this rank's tiles and the consensus variables); all indices local
    std::vector<int> gvar_, grow_;    // local variable / row → global
@@ -802,10 +817,10 @@ private:
    // The objective's term of local variable l.
    double objective_term(int l, double x) const {
       const int v = gvar_[l];
-      if (v < ou + m_u) return 0.5 * (x - clean_[v - ou]) * (x - clean_[v - ou]);
+      if (v < ou + m_u) return 0.5 * (x - ref_[l]) * (x - ref_[l]);
       if (v == oa) return 0.5 * kRegAlpha * x * x;
       if (eps_theta != 0.0 && v >= oTh && v < oTh + m_q)
-         return 0.5 * eps_theta * (x - theta_ref_[v - oTh]) * (x - theta_ref_[v - oTh]);
+         return 0.5 * eps_theta * (x - ref_[l]) * (x - ref_[l]);
       return 0.0;
    }
    // The IPM's slack of local inequality row i, in [x | s].
@@ -871,67 +886,57 @@ private:
    // Forward differences, both anchored at the cell's top-left node:
    //   (Kx u)_{a,b} = u[a,   b+1] − u[a, b]
    //   (Ky u)_{a,b} = u[a+1, b  ] − u[a, b]
-   void build_stencils() {
-      auto node = [&](int i, int j) { return i * N + j; };
-      for (int a = 0; a < nc; ++a)
-         for (int b = 0; b < nc; ++b) {
-            const int cell = a * nc + b;
-            Kx_.push_back({cell, node(a, b), -1.0});
-            Kx_.push_back({cell, node(a, b + 1), 1.0});
-            Ky_.push_back({cell, node(a, b), -1.0});
-            Ky_.push_back({cell, node(a + 1, b), 1.0});
-         }
-      auto by_row_then_col = [](const Tri& p, const Tri& q) {
-         return p.r != q.r ? p.r < q.r : p.c < q.c;
-      };
-      std::sort(Kx_.begin(), Kx_.end(), by_row_then_col);
-      std::sort(Ky_.begin(), Ky_.end(), by_row_then_col);
-      for (const auto& e : Kx_) KxT_.push_back({e.c, e.r, e.v});
-      for (const auto& e : Ky_) KyT_.push_back({e.c, e.r, e.v});
-      std::sort(KxT_.begin(), KxT_.end(), by_row_then_col);
-      std::sort(KyT_.begin(), KyT_.end(), by_row_then_col);
-   }
-
-   void apply(const std::vector<Tri>& K, const double* v, int len,
-              std::vector<double>& out) const {
-      out.assign(len, 0.0);
-      for (const auto& e : K) out[e.r] += e.v * v[e.c];
-   }
+   // They are applied directly from the grid; no stencil matrix is stored.
 
    // ---- warm start ----------------------------------------------------------
    // Solve plain TV denoising  min_u ½‖u − f‖² + λ·‖∇u‖  by Chambolle–Pock (an
    // accelerated phase, then fixed steps), then lift the answer to the MPCC
    // variables.  At that point u, q already satisfy h1 almost exactly, so the IPM
-   // starts next to the lower-level solution instead of at u = f.
+   // starts next to the lower-level solution instead of at u = f.  Returns the
+   // start in the unsplit global layout.
    //
    // θ is taken from the DUAL q, not from ∇u: that makes h3 exact and leaves only
    // noise-level error on h2.
-   void warm_start_chambolle_pock(double lam) {
+   std::vector<double> warm_start_chambolle_pock(const std::vector<double>& f, double lam) const {
       const double norm_K = std::sqrt(8.0);           // ‖K‖ for this stencil
       const double tau0 = 0.99 / (norm_K * lam), sig0 = 0.99 / norm_K;
       double tau = tau0, sig_lam = sig0;
-      std::vector<double> u = f_, ubar = u, u_new(m_u), kxu, kyu, div;
+      // Each sum adds its terms in a fixed order (Kx: the node (a, b), then
+      // (a, b+1); div: the cells in ascending order), with the leading 0.0 of
+      // an accumulator, so the result does not depend on how it is coded.
+      std::vector<double> u = f, ubar = u, u_new(m_u), div(m_u);
       std::vector<double> qx(m_q, 0.0), qy(m_q, 0.0);
       for (int it = 0; it < 3000; ++it) {
          const bool accelerated = it < 300;
          if (!accelerated && tau != tau0) { tau = tau0; sig_lam = sig0; }
          // dual step, then project q onto the unit ball
-         apply(Kx_, ubar.data(), m_q, kxu);
-         apply(Ky_, ubar.data(), m_q, kyu);
-         for (int e = 0; e < m_q; ++e) {
-            qx[e] += sig_lam * kxu[e];
-            qy[e] += sig_lam * kyu[e];
-            const double nrm = std::max(1.0, std::hypot(qx[e], qy[e]));
-            qx[e] /= nrm;
-            qy[e] /= nrm;
+         for (int a = 0; a < nc; ++a) {
+            const double* u0 = &ubar[a * N];   // node row a
+            const double* u1 = u0 + N;         // node row a + 1
+            for (int b = 0; b < nc; ++b) {
+               const int e = a * nc + b;
+               const double kx = (0.0 + -1.0 * u0[b]) + 1.0 * u0[b + 1];   // (Kx ū)_e
+               const double ky = (0.0 + -1.0 * u0[b]) + 1.0 * u1[b];       // (Ky ū)_e
+               qx[e] += sig_lam * kx;
+               qy[e] += sig_lam * ky;
+               const double nrm = std::max(1.0, std::hypot(qx[e], qy[e]));
+               qx[e] /= nrm;
+               qy[e] /= nrm;
+            }
          }
-         // primal step
-         div.assign(m_u, 0.0);
-         for (const auto& e : KxT_) div[e.r] += e.v * qx[e.c];
-         for (const auto& e : KyT_) div[e.r] += e.v * qy[e.c];
+         // primal step: div = Kxᵀqx + Kyᵀqy at node (i, j)
+         for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j) {
+               double d = 0.0;
+               if (i < nc && j >= 1) d += 1.0 * qx[i * nc + j - 1];
+               if (i < nc && j < nc) d += -1.0 * qx[i * nc + j];
+               if (i >= 1 && j < nc) d += 1.0 * qy[(i - 1) * nc + j];
+               if (i < nc && j < nc) d += -1.0 * qy[i * nc + j];
+               div[i * N + j] = d;
+            }
          double residual = 0.0;
          for (int i = 0; i < m_u; ++i) {
-            u_new[i] = (tau * f_[i] + u[i] - tau * lam * div[i]) / (tau + 1.0);
+            u_new[i] = (tau * f[i] + u[i] - tau * lam * div[i]) / (tau + 1.0);
             residual = std::max(residual, std::abs(u_new[i] - u[i]));
          }
          residual /= tau;
@@ -944,103 +949,166 @@ private:
          } else {
             for (int i = 0; i < m_u; ++i) ubar[i] = 2.0 * u_new[i] - u[i];
          }
-         u = u_new;
+         u.swap(u_new);
          if (residual <= 1e-9) break;
       }
 
-      std::vector<double> gx, gy;
-      apply(Kx_, u.data(), m_q, gx);
-      apply(Ky_, u.data(), m_q, gy);
-      x_start.assign(n, 0.0);
-      for (int i = 0; i < m_u; ++i) x_start[ou + i] = u[i];
-      for (int e = 0; e < m_q; ++e) {
-         x_start[oqx + e] = qx[e];
-         x_start[oqy + e] = qy[e];
-         x_start[oR + e] = std::hypot(gx[e], gy[e]);
-         x_start[oD + e] = std::hypot(qx[e], qy[e]);
-         x_start[oTh + e] = std::atan2(qy[e], qx[e]);
-      }
-      x_start[oa] = lam;
+      std::vector<double> x(n, 0.0);
+      for (int i = 0; i < m_u; ++i) x[ou + i] = u[i];
+      for (int a = 0; a < nc; ++a)
+         for (int b = 0; b < nc; ++b) {
+            const int e = a * nc + b;
+            const double gx = (0.0 + -1.0 * u[a * N + b]) + 1.0 * u[a * N + b + 1];
+            const double gy = (0.0 + -1.0 * u[a * N + b]) + 1.0 * u[(a + 1) * N + b];
+            x[oqx + e] = qx[e];
+            x[oqy + e] = qy[e];
+            x[oR + e] = std::hypot(gx, gy);
+            x[oD + e] = std::hypot(qx[e], qy[e]);
+            x[oTh + e] = std::atan2(qy[e], qx[e]);
+         }
+      x[oa] = lam;
+      return x;
    }
 
    // ---- the consensus split -------------------------------------------------
-   void split_into_consensus_form(const Partition& part) {
+   // Which tiles' rows reference each original variable?
+   //   u (node (i, j)): its own h1 row, and the h2 rows of the cells whose
+   //     stencil reads it: Kx at cells (i, j) and (i, j−1), Ky at (i, j) and
+   //     (i−1, j);
+   //   qx (cell (a, b)): its own h3 row, and the h1 rows of the nodes whose
+   //     divergence reads it, (a, b) and (a, b+1); qy: (a, b) and (a+1, b);
+   //   r/δ/θ: only their own cell's rows, so never shared;   α: every tile.
+   // A variable referenced by more than one tile becomes a consensus variable
+   // and gets one copy per tile, in ascending tile order.  The copies are
+   // numbered after the originals: those of u (by node), then of qx and qy (by
+   // cell), then of α.  All of this follows from the grid, so no rank needs a
+   // global table for it.
+   struct TileSet {   // the distinct tiles of one variable, ascending (≤ 4)
+      int t[4], n = 0;
+      void add(int k) {
+         for (int i = 0; i < n; ++i)
+            if (t[i] == k) return;
+         t[n++] = k;
+      }
+      int pos(int k) const {
+         for (int i = 0; i < n; ++i)
+            if (t[i] == k) return i;
+         return -1;
+      }
+   };
+   TileSet tiles_of_u(int node) const {
+      const int i = node / N, j = node % N;
+      TileSet s;
+      s.add(part_.node_tile(i, j));
+      if (i < nc && j < nc) s.add(part_.cell_tile(i, j));
+      if (i < nc && j >= 1) s.add(part_.cell_tile(i, j - 1));
+      if (i >= 1 && j < nc) s.add(part_.cell_tile(i - 1, j));
+      std::sort(s.t, s.t + s.n);
+      return s;
+   }
+   TileSet tiles_of_q(int e, bool y) const {
+      const int a = e / nc, b = e % nc;
+      TileSet s;
+      s.add(part_.cell_tile(a, b));
+      s.add(part_.node_tile(a, b));
+      s.add(y ? part_.node_tile(a + 1, b) : part_.node_tile(a, b + 1));
+      std::sort(s.t, s.t + s.n);
+      return s;
+   }
+
+   // Every variable in global order (the originals, then the copies):
+   // fn(variable, its tile (−1: consensus), the original it stands for).
+   template <class F>
+   void for_each_var(F fn) const {
+      for (int i = 0; i < m_u; ++i) {
+         const TileSet s = tiles_of_u(i);
+         fn(ou + i, s.n > 1 ? -1 : s.t[0], ou + i);
+      }
+      for (int y = 0; y < 2; ++y)
+         for (int e = 0; e < m_q; ++e) {
+            const TileSet s = tiles_of_q(e, y);
+            const int v = (y ? oqy : oqx) + e;
+            fn(v, s.n > 1 ? -1 : s.t[0], v);
+         }
+      for (int o : {oR, oD, oTh})
+         for (int e = 0; e < m_q; ++e) fn(o + e, part_.cell_tile(e), o + e);
+      fn(oa, n_tiles_ > 1 ? -1 : 0, oa);
+      int c = n_orig;
+      for (int i = 0; i < m_u; ++i) {
+         const TileSet s = tiles_of_u(i);
+         if (s.n > 1)
+            for (int j = 0; j < s.n; ++j) fn(c++, s.t[j], ou + i);
+      }
+      for (int y = 0; y < 2; ++y)
+         for (int e = 0; e < m_q; ++e) {
+            const TileSet s = tiles_of_q(e, y);
+            if (s.n > 1)
+               for (int j = 0; j < s.n; ++j) fn(c++, s.t[j], (y ? oqy : oqx) + e);
+         }
+      if (n_tiles_ > 1)
+         for (int k = 0; k < n_tiles_; ++k) fn(c++, k, oa);
+   }
+
+   // The variable that tile k uses in place of original variable v (v itself
+   // when v is not shared).  Needs copy_off_ (build_local()).
+   int seen_by(int v, int k) const {
+      int base = -1, j = -1;
+      if (v >= ou && v < ou + m_u) {
+         const TileSet s = tiles_of_u(v - ou);
+         if (s.n > 1) base = copy_off_[0][v - ou], j = s.pos(k);
+      } else if (v >= oqx && v < oqy + m_q) {
+         const bool y = v >= oqy;
+         const int e = v - (y ? oqy : oqx);
+         const TileSet s = tiles_of_q(e, y);
+         if (s.n > 1) base = copy_off_[1 + y][e], j = s.pos(k);
+      } else if (v == oa && n_tiles_ > 1) {
+         base = copy_off_[3][0], j = k;
+      }
+      return base >= 0 && j >= 0 ? n_orig + base + j : v;
+   }
+
+   // ---- the local view ------------------------------------------------------
+   // This rank's variables (its tiles' and the consensus ones) and rows, in
+   // ascending global order; the own nodes and cells with local indices; the
+   // stencils restricted to the own rows; and the patterns, in the global
+   // block order restricted to the own rows (so a tile's entries come in the
+   // same order on any number of ranks).  Built from the grid, for the own
+   // tiles only: nothing of the size of the image is kept but the warm start
+   // x0 (unsplit, global), which the caller frees.
+   void build_local(const std::vector<double>& x0, const std::vector<double>& clean,
+                    const std::vector<double>& noisy) {
+      n_tiles_ = part_.n_tiles;
+      const int k0 = dd::Comm::first_tile(dd::Comm::rank(), n_tiles_);
+      const int k1 = dd::Comm::first_tile(dd::Comm::rank() + 1, n_tiles_);
+      auto own = [&](int k) { return k >= k0 && k < k1; };
+
+      // 1. The copies: where each shared variable's run starts (copy_off_, by
+      //    kind: u, qx, qy, α), their number, and the new sizes.  Linking rows
+      //    extend the equality block, so every inequality block shifts down.
       n_orig = n;
       const int m_orig = mcon, n_eq_orig = n_eq;
-      n_tiles_ = part.n_tiles;
-      const std::vector<int>& node_tile = part.node_tile;
-      const std::vector<int>& cell_tile = part.cell_tile;
-
-      // 1. Which tiles' rows reference each original variable?
-      //    u (node i): its own h1 row, plus every h2 stencil that reads it.
-      //    qx/qy (cell e): its own h3 row, plus every h1 divergence that reads it.
-      //    r/δ/θ: only their own cell's rows, so never shared.   α: every tile.
-      std::vector<std::vector<int>> tiles(n_orig);
-      auto touch = [&](int v, int k) {
-         auto& list = tiles[v];
-         if (std::find(list.begin(), list.end(), k) == list.end()) list.push_back(k);
-      };
-      for (int i = 0; i < m_u; ++i) touch(ou + i, node_tile[i]);
-      for (const auto& e : Kx_) touch(ou + e.c, cell_tile[e.r]);
-      for (const auto& e : Ky_) touch(ou + e.c, cell_tile[e.r]);
-      for (int e = 0; e < m_q; ++e) {
-         touch(oqx + e, cell_tile[e]);
-         touch(oqy + e, cell_tile[e]);
-         touch(oR + e, cell_tile[e]);
-         touch(oD + e, cell_tile[e]);
-         touch(oTh + e, cell_tile[e]);
+      copy_off_[0].assign(m_u + 1, 0);
+      copy_off_[1].assign(m_q + 1, 0);
+      copy_off_[2].assign(m_q + 1, 0);
+      int next = 0;
+      for (int i = 0; i < m_u; ++i) {
+         copy_off_[0][i] = next;
+         const TileSet s = tiles_of_u(i);
+         if (s.n > 1) next += s.n;
       }
-      for (const auto& e : KxT_) touch(oqx + e.c, node_tile[e.r]);
-      for (const auto& e : KyT_) touch(oqy + e.c, node_tile[e.r]);
-      for (int k = 0; k < n_tiles_; ++k) touch(oa, k);
-      for (auto& list : tiles) std::sort(list.begin(), list.end());
-
-      // 2. Give every shared variable one copy per tile.  Copies of one variable
-      //    are contiguous, and α's copies come last so that every (α, ·) Hessian
-      //    entry stays in the lower triangle.
-      std::vector<int> first_copy(n_orig, -1);
-      std::vector<int> copy_tile;
-      col_tile_.assign(n_orig, 0);
-      int next = n_orig;
-      auto make_copies = [&](int v) {
-         if ((int)tiles[v].size() <= 1) {          // used by one tile only: not shared
-            col_tile_[v] = tiles[v].empty() ? 0 : tiles[v][0];
-            return;
+      copy_off_[0][m_u] = next;
+      for (int y = 0; y < 2; ++y) {
+         for (int e = 0; e < m_q; ++e) {
+            copy_off_[1 + y][e] = next;
+            const TileSet s = tiles_of_q(e, y);
+            if (s.n > 1) next += s.n;
          }
-         col_tile_[v] = -1;                        // becomes a consensus variable
-         first_copy[v] = next;
-         for (int k : tiles[v]) {
-            link_copy_.push_back(next);
-            link_orig_.push_back(v);
-            copy_tile.push_back(k);
-            ++next;
-         }
-      };
-      for (int i = 0; i < m_u; ++i) make_copies(ou + i);
-      for (int e = 0; e < m_q; ++e) make_copies(oqx + e);
-      for (int e = 0; e < m_q; ++e) make_copies(oqy + e);
-      for (int e = 0; e < m_q; ++e) {
-         make_copies(oR + e);
-         make_copies(oD + e);
-         make_copies(oTh + e);
+         copy_off_[1 + y][m_q] = next;
       }
-      make_copies(oa);
-      n_link = (int)link_copy_.size();
-      col_tile_.resize(next);
-      for (int c = 0; c < n_link; ++c) col_tile_[n_orig + c] = copy_tile[c];
-
-      // The variable that tile k should use in place of original variable v.
-      auto seen_by = [&](int v, int k) {
-         if (first_copy[v] < 0) return v;
-         const auto& list = tiles[v];
-         for (size_t j = 0; j < list.size(); ++j)
-            if (list[j] == k) return first_copy[v] + (int)j;
-         return v;
-      };
-
-      // 3. New sizes.  Linking rows extend the equality block, so every
-      //    inequality block shifts down by n_link.
-      n = next;
+      copy_off_[3].assign(1, next);
+      if (n_tiles_ > 1) next += n_tiles_;
+      n_link = next;
+      n = n_orig + n_link;
       rlink = n_eq_orig;
       n_eq = n_eq_orig + n_link;
       rhr += n_link;
@@ -1049,99 +1117,77 @@ private:
       rcomp += n_link;
       mcon = m_orig + n_link;
 
-      // 4. Row ownership.
-      row_tile_.assign(mcon, 0);
-      for (int i = 0; i < m_u; ++i) row_tile_[rh1 + i] = node_tile[i];
-      for (int block : {rh2x, rh2y, rh3x, rh3y, rhr, rhd, rcomp})
-         for (int e = 0; e < m_q; ++e) row_tile_[block + e] = cell_tile[e];
-      row_tile_[rha] = 0;
-      for (int l = 0; l < n_link; ++l) row_tile_[rlink + l] = copy_tile[l];
-
-      // 5. Effective-index tables: each row reads its own tile's copies.
-      u_of_h1_.resize(m_u);
-      alpha_of_h1_.resize(m_u);
-      for (int i = 0; i < m_u; ++i) {
-         u_of_h1_[i] = seen_by(ou + i, node_tile[i]);
-         alpha_of_h1_[i] = seen_by(oa, node_tile[i]);
-      }
-      alpha_of_tile_.resize(n_tiles_);
-      for (int k = 0; k < n_tiles_; ++k) alpha_of_tile_[k] = seen_by(oa, k);
-      qx_of_h3_.resize(m_q);
-      qy_of_h3_.resize(m_q);
-      for (int e = 0; e < m_q; ++e) {
-         qx_of_h3_[e] = seen_by(oqx + e, cell_tile[e]);
-         qy_of_h3_[e] = seen_by(oqy + e, cell_tile[e]);
-      }
-
-      for (const auto& e : KxT_) div_x_.push_back({e.r, seen_by(oqx + e.c, node_tile[e.r]), e.v});
-      for (const auto& e : KyT_) div_y_.push_back({e.r, seen_by(oqy + e.c, node_tile[e.r]), e.v});
-      for (const auto& e : Kx_) grad_x_.push_back({e.r, seen_by(ou + e.c, cell_tile[e.r]), e.v});
-      for (const auto& e : Ky_) grad_y_.push_back({e.r, seen_by(ou + e.c, cell_tile[e.r]), e.v});
-
-      // 6. Copies start equal to their consensus value, so the start is
-      //    exactly feasible for the linking rows.
-      x_start.resize(n);
-      for (int l = 0; l < n_link; ++l) x_start[link_copy_[l]] = x_start[link_orig_[l]];
-   }
-
-   // ---- the local view ------------------------------------------------------
-   // This rank's variables (its tiles' and the consensus ones) and rows, in
-   // ascending global order; the own nodes and cells with local indices; the
-   // stencils restricted to the own rows; and the patterns, in the global
-   // block order restricted to the own rows (so a tile's entries come in the
-   // same order on any number of ranks).  The global setup tables are freed.
-   // div_x_ etc. hold global (node/cell, variable) on entry, and (slot, local
-   // variable) on exit.
-   void build_local(const Partition& part) {
-      const int k0 = dd::Comm::first_tile(dd::Comm::rank(), n_tiles_);
-      const int k1 = dd::Comm::first_tile(dd::Comm::rank() + 1, n_tiles_);
-      auto own = [&](int k) { return k >= k0 && k < k1; };
-
-      std::vector<int> lv(n, -1), lr(mcon, -1);
-      for (int v = 0; v < n; ++v)
-         if (col_tile_[v] < 0 || own(col_tile_[v])) {
-            lv[v] = (int)gvar_.size();
-            gvar_.push_back(v);
-            vtile_.push_back(col_tile_[v]);
-         }
-      for (int r = 0; r < mcon; ++r)
-         if (own(row_tile_[r])) {
-            lr[r] = (int)grow_.size();
-            grow_.push_back(r);
-            rtile_.push_back(row_tile_[r]);
-         }
-      first_slack_row_ = (int)(std::lower_bound(grow_.begin(), grow_.end(), n_eq) - grow_.begin());
-      la_ = lv[oa];
-      if (own(row_tile_[rha])) { ha_ = lr[rha]; ha_alpha_ = lv[alpha_of_tile_[0]]; }
-
-      std::vector<int> node_slot(m_u, -1), cell_slot(m_q, -1);
-      for (int i = 0; i < m_u; ++i)
-         if (own(part.node_tile[i])) {
-            node_slot[i] = (int)nodes_.size();
-            nodes_.push_back({i, lr[rh1 + i], lv[u_of_h1_[i]], lv[alpha_of_h1_[i]]});
-         }
-      for (int e = 0; e < m_q; ++e)
-         if (own(part.cell_tile[e])) {
-            cell_slot[e] = (int)cells_.size();
-            cells_.push_back({e, lv[oR + e], lv[oD + e], lv[oTh + e], lv[qx_of_h3_[e]],
-                              lv[qy_of_h3_[e]], lr[rh2x + e], lr[rh2y + e], lr[rh3x + e],
-                              lr[rh3y + e], lr[rhr + e], lr[rhd + e], lr[rcomp + e]});
-         }
-      for (int l = 0; l < n_link; ++l)
-         if (lr[rlink + l] >= 0) links_.push_back({lr[rlink + l], lv[link_copy_[l]], lv[link_orig_[l]]});
-      for (int i = 0; i < m_u; ++i)
-         if (lv[ou + i] >= 0) u_orig_.push_back(lv[ou + i]);
-      for (int k = k0; k < k1; ++k) tile_alpha_.push_back(lv[alpha_of_tile_[k]]);
-      auto restrict_to = [&](std::vector<Tri>& K, const std::vector<int>& slot) {
-         std::vector<Tri> out;
-         for (const Tri& e : K)
-            if (slot[e.r] >= 0) out.push_back({slot[e.r], lv[e.c], e.v});
-         K.swap(out);
+      // 2. Local variables and rows, ascending.  A copy's linking row ℓ is
+      //    rlink + (copy − n_orig), on the copy's tile.
+      std::vector<int> orig;        // per local variable: the original it stands for
+      std::vector<std::array<int, 4>> own_links;   // (copy, its original, its row, its tile)
+      for_each_var([&](int v, int k, int o) {
+         if (k >= 0 && !own(k)) return;
+         gvar_.push_back(v);
+         vtile_.push_back(k);
+         orig.push_back(o);
+         if (v >= n_orig) own_links.push_back({v, o, rlink + (v - n_orig), k});
+      });
+      auto add_row = [&](int r, int k) {
+         if (!own(k)) return;
+         grow_.push_back(r);
+         rtile_.push_back(k);
       };
-      restrict_to(div_x_, node_slot);
-      restrict_to(div_y_, node_slot);
-      restrict_to(grad_x_, cell_slot);
-      restrict_to(grad_y_, cell_slot);
+      for (int i = 0; i < m_u; ++i) add_row(rh1 + i, part_.node_tile(i));
+      for (int block : {rh2x, rh2y, rh3x, rh3y})
+         for (int e = 0; e < m_q; ++e) add_row(block + e, part_.cell_tile(e));
+      for (const auto& l : own_links) add_row(l[2], l[3]);
+      for (int block : {rhr, rhd})
+         for (int e = 0; e < m_q; ++e) add_row(block + e, part_.cell_tile(e));
+      add_row(rha, 0);
+      for (int e = 0; e < m_q; ++e) add_row(rcomp + e, part_.cell_tile(e));
+      auto lv = [&](int v) {
+         const auto it = std::lower_bound(gvar_.begin(), gvar_.end(), v);
+         return it != gvar_.end() && *it == v ? (int)(it - gvar_.begin()) : -1;
+      };
+      auto lr = [&](int r) {
+         const auto it = std::lower_bound(grow_.begin(), grow_.end(), r);
+         return it != grow_.end() && *it == r ? (int)(it - grow_.begin()) : -1;
+      };
+      first_slack_row_ = (int)(std::lower_bound(grow_.begin(), grow_.end(), n_eq) - grow_.begin());
+      la_ = lv(oa);
+      if (own(0)) { ha_ = lr(rha); ha_alpha_ = lv(seen_by(oa, 0)); }
+
+      // 3. Own nodes and cells, links, the stencils restricted to them.
+      for (int i = 0; i < m_u; ++i) {
+         const int k = part_.node_tile(i);
+         if (!own(k)) continue;
+         nodes_.push_back({i, lr(rh1 + i), lv(seen_by(ou + i, k)), lv(seen_by(oa, k))});
+         fnode_.push_back(noisy[i]);
+      }
+      for (int e = 0; e < m_q; ++e) {
+         const int k = part_.cell_tile(e);
+         if (!own(k)) continue;
+         cells_.push_back({e, lv(oR + e), lv(oD + e), lv(oTh + e), lv(seen_by(oqx + e, k)),
+                           lv(seen_by(oqy + e, k)), lr(rh2x + e), lr(rh2y + e), lr(rh3x + e),
+                           lr(rh3y + e), lr(rhr + e), lr(rhd + e), lr(rcomp + e)});
+      }
+      for (const auto& l : own_links) links_.push_back({lr(l[2]), lv(l[0]), lv(l[1])});
+      for (size_t l = 0; l < gvar_.size() && gvar_[l] < ou + m_u; ++l) u_orig_.push_back((int)l);
+      for (int k = k0; k < k1; ++k) tile_alpha_.push_back(lv(seen_by(oa, k)));
+      // div at node (i, j): the cells in ascending order (Kxᵀ: (i, j−1) +1,
+      // (i, j) −1; Kyᵀ: (i−1, j) +1, (i, j) −1), each read through the
+      // node's tile
+      for (int s = 0; s < (int)nodes_.size(); ++s) {
+         const int i = nodes_[s].i / N, j = nodes_[s].i % N, k = part_.node_tile(i, j);
+         if (i < nc && j >= 1) div_x_.push_back({s, lv(seen_by(oqx + i * nc + j - 1, k)), 1.0});
+         if (i < nc && j < nc) div_x_.push_back({s, lv(seen_by(oqx + i * nc + j, k)), -1.0});
+         if (i >= 1 && j < nc) div_y_.push_back({s, lv(seen_by(oqy + (i - 1) * nc + j, k)), 1.0});
+         if (i < nc && j < nc) div_y_.push_back({s, lv(seen_by(oqy + i * nc + j, k)), -1.0});
+      }
+      // Kx, Ky at cell (a, b): the node (a, b) −1, then (a, b+1) / (a+1, b) +1
+      for (int s = 0; s < (int)cells_.size(); ++s) {
+         const int e = cells_[s].e, a = e / nc, b = e % nc, k = part_.cell_tile(e);
+         grad_x_.push_back({s, lv(seen_by(ou + a * N + b, k)), -1.0});
+         grad_x_.push_back({s, lv(seen_by(ou + a * N + b + 1, k)), 1.0});
+         grad_y_.push_back({s, lv(seen_by(ou + a * N + b, k)), -1.0});
+         grad_y_.push_back({s, lv(seen_by(ou + (a + 1) * N + b, k)), 1.0});
+      }
 
       // the patterns; jac_values and hess_values fill values in THIS order
       auto J = [&](int r, int c) { jac_row_.push_back(r); jac_col_.push_back(c); };
@@ -1180,11 +1226,28 @@ private:
       for (int l : tile_alpha_) H(l, l);
       H(la_, la_);
 
-      std::vector<double> xs(gvar_.size());
-      for (size_t l = 0; l < gvar_.size(); ++l) xs[l] = x_start[gvar_[l]];
-      x_start.swap(xs);
-      for (auto* v : {&row_tile_, &u_of_h1_, &alpha_of_h1_, &qx_of_h3_, &qy_of_h3_})
-         std::vector<int>().swap(*v);
-      for (auto* v : {&Kx_, &Ky_, &KxT_, &KyT_}) std::vector<Tri>().swap(*v);
+      // 4. The start (copies start equal to their consensus value, so the
+      //    linking rows hold exactly) and the objective's reference values.
+      x_start.resize(gvar_.size());
+      ref_.assign(gvar_.size(), 0.0);
+      for (size_t l = 0; l < gvar_.size(); ++l) {
+         const int v = gvar_[l];
+         x_start[l] = x0[orig[l]];
+         if (v < ou + m_u) ref_[l] = clean[v - ou];
+         else if (v >= oTh && v < oTh + m_q) ref_[l] = x0[v];   // θ_ref: the warm start's θ
+      }
+      for (auto& c : copy_off_) std::vector<int>().swap(c);
+   }
+
+   // For --diag on rank 0: every variable's tile (−1: consensus) and every
+   // copy's original, global.  Built on first use.
+   void global_maps() const {
+      if (!col_tile_.empty()) return;
+      col_tile_.assign(n, 0);
+      link_orig_.assign(n_link, 0);
+      for_each_var([&](int v, int k, int o) {
+         col_tile_[v] = k;
+         if (v >= n_orig) link_orig_[v - n_orig] = o;
+      });
    }
 };

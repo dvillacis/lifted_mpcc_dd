@@ -48,21 +48,26 @@ public:
       }
       return b.spd;
    }
-   // out(k) ← M_k⁻¹ N_kᵀ r for the blocks in [k0, k1).  The caller adds the
-   // outputs up over the border (SchurDD::gather), so that tiles owned by other
-   // ranks can contribute too.
-   void apply_blocks(const Vec& r, int k0, int k1) {
+   // out + off[k] ← M_k⁻¹ N_kᵀ r for the blocks in [k0, k1) (block k has
+   // off[k+1] − off[k] unknowns, or none).  The caller adds the outputs up
+   // over the border (SchurDD::apply_M), so that tiles owned by other ranks
+   // can contribute too.
+   void apply_blocks(const Vec& r, int k0, int k1, double* out, const int* off) {
 #pragma omp parallel for schedule(dynamic, 4)
       for (int k = k0; k < k1; ++k) {
          Block& b = blocks_[k];
          const int m = (int)b.idx.size();
          if (m == 0) continue;
-         Vec rk(m);
+         Eigen::Map<Vec> rk(out + off[k], m);
          for (int i = 0; i < m; ++i) rk[i] = r[b.idx[i]];
-         b.out = b.spd ? Vec(b.llt.solve(rk)) : Vec(b.inv * rk);
+         if (b.spd) {
+            b.llt.solveInPlace(rk);
+         } else {
+            const Vec t = b.inv * rk;
+            rk = t;
+         }
       }
    }
-   Vec& out(int k) { return blocks_[k].out; }
 
 private:
    struct Block {
@@ -70,7 +75,6 @@ private:
       Eigen::LLT<Mat> llt;
       Mat inv;
       bool spd = true;
-      Vec out;
    };
    std::vector<Block> blocks_;
 };

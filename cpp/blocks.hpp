@@ -319,15 +319,17 @@ enum class Backend { Sparse, Dense, Mumps };
 class TileBlock {
 public:
    // w: the W_k entries; b: the B_k entries (border row a, tile column l, slot);
-   // p: the number of border unknowns the tile touches.
+   // p: the number of border unknowns the tile touches; S: where a MUMPS tile
+   // puts S_k (the caller keeps it, and does not reallocate it).
    void set_pattern(Backend backend, Backend fallback, int n, const std::vector<Entry>& w,
-                    std::vector<char> primal, const std::vector<Entry>& b, int p) {
+                    std::vector<char> primal, const std::vector<Entry>& b, int p, Mat* S) {
       backend_ = backend;
       fallback_ = fallback;
       n_ = n;
       p_ = p;
       w_ = &w;
       b_ = &b;
+      S_ = S;
       if (backend_ == Backend::Sparse) sp_.set_pattern(n, w, std::move(primal));
    }
 
@@ -353,6 +355,10 @@ public:
       else if (used_ == Backend::Dense) bk_.solve(b);
       else mumps_solve(b);
    }
+   // A MUMPS tile has S_k in the caller's array after factorize() (no copy);
+   // it needs neither B_k as a matrix nor, once analysed, the W_k entries.
+   bool schur_in_place() const { return used_ == Backend::Mumps; }
+   bool needs_w() const { return !(backend_ == Backend::Mumps && mu_ready()); }
    Mat schur(const SpMat& B) const {
       if (used_ == Backend::Sparse) return sp_.schur(B);
       if (used_ == Backend::Mumps) return mumps_schur();
@@ -369,7 +375,7 @@ public:
    // W_k⁻¹(r − B_kᵀ y) for the same r.  One forward and one backward sweep,
    // instead of two solve()s.
    bool can_reduce() const { return used_ == Backend::Mumps && p_ > 0; }
-   void reduce(const Vec& r, Vec& bz) { mumps_reduce(r, bz); }
+   void reduce(const Vec& r, double* bz) { mumps_reduce(r, bz); }   // bz: p_k entries
    void expand(const Vec& y, Vec& x) { mumps_expand(y, x); }
 
 private:
@@ -397,36 +403,40 @@ private:
       if (!mu_) {   // first use: the augmented pattern, analysed once
          mu_ = std::make_unique<MumpsBlock>();
          std::vector<int> r, c;
-         for (const Entry& e : *w_) { r.push_back(e[0]); c.push_back(e[1]); }
-         for (const Entry& e : *b_) { r.push_back(n_ + e[0]); c.push_back(e[1]); }
-         if (!mu_->analyze(n_, p_, r, c)) return false;
+         for (const Entry& e : *w_) { r.push_back(e[0]); c.push_back(e[1]); slot_.push_back(e[2]); }
+         for (const Entry& e : *b_) { r.push_back(n_ + e[0]); c.push_back(e[1]); slot_.push_back(e[2]); }
+         if (p_ > 0) S_->setZero(p_, p_);
+         if (!mu_->analyze(n_, p_, r, c, p_ > 0 ? S_->data() : nullptr)) {
+            mu_.reset();
+            slot_.clear();
+            return false;
+         }
       }
-      mval_.resize(w_->size() + b_->size());
-      size_t k = 0;
-      for (const Entry& e : *w_) mval_[k++] = values[e[2]];
-      for (const Entry& e : *b_) mval_[k++] = values[e[2]];
-      return mu_->factorize(mval_.data());
+      double* a = mu_->user_values();
+      for (size_t k = 0; k < slot_.size(); ++k) a[k] = values[slot_[k]];
+      return mu_->factorize();
    }
+   bool mu_ready() const { return mu_ != nullptr; }
    int mumps_negative() const { return mu_->negative(); }
    void mumps_solve(Vec& b) const { mu_->solve(b.data()); }
-   Mat mumps_schur() const { return Eigen::Map<const Mat>(mu_->schur(), p_, p_); }
-   void mumps_reduce(const Vec& r, Vec& bz) {
-      bz.resize(p_);
-      mu_->reduce(r.data(), bz.data());
-      bz = -bz;   // MUMPS returns 0 − B W⁻¹ r
+   Mat mumps_schur() const { return *S_; }
+   void mumps_reduce(const Vec& r, double* bz) {
+      mu_->reduce(r.data(), bz);
+      for (int a = 0; a < p_; ++a) bz[a] = -bz[a];   // MUMPS returns 0 − B W⁻¹ r
    }
    void mumps_expand(const Vec& y, Vec& x) {
       x.resize(n_);
       mu_->expand(y.data(), x.data());
    }
    std::unique_ptr<MumpsBlock> mu_;
-   std::vector<double> mval_;
+   std::vector<int> slot_;   // the KKT value slot of each entry given to MUMPS
 #else
    bool mumps_factorize(const double*) { return false; }
    int mumps_negative() const { return 0; }
    void mumps_solve(Vec&) const {}
    Mat mumps_schur() const { return Mat(); }
-   void mumps_reduce(const Vec&, Vec&) {}
+   bool mu_ready() const { return false; }
+   void mumps_reduce(const Vec&, double*) {}
    void mumps_expand(const Vec&, Vec&) {}
 #endif
 
@@ -435,6 +445,7 @@ private:
    long fallbacks_ = 0;
    const std::vector<Entry>* w_ = nullptr;
    const std::vector<Entry>* b_ = nullptr;
+   Mat* S_ = nullptr;
    SparseKKT sp_;
    DenseBK bk_;
 };

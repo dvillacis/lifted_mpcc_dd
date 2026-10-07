@@ -70,6 +70,7 @@ static void usage() {
       "             --kappa-eps 1000 (μ decreases while E_μ <= κ_ε·μ)  --mu-steps S (at most\n"
       "               S decreases per iteration; 0 = no limit)\n"
       "             --t-mu-scale 10 (t = max(t_min, scale*mu); Raghunathan-Biegler: 1)\n"
+      "             --gate-scale C (level gate: inf_du <= C*sqrt(t); inf_pr, mu <= sqrt(t))\n"
       "             --mu-min M (floor of mu; default t_min/t-mu-scale, so mu/t >= 1/scale\n"
       "               at t_min; 0: the IPM's tol/10)  --resto-mu-steps S (at most S decreases\n"
       "               of mu right after a restoration phase; default 1, 0: no cap)\n"
@@ -103,7 +104,8 @@ static int run(int argc, char** argv);
 
 int main(int argc, char** argv) {
 #ifdef DD_HAVE_MPI
-   MPI_Init(&argc, &argv);
+   int provided = 0;   // MPI from the main thread only (schur_dd.hpp, StopSignal)
+   MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
 #endif
    const int code = run(argc, argv);
 #ifdef DD_HAVE_MPI
@@ -131,7 +133,7 @@ static int run(int argc, char** argv) {
    double cleanup_dual_reg = -1.0, cleanup_mu = 0.0;   // < 0 / 0: as in the continuation
    int cleanup_biactive = 0;
    double penalty = 0.0, penalty_max = 1e8;
-   double vw_mu = 0.0, t_mu_scale = 10.0, t_rate = 0.5, t_comp_ratio = 0.0;
+   double vw_mu = 0.0, gate_du_scale = 1.0, t_mu_scale = 10.0, t_rate = 0.5, t_comp_ratio = 0.0;
    bool vw_comp_only = false, vw_ls_grad = true;
    bool penalty_hessian = true;
    double cleanup_eps = 0.0;
@@ -192,6 +194,7 @@ static int run(int argc, char** argv) {
       else if (a == "--vw-bounds") vw_comp_only = v == "comp";
       else if (a == "--vw-linesearch") vw_ls_grad = v != "plain";
       else if (a == "--t-mu-scale") t_mu_scale = std::stod(v);
+      else if (a == "--gate-scale") gate_du_scale = std::stod(v);
       else if (a == "--t-rate") t_rate = std::stod(v);
       else if (a == "--t-comp-ratio") t_comp_ratio = std::stod(v);
       else if (a == "--penalty-max") penalty_max = std::stod(v);
@@ -241,9 +244,10 @@ static int run(int argc, char** argv) {
 #endif
 
    // ---- the instance
-   const Image img = load_image(data, N, sigma, seed);
+   Image img = load_image(data, N, sigma, seed);
    const Partition part(N, nsub);
    TvMpcc problem(img, part, sigma);
+   if (!root) img = Image{};   // only rank 0 reports and saves
    problem.print = root;
    problem.diag = diag;
    problem.classify = classify;
@@ -277,6 +281,7 @@ static int run(int argc, char** argv) {
    problem.t = std::max(t_min, problem.t_mu_scale * mu0);
    problem.eps_theta = problem.c_theta * problem.t;
    problem.gate_floor = tol_target;
+   problem.gate_du_scale = gate_du_scale;
 
    // ---- the IPM
    IPM ipm;
@@ -323,7 +328,8 @@ static int run(int argc, char** argv) {
       if (root)
          std::printf("\nclean-up: cells pinned at r = 0: %ld, at delta = 1: %ld, both: %ld,"
                      " neither: %ld; products dropped\n", pins[0], pins[1], pins[2], pins[3]);
-      const std::vector<double> sol = problem.solution, mult = problem.multipliers;
+      const std::vector<double> sol = problem.solution;
+      const double xi = problem.xi_max;
       const double obj = problem.objective;
       IPM ipm2;
       ipm2.opt = ipm.opt;
@@ -345,7 +351,7 @@ static int run(int argc, char** argv) {
                      rep.min_mult);
       if (!cleaned) {   // keep the continuation's answer
          problem.solution = sol;
-         problem.multipliers = mult;
+         problem.xi_max = xi;
          problem.objective = obj;
          if (root) std::printf("clean-up failed: reporting the continuation's point\n");
       }
@@ -361,11 +367,9 @@ static int run(int argc, char** argv) {
    const std::vector<double>& x = problem.solution;
    const double alpha = x.empty() ? NAN : x[problem.oa];
    const double comp = x.empty() ? NAN : problem.max_complementarity(x.data());
-   const double p_noisy = psnr(img.clean, img.noisy.data());
+   const double p_noisy = root ? psnr(img.clean, img.noisy.data()) : NAN;
    const double p_recon = x.empty() ? NAN : psnr(img.clean, x.data() + problem.ou);
-   double xi_max = 0.0;
-   for (int e = 0; e < problem.m_q && !problem.multipliers.empty(); ++e)
-      xi_max = std::max(xi_max, std::abs(problem.multipliers[problem.rcomp + e]));
+   const double xi_max = x.empty() ? 0.0 : problem.xi_max;
    const double cg_mean = s.solves ? (double)s.cg_iters / s.solves : 0.0;
 
    // timings and memory: the slowest rank (the others wait for it)
@@ -385,7 +389,7 @@ static int run(int argc, char** argv) {
       std::printf("clean-up (%s): %s, %d + %d iterations (continuation + clean-up)\n",
                   cleanup.c_str(), rc.iters == 0 ? "not run" : cleaned ? "converged" : "FAILED",
                   main_iters, rc.iters);
-   std::printf("refused factorizations: wrong In(W_k) %ld (too few negatives: %ld), S not PD %ld,"
+   std::printf("refused factorizations: wrong In(W_k) or singular W_k %ld (too few negatives: %ld), S not PD %ld,"
                " singular %ld;  iterations with δ > 0: %ld\n",
                r.tile_corrections, r.tile_too_few, r.s_corrections, r.singular, r.regularized);
    if (line_search)

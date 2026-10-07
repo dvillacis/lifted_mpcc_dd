@@ -27,7 +27,9 @@ The folder is self-contained: nothing is included from the rest of the repositor
 - The constraint multipliers start from the least-squares estimate.
 - **Regularization:** one δ on all tile primals (IPOPT's δ_w schedule), raised when some In(W_k) is wrong (eq. 24) or S is not positive definite (eq. 25). A dual δ_c = 10⁻⁶ is in every Newton system (`--dual-reg`; stabilization for the near-singular rows at flattened single-pixel features, see "The end game"); with `--dual-reg 0` it is added only when a tile has too *few* negative eigenvalues (its Jacobian is rank-deficient, and no δ fixes that), as IPOPT does. Nothing is added on the consensus variables.
   - Each iteration first tries δ = 0, as IPOPT does. With `--delta-start last`, an iteration that follows one with δ > 0 starts from δ_last/3 instead (δ > 0 is needed in most iterations here). This changes the path, so it is not the default.
-  - With δ_c > 0, every wrong In(W_k) leads to the same decision (raise δ). So each rank stops factorizing its tiles at the first tile with a wrong inertia; the rest would be refused anyway. The run is unchanged. Only the counters can differ: which of "singular" and "wrong In(W_k)" is reported, and the count of tiles with too few negatives.
+  - With δ_c > 0, every wrong In(W_k) leads to the same decision (raise δ). So **every rank stops factorizing its tiles as soon as any rank meets a tile with a wrong inertia or a singular one**; the rest would be refused anyway. The rank that meets it sends a small nonblocking message to the others, which look for it between tiles (`StopSignal`, `comm.hpp`); after the exchange of the results every rank receives exactly the messages of the ranks that sent one, so nothing is left in flight.
+    - **The iterates are unchanged.** Which bad tile is met first depends on timing, so a singular W_k and a wrong In(W_k) are counted together ("wrong In(W_k) or singular W_k" in the summary), and the count of sparse tile factorizations that fell back can vary by a few between runs. The count of tiles with too few negatives can differ too.
+    - Before 2026-10-07 each rank stopped only at its own first bad tile, and the others factorized all their tiles while the IPM waited for them. At N=128 8×8 (8 ranks) refused factorizations were 43% of the factorization time.
 
 **Linear algebra** (`schur_dd.hpp`, `blocks.hpp`, `precond.hpp`):
 - **Tile blocks, default when built with MUMPS.** MUMPS factorizes the augmented tile matrix [W_k B_kᵀ; B_k 0] with its Schur-complement feature. That returns S_k directly and gives In(W_k) exactly through its pivoted (1×1/2×2) LDLᵀ (`mumps_block.hpp`).
@@ -43,11 +45,11 @@ The folder is self-contained: nothing is included from the rest of the repositor
 - **Parallelism: MPI over tiles** (`MPI=1`, `comm.hpp`). Each rank owns a contiguous range of tiles and **holds only their part of the problem**: their variables, rows and KKT unknowns, plus the consensus variables (the border), which every rank holds and updates identically. A rank evaluates the functions and derivatives of its own rows, runs the IPM's elementwise work on its own entries, factorizes its W_k with its own MUMPS, forms its S_k and does its tile solves. The PCG vectors live on the border and are the same on every rank.
   - **Exchange.** Never MPI sums of floating-point values:
     - every global sum (θ, φ_μ, ∇φ_μᵀd, the scaling sums, the objective) is formed per tile, the partials are all-gathered and added in tile order (`TileSum`), the consensus part last;
-    - the consensus rows of Jᵀλ and K·d, and every border contribution in each solve and each PCG product, are all-gathered per tile and added in tile order (`SchurDD::border_product`);
+    - the consensus rows of Jᵀλ and K·d, and every border contribution in each solve and each PCG product, are all-gathered per tile and added in tile order (`SchurDD::border_product`). The per-tile border outputs live in one flat array with fixed offsets (`flat_`): each product writes into it, one all-gather spreads it, and nothing is allocated or copied per product;
     - maxima and minima (inf_pr, inf_du, the fraction to the boundary) are exact reductions;
     - for the Schwarz blocks S̃_k, each tile j sends only the part of S_j on the border unknowns it shares with tile k: an edge block for neighbours, and for distant tiles the single entry of α, which every tile shares (`MPI_Alltoallv`). With `--schur direct` every rank assembles all of S, so every S_k is all-gathered.
   - **Consequence.** A run is bit-identical for any number of ranks and threads (verified: 1–4 ranks and 4 threads on mariposa N=48; 1–3 ranks on cameraman N=32 with PCG, direct, and the sparse+dense tiles of a build without MUMPS; 4 and 8 ranks on cameraman N=256 through a restoration phase). No rank can drift from the others.
-  - **Memory.** Per rank, it is the rank's share of the problem plus a few per-pixel arrays (image, warm start, the variable → tile map). See "Memory" below.
+  - **Memory.** Per rank, it is the rank's share of the problem. The setup builds it from the grid geometry for the rank's own tiles: which tiles reference a variable, the copies' numbering and the stencils follow from the stencil itself, so no global table is built. The only per-pixel arrays are the warm start, during the setup (every rank computes it for the whole image), and the image on rank 0. See "Memory" below.
   - **`--diag`, `--classify`, the solution and the `.npz`** are gathered on rank 0 in the global layout (for `--diag`/`--classify` at every iteration where they print).
 - **OpenMP within a rank** (`OMP=1`) runs the per-tile loops in parallel. MUMPS's C interface is not thread-safe, even across separate instances: concurrent calls crashed or aborted in `mumps_check`. So every MUMPS call takes one process-wide lock: within a rank, MUMPS tiles go one at a time. MPI ranks are separate processes, so they don't share that lock. **Use MPI ranks, not threads, for the tile factorizations.**
 
@@ -88,6 +90,8 @@ OMP_NUM_THREADS=1 mpirun -np 8 ./tv_dd --size 128 --nsub 8    # 64 tiles over 8 
 
 On Linux, build inside a conda env with `eigen` and `lapack`, or set `LAPACK_LIBS` (e.g. `"-lopenblas"`). Threads: `--threads n` or `OMP_NUM_THREADS`. BLAS is pinned to one thread inside each tile.
 
+**On the cluster** (OpenHPC, recognized by `/opt/ohpc`; `HPC=0` turns it off), `conda activate mkl_imaging && ./build.sh` always builds with Open MPI and MUMPS: it loads the `openmpi5` module if `mpicxx` is missing, compiles with the system `g++` and links with the system linker (`-B/usr/bin`; conda's linker cannot resolve the system libraries `libmpi.so` needs), and takes MUMPS from conda-forge's `mumps-seq`. Without MUMPS it stops instead of building the sparse+dense tiles, which are about 1000× slower at N=128. `tv_dd.slurm` runs it with the same modules.
+
 **MUMPS.** `build.sh` finds MUMPS through pkg-config `coinmumps`, i.e. COIN-OR ThirdParty-Mumps; `~/.local/coinmumps` is searched by default. On this laptop it was installed with:
 
 ```bash
@@ -98,7 +102,7 @@ make -j8 && make install          # MUMPS 5.9.1 (ThirdParty-Mumps 3.0.14)
 
 Elsewhere, give the flags directly: `MUMPS_CFLAGS="-I…/include" MUMPS_LIBS="-L…/lib -ldmumps_seq -lmumps_common_seq …"` (e.g. conda-forge's `mumps-seq`). `MUMPS=0 ./build.sh` builds without it. `tv_dd` runs MUMPS's self-test at startup and refuses to use MUMPS if it fails.
 
-**MPI and sequential MUMPS in one binary.** Sequential MUMPS ships its own stand-ins for some MPI functions (`MPI_Init`, `MPI_Comm_rank`, `MPI_Finalize`, … in its `libseq`), under the same names as the real MPI library. `build.sh` therefore does not use the `mpicxx` wrapper, which puts `-lmpi` last. It takes the wrapper's flags and links the real MPI library *before* MUMPS. On macOS each symbol binds to the first library that exports it; check with `nm -m tv_dd | grep _MPI_Init`, which must say `(from libmpi…)`. On Linux, symbols are resolved globally at run time instead. **Before trusting MPI runs on a new machine:** run `mpirun -np 2 ./tv_dd --size 32 --nsub 4` and compare its iteration log with a run of a build without MPI (`MPI=0`); they must be identical.
+**MPI and sequential MUMPS in one binary.** Sequential MUMPS ships its own stand-ins for some MPI functions (`MPI_Init`, `MPI_Comm_rank`, `MPI_Finalize`, … in its `libseq`), under the same names as the real MPI library. `build.sh` therefore does not use the `mpicxx` wrapper, which puts `-lmpi` last. It takes the wrapper's flags and links the real MPI library *before* MUMPS. On macOS each symbol binds to the first library that exports it; check with `nm -m tv_dd | grep _MPI_Init` (`tv_dd` calls `MPI_Init_thread`), which must say `(from libmpi…)`. On Linux, symbols are resolved globally at run time instead. **Before trusting MPI runs on a new machine:** run `mpirun -np 2 ./tv_dd --size 32 --nsub 4` and compare its iteration log with a run of a build without MPI (`MPI=0`); they must be identical.
 
 | option | default | |
 |---|---|---|
@@ -125,6 +129,7 @@ Elsewhere, give the flags directly: `MUMPS_CFLAGS="-I…/include" MUMPS_LIBS="-L
 | `--t-mu-scale` | 10 | t = max(t_min, scale·μ); 1 is Raghunathan–Biegler's μ/t = 1 (fewer iterations on N ≥ 96, see "The end game") |
 | `--precond` | `as` | interface preconditioner: `as` additive Schwarz on S̃_k = N_kᵀ S N_k (eq. 19); `asd` S_k with its diagonal replaced by diag(S) (eq. 21; weaker, see "Known limitations") |
 | `--vw-mu` | 0 (off) | M > 0: Raghunathan–Biegler's modified step (eq. 3.7, choice (ii) of 3.8) once μ ≤ M, as in IPOPT-C's source: every bound, η = 0.1·μ_prev/(1 + max(‖c‖∞, ‖z‖∞)), off in restoration, matching line-search gradient (IPOPT-C: M = 5·10⁻⁶); `--vw-bounds comp` restricts it to r ≥ 0, 1−δ ≥ 0, `--vw-linesearch plain` keeps the plain barrier gradient |
+| `--gate-scale` | 1 | C: the level gate's dual test is inf_du ≤ C·√t; inf_pr and μ stay at √t (experiment) |
 | `--t-rate` | 0.5 | t falls by at most this factor per iteration; 0: no limit (with `--t-mu-scale 1`: t = μ, IPOPT-C) |
 | `--vw-linesearch` | `modified` | with `--vw-mu`: the line search's ∇φ_μᵀd uses the barrier term of the modified step, ∓(z + (μ − sz)/(s + ηz)) instead of ∓μ/s, as IPOPT-C's `filter.F` does; `plain` = the barrier gradient unchanged (the behaviour before) |
 | `--penalty` | 0 (off) | π₀ > 0: exact-penalty formulation f + π Σ r(1−δ), no product rows (experiment, fails from N=128 on; see "The end game"); `--penalty-max 1e8` (cap; = π₀ keeps π fixed), `--penalty-hessian on\|off` |
@@ -382,6 +387,24 @@ Both stop at the level gate (t = 10⁻⁴); the 16×16 log is bit-identical on 4
 - **RSS is higher than the live heap.** The macOS allocator keeps freed memory: RSS goes 219 → 327 MB while the live heap stays at 165 MB.
 - **Results against the previous replicated version.** Global sums are now added per tile, so values differ from it by rounding. The paths agree on the small instances (iterations and α\* unchanged on the six, with `--schur direct`, `--bounds vars`, `--alpha-y min-dual-infeas`, `--relax-cells`), but can split in a long end game (N=128 above).
 - **Eliminating p and n** changes the restoration phase only by rounding: on N=256 16×16 its 10 iterations agree with the uncondensed phase in every printed digit. Its `lin.res` column now measures the condensed system that is solved (≈10⁻¹⁰, PCG's tolerance), not the full one.
+
+**Performance and memory changes of 2026-10-07.** None of them changes a number: on the small six (4 ranks), cameraman N=32 and mariposa N=48 on 1 and 3 ranks, cameraman N=128 8×8 and N=256 16×16 (8 ranks) and mariposa N=512 16×16 (8 ranks, t_min = 5·10⁻⁴, with a restoration phase), the iteration logs are identical to those before. So are the `--diag` output and the `.npz` (byte for byte), the `--schur direct`, `--block-solver dense|sparse` and `--cleanup` runs, an OpenMP build on 1 and 3 threads, and a build without MUMPS.
+- **Every rank stops at the first bad tile of any rank** (see the method).
+- **PCG exchange without allocations:** the flat border array (see "Exchange").
+- **The warm start** applies the gradient stencils directly instead of through triplet lists. The terms are added in the same order, so the result is the same to the last bit. N=512 on 8 ranks: 26 s → 5.7 s per rank (not in the reported wall, which times only the IPM).
+- **The setup builds only the rank's part** (`TvMpcc::build_local`, `Partition` keeps one band per grid line). Before, every rank built global tables of the whole problem (the tiles of every variable, the copy maps, the stencils, the row owners) and then cut them down; that transient grew with N², not with 1/ranks.
+- **Copies dropped:** MUMPS writes S_k straight into the tile's array, and takes the values straight into its own input array (no `mval_`); zero diagonals go only to the unknowns without a diagonal entry (24% fewer entries); the routed W_k triplets are freed after MUMPS's analysis and B_k is not built for MUMPS tiles; the restoration phase moves its start and end points instead of copying them; the global λ is no longer gathered (max |ξ| is an exact max over the ranks), the solution is gathered without indices, and ranks other than 0 drop the image after the setup.
+- **Measured** (8 ranks, 1 thread each, the machine loaded by other jobs, so times ±10%; memory: peak physical footprint of the largest rank, which unlike RSS counts compressed pages, and the setup's peak RSS from a run stopped after the setup):
+
+  | instance | setup peak | peak footprint | IPM wall | factorize / solve |
+  |---|---|---|---|---|
+  | cameraman N=128 8×8 (best of 3) | | | 3.78 → 3.07 s | 2.21 → 1.72 s / 1.22 → 1.09 s |
+  | cameraman N=256 16×16, full run | 75 → 32 MB | 338 → 257 MB | 19.3 → 16.2 s | 8.46 → 7.09 s / 9.33 → 7.42 s |
+  | mariposa N=512 16×16, full run | 251 → 88 MB | 976 → 756 MB | 96 → 87 s (job 110 → 90 s) | 57.2 → 49.1 s / 32.3 → 30.8 s |
+  | mariposa N=1024 16×16, 5 its | 856 → 239 MB | 2507 → 2002 MB | 44 → 23 s (job 107 → 39 s) | 28.4 → 15.8 s / 9.6 → 3.5 s |
+
+  - **What is left at N=1024 is MUMPS:** the live heap after 5 iterations is 185 MB of the 2 GB footprint; the rest is MUMPS's factors and its workspace during factorization (64×64-pixel tiles, t_k ≈ 70k). The ordering is what sets the factor size; this MUMPS build uses AMD whatever ICNTL(7) asks for, so a MUMPS with METIS is the next thing to try.
+  - **Peak RSS is not a reliable measure here.** Under memory pressure macOS compresses pages, which RSS does not count: at N=1024 the peak RSS of the same binary varied between 1.3 and 1.7 GB. The footprint above does count them.
 
 ## Known limitations
 

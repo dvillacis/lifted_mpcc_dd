@@ -126,6 +126,26 @@ struct Comm {
       return out;
    }
 
+   // Every rank's cnt values, concatenated in rank order on rank 0 (empty
+   // elsewhere); counts[r] = rank r's cnt, on rank 0.
+   static std::vector<double> gather_values(const double* val, int cnt, std::vector<int>& counts) {
+      const int nr = size();
+      counts.assign(nr, cnt);
+#ifdef DD_HAVE_MPI
+      if (nr > 1) {
+         std::vector<int> displs(nr, 0);
+         MPI_Gather(&cnt, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+         for (int r = 1; r < nr; ++r) displs[r] = displs[r - 1] + counts[r - 1];
+         std::vector<double> all(root() ? std::max(displs[nr - 1] + counts[nr - 1], 1) : 1);
+         MPI_Gatherv(val, cnt, MPI_DOUBLE, all.data(), counts.data(), displs.data(), MPI_DOUBLE, 0,
+                     MPI_COMM_WORLD);
+         if (!root()) return {};
+         return all;
+      }
+#endif
+      return std::vector<double>(val, val + cnt);
+   }
+
 private:
 #ifdef DD_HAVE_MPI
    template <class T> static MPI_Datatype type();
@@ -145,6 +165,66 @@ template <> inline MPI_Datatype Comm::type<double>() { return MPI_DOUBLE; }
 template <> inline MPI_Datatype Comm::type<long>() { return MPI_LONG; }
 template <> inline MPI_Datatype Comm::type<int>() { return MPI_INT; }
 #endif
+
+// =============================================================================
+//  StopSignal — "stop this loop" across ranks, without a collective per step.
+//  A rank that finds a reason to stop calls raise(): one small nonblocking
+//  message to every other rank.  The others look for it with seen() between
+//  units of work.  After the loop, a collective tells every rank how many
+//  ranks raised (the caller knows it from the exchanged results); drain(n)
+//  receives exactly the messages of the other raisers and completes the own
+//  sends, so nothing is left in flight for the next loop.  Only the main
+//  thread may call it (MPI_THREAD_FUNNELED).
+// =============================================================================
+class StopSignal {
+public:
+   void raise() {
+      if (raised_) return;
+      raised_ = true;
+#ifdef DD_HAVE_MPI
+      const int nr = Comm::size(), me = Comm::rank();
+      for (int r = 0; r < nr; ++r)
+         if (r != me) {
+            reqs_.emplace_back();
+            MPI_Isend(&token_, 1, MPI_INT, r, kTag, MPI_COMM_WORLD, &reqs_.back());
+         }
+#endif
+   }
+   bool raised() const { return raised_; }
+   // Has another rank raised?  (The message stays queued for drain().)
+   bool seen() {
+#ifdef DD_HAVE_MPI
+      if (Comm::size() > 1) {
+         int flag = 0;
+         MPI_Iprobe(MPI_ANY_SOURCE, kTag, MPI_COMM_WORLD, &flag, MPI_STATUS_IGNORE);
+         return flag != 0;
+      }
+#endif
+      return false;
+   }
+   // others = number of OTHER ranks that raised in this loop.  Resets.
+   void drain(int others) {
+#ifdef DD_HAVE_MPI
+      for (int i = 0; i < others; ++i) {
+         int buf;
+         MPI_Recv(&buf, 1, MPI_INT, MPI_ANY_SOURCE, kTag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      }
+      if (!reqs_.empty()) MPI_Waitall((int)reqs_.size(), reqs_.data(), MPI_STATUSES_IGNORE);
+      reqs_.clear();
+#else
+      (void)others;
+#endif
+      raised_ = false;
+   }
+
+private:
+   static constexpr int kTag = 7301;
+   bool raised_ = false;
+   int token_ = 1;
+#ifdef DD_HAVE_MPI
+   std::vector<MPI_Request> reqs_;
+#endif
+};
 
 // =============================================================================
 //  TileSum — global sums that come out the same for any number of ranks.

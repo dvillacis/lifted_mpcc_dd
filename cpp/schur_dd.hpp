@@ -50,8 +50,9 @@
 //  · direct: factorize the assembled S; its inertia is exact (eq. 25).
 //
 // The IPM refuses every factorization with a wrong In(W_k) (eq. 24).  When it
-// says so (factorize(true)), a rank stops factorizing its tiles at the first
-// one with a wrong inertia, or a singular one: the rest would be thrown away.
+// says so (factorize(true)), every rank stops factorizing its tiles as soon as
+// any rank meets one with a wrong inertia, or a singular one: the rest would be
+// thrown away (StopSignal, comm.hpp).
 //
 // ============================================================================
 //  4. PARALLELISM (MPI over tiles, OpenMP within a rank)
@@ -89,7 +90,20 @@
 #include "comm.hpp"
 #include "precond.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace dd {
+
+// MPI calls inside OpenMP loops are made by the main thread only (FUNNELED).
+inline bool main_thread() {
+#ifdef _OPENMP
+   return omp_get_thread_num() == 0;
+#else
+   return true;
+#endif
+}
 
 class SchurDD {
 public:
@@ -232,6 +246,20 @@ public:
                users_[fill[tiles_[k].nk[a]]++] = {k, a};
       }
       tile_neg_.assign(n_tiles, 0);
+
+      // flat_: every tile's border output, tile k at foff_[k] (p_k entries);
+      // users_[q] is at uoff_[q].  One all-gather spreads it.
+      foff_.assign(n_tiles + 1, 0);
+      for (int k = 0; k < n_tiles; ++k) foff_[k + 1] = foff_[k] + lenP_[k];
+      flat_.assign(std::max(foff_[n_tiles], 1), 0.0);
+      uoff_.resize(users_.size());
+      for (size_t q = 0; q < users_.size(); ++q) uoff_[q] = foff_[users_[q][0]] + users_[q][1];
+      fcounts_.resize(Comm::size());
+      fdispl_.resize(Comm::size());
+      for (int r = 0; r < Comm::size(); ++r) {
+         fdispl_[r] = foff_[Comm::first_tile(r, n_tiles)];
+         fcounts_[r] = foff_[Comm::first_tile(r + 1, n_tiles)] - fdispl_[r];
+      }
       if (opt_.interface == Interface::Pcg) plan_exchange_S();
 
       // symbolic work on this rank's tiles
@@ -239,7 +267,7 @@ public:
       for (int k = k0_; k < k1_; ++k) {
          Tile& T = tiles_[k];
          T.blk.set_pattern(opt_.blocks, opt_.fallback, (int)T.glob.size(), T.w, T.primal, T.b,
-                           (int)T.nk.size());
+                           (int)T.nk.size(), &T.S);
       }
 
       st_->n_tiles = n_tiles;
@@ -280,10 +308,9 @@ public:
    // ---------------------------------------------------------------- factorize
    // false = singular (some W_k or, in direct mode, S has a zero pivot).
    // stop_on_inertia: the caller refuses any factorization with a wrong
-   // In(W_k) (#neg(W_k) ≠ #duals(W_k), eq. 24).  Each rank then stops at its
-   // first tile that is singular or has a wrong inertia, and a true return
-   // with inertia_stopped() reports the latter.  Which of the two is reported
-   // when both occur can depend on the number of ranks.
+   // In(W_k) (#neg(W_k) ≠ #duals(W_k), eq. 24).  Every rank then stops as soon
+   // as some rank meets a tile that is singular or has a wrong inertia, and a
+   // true return with inertia_stopped() reports either.
    bool factorize(bool stop_on_inertia = false) {
       const auto t0 = Clock::now();
       ++st_->factorizations;
@@ -297,11 +324,20 @@ public:
       // per tile: status (0 singular, 1 factorized, 2 wrong In(W_k), 3 skipped),
       // #neg(W_k), fallbacks
       std::vector<long> info(3 * K, 0);
-      std::atomic<bool> stop(false);
+      std::atomic<bool> stop(false), found(false);   // stop: any rank; found: this one
+      // The first bad tile on ANY rank stops every rank (StopSignal): the
+      // main thread passes a bad tile of this rank on and looks for the other
+      // ranks'.  Only ranks that found one raise (drain() counts on that).
+      auto poll = [&] {
+         if (!stop_on_inertia || !main_thread()) return;
+         if (found.load(std::memory_order_relaxed)) stop_signal_.raise();
+         else if (!stop.load(std::memory_order_relaxed) && stop_signal_.seen()) stop = true;
+      };
 #pragma omp parallel for schedule(dynamic)
       for (int k = k0_; k < k1_; ++k) {
          Tile& T = tiles_[k];
          info[3 * k + 2] = T.blk.fallbacks();
+         poll();
          if (stop.load(std::memory_order_relaxed)) {
             info[3 * k] = 3;
             continue;
@@ -312,22 +348,42 @@ public:
          info[3 * k + 2] = T.blk.fallbacks();
          if (stop_on_inertia && (!good || T.blk.negative() != duals_[k])) {
             if (good) info[3 * k] = 2;
+            found = true;
             stop = true;
+            poll();
             continue;
          }
-         if (!good) continue;
+         if (!T.blk.needs_w() && !T.w.empty()) std::vector<Entry>().swap(T.w);   // analysed
+         if (!good || T.blk.schur_in_place()) continue;   // MUMPS: S_k is in T.S already
          std::vector<Eigen::Triplet<double>> tb;
          tb.reserve(T.b.size());
          for (const Entry& e : T.b) tb.emplace_back(e[0], e[1], values_[e[2]]);
          T.B.resize((int)T.nk.size(), (int)T.glob.size());
          T.B.setFromTriplets(tb.begin(), tb.end());
-         T.S = T.blk.schur(T.B);
+         const Mat Sk = T.blk.schur(T.B);
+         T.S = Sk;   // a copy: a move would swap out the storage a MUMPS fallback writes into
       }
+      // a bad tile found by a worker thread after the main thread's last poll
+      // is still passed on, so that drain() can count on every bad rank
+      bool local_bad = false;
+      for (int k = k0_; k < k1_; ++k) local_bad = local_bad || info[3 * k] == 0 || info[3 * k] == 2;
+      if (stop_on_inertia && local_bad) stop_signal_.raise();
       share_long(info, 3);
       bool all_ok = true, wrong = false;
       for (int k = 0; k < K; ++k) {
          all_ok = all_ok && info[3 * k] == 1;
          wrong = wrong || info[3 * k] == 2;
+      }
+      if (stop_on_inertia) {   // receive the other bad ranks' signals
+         int others = 0;
+         for (int r = 0; r < Comm::size(); ++r) {
+            if (r == Comm::rank()) continue;
+            bool bad = false;
+            for (int k = Comm::first_tile(r, K); k < Comm::first_tile(r + 1, K); ++k)
+               bad = bad || info[3 * k] == 0 || info[3 * k] == 2;
+            others += bad;
+         }
+         stop_signal_.drain(others);
       }
       // direct: every rank assembles S from every S_k (PCG: the parts the
       // S̃_k need are exchanged when the preconditioner is built)
@@ -341,9 +397,13 @@ public:
          st_->fallbacks += fb - fallbacks_seen_;
          fallbacks_seen_ = fb;
       }
+      // With stop_on_inertia, which bad tile is met first depends on timing,
+      // so a singular W_k is reported like a wrong In(W_k): refused (for the
+      // caller both mean "raise δ").
+      if (stop_on_inertia && !all_ok) wrong = true;
       int negW = 0;
       negS_ = 0;
-      for (int k = 0; k < K; ++k) {
+      for (int k = 0; k < K && !wrong; ++k) {
          if (!info[3 * k]) {
             ++st_->singular;
             if (opt_.verbose && Comm::root())
@@ -354,10 +414,10 @@ public:
          tile_neg_[k] = (int)info[3 * k + 1];
          negW += tile_neg_[k];
       }
-      if (wrong) {   // stopped at a wrong In(W_k): the caller refuses it
+      if (wrong) {   // stopped at a wrong In(W_k) or a singular W_k: the caller refuses it
          inertia_stopped_ = true;
          if (opt_.verbose && Comm::root())
-            std::printf("[dd] fact %3ld  stopped: wrong In(W_k)\n", st_->factorizations);
+            std::printf("[dd] fact %3ld  stopped: wrong In(W_k) or singular W_k\n", st_->factorizations);
          st_->t_factor += secs(t0);
          return true;
       }
@@ -422,19 +482,18 @@ public:
          T.z.resize(T.glob.size());
          for (size_t l = 0; l < T.glob.size(); ++l) T.z[l] = R[T.glob[l]];
          if (T.blk.can_reduce()) {
-            T.blk.reduce(T.z, T.buf);
+            T.blk.reduce(T.z, flat_.data() + foff_[k]);
             continue;
          }
          T.blk.solve(T.z);
-         T.buf = T.B * T.z;
+         if (lenP_[k] > 0) flat(k).noalias() = T.B * T.z;
       }
-      share_buf();
+      gather_flat();
       Vec rS(p);
 #pragma omp parallel for schedule(static)
       for (int i = 0; i < p; ++i) {
          double s = R[border_[i]];
-         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q)
-            s -= tiles_[users_[q][0]].buf[users_[q][1]];
+         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q) s -= flat_[uoff_[q]];
          rS[i] = s;
       }
       const auto t1 = Clock::now();
@@ -475,7 +534,7 @@ public:
          } else {
             rk.resize(T.glob.size());
             for (size_t l = 0; l < T.glob.size(); ++l) rk[l] = R[T.glob[l]];
-            rk -= T.B.transpose() * uyk;
+            if (uyk.size() > 0) rk -= T.B.transpose() * uyk;
             T.blk.solve(rk);
          }
          for (size_t l = 0; l < T.glob.size(); ++l) R[T.glob[l]] = rk[l];
@@ -494,15 +553,16 @@ public:
    void border_product(Val val, X x, Vec& out) const {
       for (int k = k0_; k < k1_; ++k) {
          const Tile& T = tiles_[k];
-         T.buf.setZero(T.nk.size());
-         for (const Entry& e : T.b) T.buf[e[0]] += val(e[2]) * x(T.glob[e[1]]);
+         double* o = flat_.data() + foff_[k];
+         std::fill(o, o + lenP_[k], 0.0);
+         for (const Entry& e : T.b) o[e[0]] += val(e[2]) * x(T.glob[e[1]]);
       }
-      share_buf();
+      gather_flat();
       const int p = (int)border_.size();
       out.resize(p);
       for (int i = 0; i < p; ++i) {
          double s = 0.0;
-         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q) s += tiles_[users_[q][0]].buf[users_[q][1]];
+         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q) s += flat_[uoff_[q]];
          out[i] = s;
       }
    }
@@ -541,11 +601,12 @@ private:
       std::vector<Entry> w, b;   // routed triplets: W_k (r, c, slot), B_k (a, l, slot)
       TileBlock blk;             // factorization of W_k
       SpMat B;                   // B_k (p_k × t_k)
-      Mat S;                     // S_k (this rank's tiles; all of them in direct mode)
+      Mat S;                     // S_k (this rank's tiles; all of them in direct mode).
+                                 // A MUMPS tile's factorization writes it in place:
+                                 // never resize an own tile's S.
       std::vector<Part> parts;   // S̃_k: the tiles sharing border unknowns with k (PCG)
       Vec sdiag;                 // diag(S_k), all tiles (ASd)
       Vec z;                     // W_k⁻¹ r_k during a solve
-      mutable Vec buf;           // per-tile output, gathered over the border
    };
 
    // S = C + Σ_k N_k S_k N_kᵀ (15), sparse, both triangles
@@ -722,23 +783,22 @@ private:
    // out = S v, tile by tile through the stored S_k (15)
    void apply_S(const Vec& v, Vec& out) const {
       const int p = (int)border_.size();
-      const int K = (int)tiles_.size();
 #pragma omp parallel for schedule(dynamic, 4)
       for (int k = k0_; k < k1_; ++k) {
          const Tile& T = tiles_[k];
          const int pk = (int)T.nk.size();
          if (pk == 0) continue;
-         Vec vk(pk);
+         static thread_local Vec vk;
+         vk.resize(pk);
          for (int a = 0; a < pk; ++a) vk[a] = v[T.nk[a]];
-         T.buf = T.S * vk;
+         flat(k).noalias() = T.S * vk;
       }
-      share_buf();
+      gather_flat();
       out.resize(p);
 #pragma omp parallel for schedule(static)
       for (int i = 0; i < p; ++i) {
          double s = cdiag_[i] * v[i];
-         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q)
-            s += tiles_[users_[q][0]].buf[users_[q][1]];
+         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q) s += flat_[uoff_[q]];
          out[i] = s;
       }
       for (const auto& e : coff_) {
@@ -750,15 +810,14 @@ private:
    // z = M⁻¹ r: this rank's Schwarz blocks, then the sum over the border in
    // the serial order (z_i = Σ over the tiles touching i of their output).
    void apply_M(const Vec& r, Vec& z) {
-      M_.apply_blocks(r, k0_, k1_);
-      share(lenP_, [&](int k, double* d) { std::copy(M_.out(k).data(), M_.out(k).data() + lenP_[k], d); },
-            [&](int k, const double* d) { M_.out(k) = Eigen::Map<const Vec>(d, lenP_[k]); });
+      M_.apply_blocks(r, k0_, k1_, flat_.data(), foff_.data());
+      gather_flat();
       const int p = (int)border_.size();
       z.resize(p);
 #pragma omp parallel for schedule(static)
       for (int i = 0; i < p; ++i) {
          double s = 0.0;
-         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q) s += M_.out(users_[q][0])[users_[q][1]];
+         for (int q = ustart_[i]; q < ustart_[i + 1]; ++q) s += flat_[uoff_[q]];
          z[i] = s;
       }
    }
@@ -784,11 +843,10 @@ private:
       for (int k = 0; k < K; ++k)
          if (k < k0_ || k >= k1_) unpack(k, all.data() + off[k]);
    }
-   // The per-tile border buffers (T.buf, length p_k).
-   void share_buf() const {
-      share(lenP_, [&](int k, double* d) { std::copy(tiles_[k].buf.data(), tiles_[k].buf.data() + lenP_[k], d); },
-            [&](int k, const double* d) { tiles_[k].buf = Eigen::Map<const Vec>(d, lenP_[k]); });
-   }
+   // The per-tile border outputs: tile k writes flat(k) (p_k entries); after
+   // gather_flat() every rank has every tile's (no allocation, no copies).
+   Eigen::Map<Vec> flat(int k) const { return Eigen::Map<Vec>(flat_.data() + foff_[k], lenP_[k]); }
+   void gather_flat() const { Comm::allgatherv(flat_, fcounts_, fdispl_); }
    // m integers per tile (filled by the owners).
    void share_long(std::vector<long>& v, int m) const {
       const int nr = Comm::size();
@@ -824,7 +882,8 @@ private:
    Options opt_;
    unsigned long long hash_ = 0;   // of the structure (same_structure())
    int dim_ = 0, negS_ = 0;
-   bool inertia_stopped_ = false;      // last factorize(true) stopped at a wrong In(W_k)
+   bool inertia_stopped_ = false;      // last factorize(true) stopped at a bad W_k
+   StopSignal stop_signal_;            // factorize(true): the first bad tile stops every rank
    bool precond_ready_ = false;        // the preconditioner is that of the last factorization
    bool s_tilde_indefinite_ = false;   // ... and some S̃_k of it is not SPD (AS)
    int k0_ = 0, k1_ = 0;                        // this rank's tiles
@@ -833,6 +892,8 @@ private:
    std::vector<std::vector<Part>> sends_;       // per rank: the parts of owned S_j it needs
    long fallbacks_seen_ = 0;
    std::vector<int> border_, ustart_;
+   std::vector<int> foff_, uoff_, fcounts_, fdispl_;   // flat_ layout (set_structure)
+   mutable std::vector<double> flat_;                   // per-tile border outputs
    std::vector<std::array<int, 2>> users_;
    std::vector<double> values_;
    std::vector<Tile> tiles_;
