@@ -20,7 +20,6 @@ archive/cpp/plots/
 archive/cpp/sol_*.txt
 archive/cpp/dd_*.txt
 archive/cpp/*.png
-*.slurm
 runs/sols
 
 # SLURM logs. The (archived) batch scripts write %x_%j.out/.err into
