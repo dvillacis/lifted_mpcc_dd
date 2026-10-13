@@ -63,11 +63,12 @@ namespace dd {
 
 class MumpsBlock {
 public:
-   MumpsBlock() {
+   // sym: 2 general symmetric (indefinite, the tiles), 1 positive definite
+   explicit MumpsBlock(int sym = 2) {
       std::memset(&id_, 0, sizeof(id_));
       id_.comm_fortran = -987654;   // USE_COMM_WORLD: the sequential libseq stub
       id_.par = 1;                  // the host works
-      id_.sym = 2;                  // general symmetric (indefinite)
+      id_.sym = sym;
       id_.job = -1;                 // initialize
       call();
       alive_ = infog(1) >= 0;

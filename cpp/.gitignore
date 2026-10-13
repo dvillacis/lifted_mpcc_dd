@@ -2,3 +2,5 @@ tv_dd
 *.npz
 *.csv
 mumps_check
+tv_learn
+*.tmp.*

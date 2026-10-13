@@ -8,7 +8,8 @@ by `tv_dd` in [`../cpp`](../cpp); these scripts need only numpy and matplotlib.
 | `plot_slurm.py`   | seven panels per solution (noisy, recon, diff, delta, index sets, complementarity residual, continuation) from a directory of `tv_dd --save-solution` files |
 | `plot_style.py`   | shared figure style: `screen` (200-dpi PNG) and `paper` (two-column PDF) presets, Okabe–Ito palette, figure sizing helpers |
 | `plot_discretization.py` | the grid, tiles and consensus copies of the discretization |
-| `plot_dataset.py`, `aggregate_runs.py` | figures and tables for dataset runs and sweep timings of the archived drivers; kept because they reuse `plot_slurm.py`'s decoder |
+| `plot_dataset.py`, `aggregate_runs.py` | figures and tables for dataset runs (`tv_learn --save-report`, including the α map of a block run) and sweep timings of the archived drivers |
+| `make_datasets.py` | prepares `../images/bsds64/` (BSDS500 crops) and `../images/cartoon64/` (Cartoon Set) with `train.txt` / `val.txt` for `tv_learn`, from the archives in `../images/` |
 
 The data-generation helpers of the archived drivers (`dump_data*.py`,
 `mpcc_utils.py`) are in [`../archive/python`](../archive/python).

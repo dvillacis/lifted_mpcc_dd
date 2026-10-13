@@ -33,7 +33,9 @@
 #include "ipm.hpp"
 #include "partition.hpp"
 #include "save.hpp"
+#include "smoothed.hpp"
 #include "tv_mpcc.hpp"
+#include "ui.hpp"
 
 static double psnr(const std::vector<double>& clean, const double* u) {
    double mse = 0.0;
@@ -56,7 +58,7 @@ static void usage() {
    std::printf(
       "usage: tv_dd [options]\n"
       "  instance   --data ../images/cameraman.png  --size 32  --nsub 4  --sigma 0.1  --seed 0\n"
-      "  relaxation --t-min 1e-4\n"
+      "  relaxation --t-min 1e-5\n"
       "  solver     --schur pcg|direct  --cg-tol 1e-10  --cg-maxit 2000\n"
       "             --precond as|asd (additive Schwarz on S~_k = N_k' S N_k, eq. 19, or on\n"
       "               S_k with its diagonal replaced by diag(S), eq. 21)\n"
@@ -86,8 +88,21 @@ static void usage() {
       "             --dual-reg 1e-6 (δ_c = C·μ^K every iteration; 0: only on demand)\n"
       "             --dual-reg-exp 0  --relax-cells THR (0 = off)  --relax-shift 1e-4\n"
       "             --relax-persist 5  --relax-exp 0.7 (threshold max(THR, inf_du^exp))\n"
+      "             --follow-comp 3 (a cell whose product row stays violated while its\n"
+      "               multiplier rises, K iterations in a row, gets t_e = its product, then\n"
+      "               lowered as the product falls; armed only after mu and t have not\n"
+      "               moved for --follow-stall 20 iterations; 0: off)\n"
       "             --classify FILE|- (MPCC multipliers per end-game iteration; FILE: the\n"
       "               last point per cell as CSV r,w,xi,a,b,gamma,nu,lam_h2, w = 1-delta)\n"
+      "  start      --start smoothed|uniform (smoothed, the default: two stages, the smoothed\n"
+      "               bilevel method of smoothed.hpp first (--start-gamma 1e-3, --start-iters\n"
+      "               1000 (a safeguard), --start-ftol 1e-9: stop once J falls by less than this, relative,\n"
+      "               over 5 iterations; --start-solver auto|eigen|mumps: its Newton\n"
+      "               factorizations, auto: MUMPS for N >= 128), then the MPCC from its weight and its lower-level solution, lifted;\n"
+      "               uniform: Chambolle-Pock at the weight --alpha0\n"
+      "               (default 0.7*sigma), the start of the runs before 2026-10-09)\n"
+      "  output     --color auto|always|never (auto: a terminal, unless NO_COLOR; plain under\n"
+      "               mpirun, where --color always or CLICOLOR_FORCE=1 asks for colour)\n"
       "  penalty    --penalty PI0 (> 0: exact-penalty formulation pi*sum r(1-delta) in the\n"
       "               objective instead of the relaxed rows; pi grows x10 when needed)\n"
       "             --penalty-max 1e8 (cap on pi; = PI0: pi fixed)  --penalty-hessian on|off\n"
@@ -141,12 +156,16 @@ static int run(int argc, char** argv) {
    double relax_thr = 0.0, relax_shift = 1e-4;
    int relax_persist = 5;
    double relax_exp = 0.7;
-   double sigma = 0.1, t_min = 1e-4;
+   double sigma = 0.1, t_min = 1e-5;
+   std::string start = "smoothed", start_solver = "auto", color_mode = "auto";
+   double start_gamma = 1e-3, alpha0 = 0.0, start_ftol = 1e-9;
+   int start_iters = 1000;
    unsigned seed = 0;
    bool quiet = false, line_search = true, restoration = true, diag = false, bounds_rows = true;
    bool delta_from_last = false;
    bool classify = false;
    std::string classify_file;
+   int follow_persist = 3, follow_stall = 20;   // per-cell t of branch-locked cells (0: off)
    dd::SchurDD::Options dopt;
    IPM::Options::AlphaY alpha_y = IPM::Options::AlphaY::Primal;
 #ifdef DD_HAVE_MUMPS
@@ -166,6 +185,13 @@ static int run(int argc, char** argv) {
       else if (a == "--sigma") sigma = std::stod(v);
       else if (a == "--seed") seed = (unsigned)std::stoul(v);
       else if (a == "--t-min") t_min = std::stod(v);
+      else if (a == "--start") start = v;
+      else if (a == "--color") color_mode = v;
+      else if (a == "--start-gamma") start_gamma = std::stod(v);
+      else if (a == "--start-ftol") start_ftol = std::stod(v);
+      else if (a == "--start-solver") start_solver = v;
+      else if (a == "--start-iters") start_iters = std::stoi(v);
+      else if (a == "--alpha0") alpha0 = std::stod(v);
       else if (a == "--schur")
          dopt.interface = v == "direct" ? dd::SchurDD::Interface::Direct : dd::SchurDD::Interface::Pcg;
       else if (a == "--cg-tol") dopt.cg_tol = std::stod(v);
@@ -208,6 +234,8 @@ static int run(int argc, char** argv) {
       else if (a == "--classify") { classify = true; classify_file = v == "-" ? "" : v; }
       else if (a == "--dual-reg") dual_reg = std::stod(v);
       else if (a == "--dual-reg-exp") dual_reg_exp = std::stod(v);
+      else if (a == "--follow-comp") follow_persist = std::stoi(v);
+      else if (a == "--follow-stall") follow_stall = std::stoi(v);
       else if (a == "--relax-cells") relax_thr = std::stod(v);
       else if (a == "--relax-shift") relax_shift = std::stod(v);
       else if (a == "--relax-persist") relax_persist = std::stoi(v);
@@ -223,18 +251,19 @@ static int run(int argc, char** argv) {
       else if (a == "--save-solution") save_file = v;
       else { if (root) usage(); return 1; }
    }
-   if (nsub < 1 || nsub > N - 1) { std::fprintf(stderr, "need 1 <= nsub <= size-1\n"); return 1; }
+   ui::init(color_mode);
+   if (nsub < 1 || nsub > N - 1) { ui::error("need 1 <= nsub <= size-1"); return 1; }
    if (dopt.fallback == dd::Backend::Sparse) dopt.fallback = dd::Backend::Dense;
    const bool use_mumps = dopt.blocks == dd::Backend::Mumps ||
                           (dopt.blocks == dd::Backend::Sparse && dopt.fallback == dd::Backend::Mumps);
 #ifdef DD_HAVE_MUMPS
    if (use_mumps && !dd::MumpsBlock::self_test()) {
-      std::fprintf(stderr, "MUMPS self test failed (Schur layout or inertia): run ./mumps_check\n");
+      ui::error("MUMPS self test failed (Schur layout or inertia): run ./mumps_check");
       return 1;
    }
 #else
    if (use_mumps) {
-      std::fprintf(stderr, "this tv_dd was built without MUMPS (see build.sh)\n");
+      ui::error("this tv_dd was built without MUMPS (see build.sh)");
       return 1;
    }
 #endif
@@ -248,7 +277,54 @@ static int run(int argc, char** argv) {
    // ---- the instance
    Image img = load_image(data, N, sigma, seed);
    const Partition part(N, nsub);
-   TvMpcc problem(img, part, sigma);
+   if (start != "smoothed" && start != "uniform") {
+      if (root) ui::error("--start must be smoothed or uniform");
+      return 1;
+   }
+   if (root)
+      ui::header("tv_dd: %s, %dx%d, sigma %g, %dx%d tiles, %d rank%s x %d thread%s", data.c_str(), N,
+                 N, sigma, nsub, nsub, ranks, ranks > 1 ? "s" : "", nthreads, nthreads > 1 ? "s" : "");
+   // ---- the start: stage 1, the smoothed bilevel method (serial on rank 0, then its
+   //      weight to every rank), or the uniform weight
+   double alpha_start = alpha0, stage1_wall = 0.0;
+   std::vector<double> u1, qx1, qy1;   // stage 1's lower level at its weight: the MPCC's start
+   if (start == "smoothed") {
+      double a1 = 0.0;
+      u1.resize((size_t)N * N);
+      qx1.resize((size_t)(N - 1) * (N - 1));
+      qy1.resize((size_t)(N - 1) * (N - 1));
+      if (root) {
+         ui::header("Stage 1: the smoothed bilevel problem (Huber, gamma %.0e), L-BFGS on rank 0",
+                    start_gamma);
+         Instance in;
+         in.N = N;
+         in.clean = img.clean;
+         in.f = img.noisy;
+         in.diag.assign(img.noisy.size(), 1.0);
+         in.rhs = img.noisy;
+         const smoothed::Result R1 =
+             smoothed::solve({in}, nullptr, LearnPartition(N, 1, 1, 0), start_gamma,
+                             alpha0 > 0.0 ? alpha0 : 0.7 * sigma, 1.0, !quiet, 1e-6, start_iters,
+                             1e-10, start_ftol,
+                             start_solver == "mumps" || (start_solver == "auto" && N >= 128));
+         a1 = R1.alpha[0];
+         stage1_wall = R1.wall;
+         u1 = R1.u[0];
+         qx1 = R1.qx[0];
+         qy1 = R1.qy[0];
+         ui::outcome(R1.converged, "Stage 1 %s (%s): %d iterations, %d lower-level solves, %.2f s;"
+                     " alpha %.6f", R1.converged ? "converged" : "stopped", R1.stop, R1.iters,
+                     R1.lower_solves, R1.wall, a1);
+      }
+      dd::Comm::bcast(&a1, 1);
+      dd::Comm::bcast(u1.data(), (int)u1.size());
+      dd::Comm::bcast(qx1.data(), (int)qx1.size());
+      dd::Comm::bcast(qy1.data(), (int)qy1.size());
+      stage1_wall = dd::Comm::max(stage1_wall);
+      alpha_start = a1;
+   }
+   TvMpcc problem(img, part, sigma, alpha_start, u1.empty() ? nullptr : &u1,
+                  u1.empty() ? nullptr : &qx1, u1.empty() ? nullptr : &qy1);
    if (!root) img = Image{};   // only rank 0 reports and saves
    problem.print = root;
    problem.diag = diag;
@@ -258,6 +334,9 @@ static int run(int argc, char** argv) {
    problem.relax_shift = relax_shift;
    problem.relax_persist = relax_persist;
    problem.relax_exp = relax_exp;
+   problem.follow = follow_persist > 0 && penalty <= 0.0;
+   problem.follow_persist = follow_persist;
+   problem.follow_stall = follow_stall;
    problem.bounds_as_rows = bounds_rows;
    problem.penalty = penalty;
    problem.penalty_max = penalty_max;
@@ -267,12 +346,17 @@ static int run(int argc, char** argv) {
    const std::string blocks = dopt.blocks == dd::Backend::Sparse
                                  ? std::string("sparse+") + bname[(int)dopt.fallback]
                                  : bname[(int)dopt.blocks];
-   if (root)
-      std::printf("tv_dd  N=%d  %dx%d tiles  variables=%d  constraints=%d (%d inequalities)"
-                  "  copies=%d  interface=%s  blocks=%s  ranks=%d  threads/rank=%d\n",
-                  N, nsub, nsub, problem.n, problem.mcon, problem.n_ineq, problem.n_link,
-                  dopt.interface == dd::SchurDD::Interface::Pcg ? "pcg" : "direct",
-                  blocks.c_str(), ranks, nthreads);
+   if (root) {
+      if (start == "smoothed")
+         ui::header("Stage 2: the MPCC by the IPM, from stage 1's weight and lower level");
+      else
+         ui::header("The MPCC by the IPM, from the uniform weight %.4f", alpha_start > 0.0 ? alpha_start
+                                                                                    : 0.7 * sigma);
+      ui::kv("problem", "%d variables, %d constraints (%d inequalities), %d copies", problem.n,
+             problem.mcon, problem.n_ineq, problem.n_link);
+      ui::kv("linear algebra", "%s interface, %s tile blocks",
+             dopt.interface == dd::SchurDD::Interface::Pcg ? "pcg" : "direct", blocks.c_str());
+   }
 
    // ---- μ-coupled continuation
    const double tol_target = 1e-8, mu0 = 0.1;
@@ -328,9 +412,11 @@ static int run(int argc, char** argv) {
    const int main_iters = r.iters;
    if (cleanup != "off" && r.status == 2 && (problem.gate_fired || problem.reached_tmin)) {
       const std::array<long, 4> pins = problem.begin_cleanup(final_pt);
-      if (root)
-         std::printf("\nclean-up: cells pinned at r = 0: %ld, at delta = 1: %ld, both: %ld,"
-                     " neither: %ld; products dropped\n", pins[0], pins[1], pins[2], pins[3]);
+      if (root) {
+         ui::header("Clean-up: a re-solve with the active set pinned");
+         ui::kv("pinned cells", "r = 0: %ld, delta = 1: %ld, both: %ld, neither: %ld (products"
+                " dropped)", pins[0], pins[1], pins[2], pins[3]);
+      }
       const std::vector<double> sol = problem.solution;
       const double xi = problem.xi_max;
       const double obj = problem.objective;
@@ -346,17 +432,17 @@ static int run(int argc, char** argv) {
       rc = ipm2.solve(problem, dopt, &s);
       cleaned = rc.status == 0 || rc.status == 3;
       const TvMpcc::CleanupReport rep = problem.cleanup_report(clean_pt, 1e-4, 1e-6);
-      if (root)
-         std::printf("clean-up: status %d, %d iterations;  max pinned-row violation %.1e,"
-                     " max r*w %.1e;  biactive cells (r, w <= 1e-4): %ld, of which with an MPCC"
-                     " multiplier < -1e-6: %ld (min %.2e)\n",
-                     rc.status, rc.iters, rep.max_pin, rep.max_rw, rep.biactive, rep.wrong,
-                     rep.min_mult);
+      if (root) {
+         ui::kv("clean-up", "status %d, %d iterations; max pinned-row violation %.1e, max r*w %.1e",
+                rc.status, rc.iters, rep.max_pin, rep.max_rw);
+         ui::kv("biactive cells", "%ld (r, w <= 1e-4), %ld with an MPCC multiplier < -1e-6 (min %.2e)",
+                rep.biactive, rep.wrong, rep.min_mult);
+      }
       if (!cleaned) {   // keep the continuation's answer
          problem.solution = sol;
          problem.xi_max = xi;
          problem.objective = obj;
-         if (root) std::printf("clean-up failed: reporting the continuation's point\n");
+         if (root) ui::warn("the clean-up failed: reporting the continuation's point");
       }
       r.iters += rc.iters;
       r.wall += rc.wall;
@@ -383,41 +469,49 @@ static int run(int argc, char** argv) {
    const double ti = dd::Comm::max(s.t_interface);
    if (!root) return ok ? 0 : 2;
 
-   std::printf("\nstatus %d (%s)   iterations %d   t=%.2e   wall %.2fs   peak RSS %.0f MB/rank\n",
-               r.status, st, r.iters, problem.t, wall, rss);
+   ui::outcome(ok, "%s %s (status %d) after %d iterations, t = %.1e, %.2f s",
+               start == "smoothed" ? "Stage 2" : "The MPCC", st, r.status, r.iters, problem.t, wall);
+   ui::header("Result");
+   ui::kv("alpha*", "%.6f", alpha);
+   ui::kv("max r(1-delta)", "%.2e", comp);
+   ui::kv("PSNR", "%.2f dB noisy -> %.2f dB", p_noisy, p_recon);
+   if (start == "smoothed")
+      ui::kv("time", "stage 1 %.2f s + stage 2 %.2f s = %.2f s", stage1_wall, wall, stage1_wall + wall);
+   else
+      ui::kv("time", "%.2f s", wall);
+   ui::kv("peak memory", "%.0f MB/rank", rss);
    if (penalty > 0.0)
-      std::printf("penalty: pi %.0e -> %.0e (%ld raises)\n", penalty, problem.penalty,
-                  problem.penalty_raises);
+      ui::kv("penalty", "pi %.0e -> %.0e (%ld raises)", penalty, problem.penalty, problem.penalty_raises);
    if (cleanup != "off")
-      std::printf("clean-up (%s): %s, %d + %d iterations (continuation + clean-up)\n",
-                  cleanup.c_str(), rc.iters == 0 ? "not run" : cleaned ? "converged" : "FAILED",
-                  main_iters, rc.iters);
-   std::printf("refused factorizations: wrong In(W_k) or singular W_k %ld (too few negatives: %ld), S not PD %ld,"
-               " singular %ld;  iterations with δ > 0: %ld\n",
-               r.tile_corrections, r.tile_too_few, r.s_corrections, r.singular, r.regularized);
-   if (line_search)
-      std::printf("line search: %ld step halvings, %ld iterations without an acceptable step;"
-                  "  restoration: %ld phases (%ld for a stall, %ld failed), %ld iterations\n",
-                  r.ls_backtracks, r.ls_failures, r.restorations, r.stall_restorations,
-                  r.resto_failures, r.resto_iters);
+      ui::kv("clean-up", "(%s) %s, %d + %d iterations (continuation + clean-up)", cleanup.c_str(),
+             rc.iters == 0 ? "not run" : cleaned ? "converged" : "FAILED", main_iters, rc.iters);
+   ui::header("Solver");
+   ui::kv("refused steps", "wrong In(W_k) or singular W_k %ld (too few negatives %ld), S not PD %ld,"
+          " singular %ld; iterations with delta > 0: %ld", r.tile_corrections, r.tile_too_few,
+          r.s_corrections, r.singular, r.regularized);
+   if (line_search) {
+      ui::kv("line search", "%ld step halvings, %ld iterations without an acceptable step",
+             r.ls_backtracks, r.ls_failures);
+      ui::kv("restoration", "%ld phases (%ld for a stall, %ld failed), %ld iterations", r.restorations,
+             r.stall_restorations, r.resto_failures, r.resto_iters);
+   }
    if (problem.relax_cells)
-      std::printf("relaxed cells: %ld (r >= -%.0e, delta <= 1+%.0e, r(1-delta) <= 0)\n",
-                  problem.relaxed_total, relax_shift, relax_shift);
-   std::printf("linear: nP=%d  KKT dim=%d  p=%d  max p_k=%d  max t_k=%d  factorizations %ld"
-               " (sparse tile factorizations that fell back: %ld)\n",
-               s.n_tiles, s.dim, s.p, s.max_pk, s.max_tk, s.factorizations, s.fallbacks);
+      ui::kv("relaxed cells", "%ld (r >= -%.0e, delta <= 1+%.0e, r(1-delta) <= 0)",
+             problem.relaxed_total, relax_shift, relax_shift);
+   if (problem.follow)
+      ui::kv("followed cells", "%ld raises (locked %d iterations, armed after a %d-iteration stall);"
+             " at the end %ld cells with t_e > t, max t_e %.2e", problem.follow_events,
+             follow_persist, follow_stall, problem.follow_now, problem.follow_tmax);
+   ui::kv("linear systems", "%d tiles, KKT dimension %d, border %d (max per tile %d), max tile %d;"
+          " %ld factorizations (%ld sparse fallbacks)", s.n_tiles, s.dim, s.p, s.max_pk, s.max_tk,
+          s.factorizations, s.fallbacks);
    if (dopt.interface == dd::SchurDD::Interface::Pcg)
-      std::printf("        pcg: solves %ld, iterations mean %.1f max %ld, negative curvature %ld,"
-                  " unconverged %ld;  refused before PCG (some S~_k not SPD) %ld\n",
-                  s.solves, cg_mean, s.cg_max, s.cg_breakdowns, s.cg_unconverged,
-                  s.s_tilde_indefinite);
-   std::printf("time:   factorize %.2fs [blocks %.2f, S %.2f, preconditioner %.2f]  solve %.2fs"
-               " [tiles %.2f, interface %.2f]  rest %.2fs   (max over ranks)\n",
-               tf, tb, ts, tp, tsol, tts, ti, wall - tf - tsol);
-   std::printf("alpha*      %.6f\n", alpha);
-   std::printf("max r(1-d)  %.2e\n", comp);
-   std::printf("PSNR noisy  %.2f dB\n", p_noisy);
-   std::printf("PSNR recon  %.2f dB\n", p_recon);
+      ui::kv("pcg", "%ld solves, %.1f iterations on average (max %ld); negative curvature %ld,"
+             " unconverged %ld, refused before PCG %ld", s.solves, cg_mean, s.cg_max,
+             s.cg_breakdowns, s.cg_unconverged, s.s_tilde_indefinite);
+   ui::kv("time split", "factorize %.2f s [blocks %.2f, S %.2f, preconditioner %.2f], solve %.2f s"
+          " [tiles %.2f, interface %.2f], rest %.2f s (slowest rank)", tf, tb, ts, tp, tsol, tts, ti,
+          wall - tf - tsol);
    // image,N,nsub,sigma,seed,t_min,interface,blocks,ranks,threads,status,ok,iters,t,alpha,comp,
    // psnr_noisy,psnr_recon,wall,t_factor,t_solve,factorizations,fallbacks,cg_mean,cg_max,rss_mb
    std::printf("CSV,%s,%d,%d,%g,%u,%g,%s,%s,%d,%d,%d,%d,%d,%.3e,%.6f,%.3e,%.3f,%.3f,%.3f,%.3f,%.3f,"
@@ -432,7 +526,7 @@ static int run(int argc, char** argv) {
       const RunSummary run{problem.t, r.status, r.iters, comp, alpha, problem.objective,
                            xi_max, ok};
       if (save_npz(save_file, problem, img, run, nsub, sigma))
-         std::printf("wrote %s\n", save_file.c_str());
+         ui::ok("Wrote %s", save_file.c_str());
    }
    if (root && !classify_file.empty() && !problem.mpcc_cells.empty()) {
       if (FILE* fp = std::fopen(classify_file.c_str(), "w")) {
@@ -442,7 +536,7 @@ static int run(int argc, char** argv) {
             std::fprintf(fp, "%d,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e\n", e, c[0], c[1], c[2],
                          c[3], c[4], c[5], c[6], c[7]);
          std::fclose(fp);
-         std::printf("wrote %s\n", classify_file.c_str());
+         ui::ok("Wrote %s", classify_file.c_str());
       }
    }
    return ok ? 0 : 2;

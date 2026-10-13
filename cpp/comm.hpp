@@ -95,6 +95,15 @@ struct Comm {
 #endif
    }
    static bool any(bool b) { return sum(b ? 1 : 0) > 0; }
+   // rank 0's n values to every rank (exact: a copy, no arithmetic)
+   static void bcast(double* v, int n) {
+#ifdef DD_HAVE_MPI
+      if (size() > 1) MPI_Bcast(v, n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+#else
+      (void)v;
+      (void)n;
+#endif
+   }
 
    // Gather values with global indices on rank 0: there, the result has n
    // entries, entry idx[i] = val[i] (entries held by several ranks — the

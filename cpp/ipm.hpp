@@ -120,6 +120,10 @@ public:
       bool delta_from_last = false; // after an iteration that needed δ > 0, start from
                                     // δ_last/3 instead of trying δ = 0 first (IPOPT tries 0;
                                     // here δ > 0 is needed in most iterations)
+      int max_soc = 0;              // > 0: second-order corrections (Wächter & Biegler
+      double kappa_soc = 0.99;      // 2006, A-5.5 to A-5.10; IPOPT max_soc = 4): up to
+                                    // this many when the first trial is rejected and θ
+                                    // grew; they stop when θ is not reduced by kappa_soc
       int stall_iter = 0;           // > 0: restoration also when the barrier error E_μ
                                     // has not halved in this many iterations (θ ≤ θ_min,
                                     // μ > its floor)
@@ -142,6 +146,8 @@ public:
       long stall_restorations = 0;// ... of which for a stall
       long resto_failures = 0;    // ... that found no acceptable point (step taken anyway)
       long resto_iters = 0;       // iterations spent in them (not in iters)
+      long soc_tried = 0;         // second-order correction steps computed ...
+      long soc_accepted = 0;      // ... and iterations that took one
    };
    // A point in the IPM's own layout: p = [x | s], λ in row order [c | d],
    // bound multipliers for p.  Optional start and end of solve() (the start
@@ -527,6 +533,8 @@ public:
          res.s_corrections += rr.s_corrections;
          res.singular += rr.singular;
          res.ls_backtracks += rr.ls_backtracks;
+         res.soc_tried += rr.soc_tried;
+         res.soc_accepted += rr.soc_accepted;
          if (!rnlp.accepted()) {
             ++res.resto_failures;
             if (o.print_level > 0)
@@ -813,13 +821,16 @@ public:
          sum2.total(rb);
          const double linres = std::sqrt(rb[0] / std::max(rb[1], 1e-300));
 
-         // ---- bound multipliers and fraction to the boundary
+         // ---- bound multipliers and fraction to the boundary (for the step d;
+         //      again for a second-order correction that is taken)
          const double tau = std::max(0.99, 1.0 - mu);
+         double dpn = 0.0;
+         std::vector<double> dzl(np, 0.0), dzu(np, 0.0);
+         auto bound_step = [&]() {
          ap = 1.0;
          ad = 1.0;
          pr_block = du_block = -1;
-         double dpn = 0.0;
-         std::vector<double> dzl(np, 0.0), dzu(np, 0.0);
+         dpn = 0.0;
          for (int i = 0; i < np; ++i) {
             const double dp = d[i];
             dpn = std::max(dpn, std::abs(dp));
@@ -847,6 +858,8 @@ public:
             ad = a[1];
             dpn = dd::Comm::max(dpn);
          }
+         };
+         bound_step();
          // ---- filter line search on (θ, φ_μ), backtracking from the
          //      fraction-to-the-boundary step.  If no step down to α_min is
          //      acceptable: the restoration phase, and if that fails as well,
@@ -887,31 +900,80 @@ public:
                   amin = std::min(amin, delta_sw * std::pow(th0, s_th) / std::pow(-gd, s_ph));
             }
             amin *= 0.05;
+            // is the trial point (θ, φ), reached with step a along d, acceptable?
+            auto acceptable = [&](double tht, double pht, double a, bool& ft) {
+               bool ok = false;
+               if (std::isfinite(pht) && tht <= theta_max && !dominated(tht, pht)) {
+                  const bool sw = gd < 0.0 && a * std::pow(-gd, s_ph) > delta_sw * std::pow(th0, s_th);
+                  if (sw && th0 <= theta_min) {        // f-type: Armijo on φ
+                     ok = pht <= ph0 + eta * a * gd;
+                     ft = true;
+                  } else {                              // h-type: θ or φ decreases enough
+                     ok = tht <= (1.0 - g_th) * th0 || pht <= ph0 - g_ph * th0;
+                     ft = false;
+                  }
+               }
+               return ok;
+            };
+            // Second-order corrections (Wächter & Biegler 2006, A-5.5 to A-5.10), after
+            // the first trial (step a0) was rejected with θ grown: with the same
+            // factorization, solve for d_soc with the constraint residual replaced by
+            // c_soc = a0·A(p) + A(p + a0 d), then c_soc ← α_soc·c_soc + A(p + α_soc d_soc),
+            // up to max_soc times while θ falls by kappa_soc.  The trial point
+            // p + α_soc d_soc (fraction to the boundary) is judged with a0.  If one is
+            // accepted, d becomes d_soc (its λ part too) and the step is α_soc.
+            auto try_soc = [&](double a0, bool& ft) {
+               std::vector<double> csoc(m), rf, dsoc;
+               for (Index r = 0; r < m; ++r) csoc[r] = a0 * A[r] + At[r];
+               double th_old = th0;
+               for (int k = 0; k < o.max_soc; ++k) {
+                  ++res.soc_tried;
+                  rf = rhs;
+                  for (Index r = 0; r < m; ++r) rf[np + r] = -csoc[r];
+                  if (!kkt_solve(rf, dsoc)) return false;
+                  double as = 1.0;
+                  for (int i = 0; i < np; ++i) {
+                     const double dp = dsoc[i];
+                     if (hl[i] && dp < 0.0) as = std::min(as, -tau * (p[i] - pl[i]) / dp);
+                     if (hu[i] && dp > 0.0) as = std::min(as, tau * (pu[i] - p[i]) / dp);
+                  }
+                  as = dd::Comm::min(as);
+                  for (int i = 0; i < np; ++i) pt[i] = p[i] + as * dsoc[i];
+                  const double ft_ = nlp.f(pt.data());
+                  residual_at(pt, At);
+                  const double tht = theta_of(At), pht = phi_of(pt, ft_);
+                  if (acceptable(tht, pht, a0, ft)) {
+                     d = dsoc;
+                     bound_step();   // ap = α_soc (the same fraction to the boundary), ad, dz
+                     return true;
+                  }
+                  if (tht > o.kappa_soc * th_old) return false;
+                  th_old = tht;
+                  for (Index r = 0; r < m; ++r) csoc[r] = as * csoc[r] + At[r];
+               }
+               return false;
+            };
             double alpha = ap;
-            bool accepted = false, ftype = false;
+            bool accepted = false, ftype = false, soc = false;
             for (;;) {
                for (int i = 0; i < np; ++i) pt[i] = p[i] + alpha * d[i];
                const double ft = nlp.f(pt.data());
                residual_at(pt, At);
                const double tht = theta_of(At), pht = phi_of(pt, ft);
-               if (std::isfinite(pht) && tht <= theta_max && !dominated(tht, pht)) {
-                  const bool sw = gd < 0.0 && alpha * std::pow(-gd, s_ph) > delta_sw * std::pow(th0, s_th);
-                  if (sw && th0 <= theta_min) {        // f-type: Armijo on φ
-                     accepted = pht <= ph0 + eta * alpha * gd;
-                     ftype = true;
-                  } else {                              // h-type: θ or φ decreases enough
-                     accepted = tht <= (1.0 - g_th) * th0 || pht <= ph0 - g_ph * th0;
-                     ftype = false;
-                  }
-               }
+               accepted = acceptable(tht, pht, alpha, ftype);
                if (accepted) break;
+               if (nback == 0 && o.max_soc > 0 && tht >= th0 && try_soc(alpha, ftype)) {
+                  accepted = soc = true;
+                  ++res.soc_accepted;
+                  break;
+               }
                ++nback;
                alpha *= 0.5;
                if (alpha < amin || nback > 60) break;
             }
             if (accepted) {
-               ap = alpha;
-               ltype = ftype ? 'f' : 'h';
+               if (!soc) ap = alpha;
+               ltype = soc ? (ftype ? 'F' : 'H') : (ftype ? 'f' : 'h');
                if (!ftype) augment_filter(th0, ph0);
             } else {
                ++res.ls_failures;

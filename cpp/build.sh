@@ -1,11 +1,12 @@
 #!/bin/bash
-# Build tv_dd.  Needs Eigen, LAPACK (dsytrf) and zlib — no IPOPT, no HSL.
+# Build tv_dd and tv_learn.  Needs Eigen, LAPACK (dsytrf) and zlib — no IPOPT, no HSL.
 # MUMPS is optional: it enables --block-solver mumps / --fallback mumps.
 #
 #   ./build.sh            serial
 #   OMP=1 ./build.sh      OpenMP over the tiles (then set OMP_NUM_THREADS or --threads)
 #   MUMPS=0 ./build.sh    build without MUMPS even if it is found
 #   MPI=1 ./build.sh      distribute the tiles over MPI ranks (run with mpirun -np R)
+#   TARGETS=tv_learn ./build.sh   build only tv_learn (default: tv_dd tv_learn)
 #
 # MUMPS is found through pkg-config "coinmumps" (COIN-OR ThirdParty-Mumps;
 # ~/.local/coinmumps is searched by default), or given explicitly with
@@ -124,9 +125,21 @@ if [ "${MUMPS:-1}" != "0" ]; then
   fi
 fi
 
-"$CXX" "${FLAGS[@]}" "${PFLAGS[@]}" "${MFLAGS[@]}" main.cpp -o tv_dd "${LIBS[@]}" "${PLIBS[@]}" "${MLIBS[@]}" -lz
-echo "built $(pwd)/tv_dd ($([ ${#MFLAGS[@]} -gt 0 ] && echo "with" || echo "without") MUMPS, $([ ${#PFLAGS[@]} -gt 0 ] && echo "with" || echo "without") MPI)"
-if [ ${#MFLAGS[@]} -gt 0 ]; then
+# TARGETS: which binaries (default both); TARGETS=tv_learn leaves tv_dd as it is
+for target in ${TARGETS:-tv_dd tv_learn}; do
+  case "$target" in
+    tv_dd) src=main.cpp ;;
+    tv_learn) src=main_learn.cpp ;;
+    *) echo "build.sh: unknown target $target" >&2; exit 1 ;;
+  esac
+  # link to a temporary name, then rename: the rename is atomic, so a job started
+  # meanwhile never finds the binary missing or half-written, and running jobs keep theirs
+  "$CXX" "${FLAGS[@]}" "${PFLAGS[@]}" "${MFLAGS[@]}" "$src" -o "$target.tmp.$$" "${LIBS[@]}" "${PLIBS[@]}" "${MLIBS[@]}" -lz \
+    || { rm -f "$target.tmp.$$"; exit 1; }
+  mv -f "$target.tmp.$$" "$target"
+  echo "built $(pwd)/$target ($([ ${#MFLAGS[@]} -gt 0 ] && echo "with" || echo "without") MUMPS, $([ ${#PFLAGS[@]} -gt 0 ] && echo "with" || echo "without") MPI)"
+done
+if [ ${#MFLAGS[@]} -gt 0 ] && [[ " ${TARGETS:-tv_dd} " == *" tv_dd "* ]]; then
   "$CXX" "${FLAGS[@]}" "${MFLAGS[@]}" mumps_check.cpp -o mumps_check "${LIBS[@]}" "${MLIBS[@]}"
   echo "built $(pwd)/mumps_check  (run it once on this machine)"
 fi

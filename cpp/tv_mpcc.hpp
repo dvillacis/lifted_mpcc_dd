@@ -53,6 +53,11 @@
 // infeasibility too): a relaxation at level t is only accurate to about √t, so
 // solving it more tightly is wasted.
 //
+// When (μ, t) stalls (unchanged for follow_stall iterations), cells locked
+// between the branches (product row violated, ξ rising, product not falling)
+// get their own level t_e = their product, lowered as the product falls and
+// dropped once t_e ≤ t (follow_cells(); on by default, --follow-comp 0: off).
+//
 // ============================================================================
 //  THE EXACT-PENALTY FORMULATION (penalty > 0, opt-in)
 // ============================================================================
@@ -117,7 +122,7 @@ class TvMpcc : public NLP {
 public:
    // ---- continuation state ------------------------------------------------
    double t = 1.0;             // current relaxation level
-   double t_min = 1e-4;        // the level the answer is reported at
+   double t_min = 1e-5;        // the level the answer is reported at
    double t_mu_scale = 10.0;   // t follows the barrier: t = max(t_min, 10·μ)
    double t_rate = 0.5;        // ... but may at most halve per iteration
    double t_comp_ratio = 0.0;  // κ_t > 0: ... and never below max r(1−δ)/κ_t, so that t does
@@ -170,6 +175,23 @@ public:
    bool bounds_as_rows = true; // r, δ, α ≥ 0 as rows hr, hd, ha (slacked); false: as
                                // variable bounds, the rows kept but free (experiment)
 
+   // ---- per-cell t for branch-locked cells (end game, on by default) ----------
+   // A cell whose product row stays violated (r(1 − δ) > t_e) while ξ rises and the
+   // product does not fall, at a fixed t, for follow_persist consecutive iterations,
+   // is "locked" between the branches r = 0 and δ = 1.  Its t_e is then raised to
+   // r(1 − δ) − s, so its row holds at the current point (s ≤ 0: the row's slack),
+   // and from then on only lowered, to r(1 − δ) − s each iteration: the barrier on s
+   // pulls the product down and t_e follows it.  The cell is released once t_e ≤ t.
+   // The test is armed only in a stall: μ and t unchanged for follow_stall iterations
+   // in a row (an ordinary end phase at t = t_min is shorter; the failing runs sit at
+   // a fixed (μ, t) for hundreds of iterations).  A followed cell's certificate holds
+   // at its own t_e, reported as follow_now and follow_tmax.  See endgame_literature.md §11.
+   bool follow = true;
+   int follow_persist = 3, follow_stall = 20;
+   long follow_events = 0;             // raises so far (all ranks)
+   long follow_now = 0;                // cells with t_e > t at the last iteration
+   double follow_tmax = 0.0;           // ... their largest t_e
+
    // ---- sizes and offsets -------------------------------------------------
    int N, nc, m_u, m_q;        // image side, cells per side, #nodes, #cells
    int n, mcon, n_eq, n_ineq;  // #variables, #rows, #equality rows, #inequality rows
@@ -192,13 +214,20 @@ public:
 
    // Build this rank's part of the NLP.  The warm start and θ_ref are computed
    // on the unsplit problem, then the consensus copies are appended.
-   TvMpcc(const Image& img, const Partition& part, double sigma)
+   // alpha0 > 0: the warm start's weight (and α's start), else 0.7σ.  With u0, qx0,
+   // qy0 (a lower-level solution at alpha0 and its dual, |q| ≤ 1), the start is
+   // their lifting; else Chambolle–Pock's at that weight.
+   TvMpcc(const Image& img, const Partition& part, double sigma, double alpha0 = 0.0,
+          const std::vector<double>* u0 = nullptr, const std::vector<double>* qx0 = nullptr,
+          const std::vector<double>* qy0 = nullptr)
        : N(img.N), part_(part), sum_(part.n_tiles) {
       nc = N - 1;
       m_u = N * N;
       m_q = nc * nc;
       layout_unsplit();
-      build_local(warm_start_chambolle_pock(img.noisy, 0.7 * sigma), img.clean, img.noisy);
+      const double lam = alpha0 > 0.0 ? alpha0 : 0.7 * sigma;
+      build_local(u0 ? lift(*u0, *qx0, *qy0, lam) : warm_start_chambolle_pock(img.noisy, lam),
+                  img.clean, img.noisy);
    }
 
    // max over cells of r·(1 − δ): how far from exact complementarity x is
@@ -305,7 +334,9 @@ public:
          g[q.h3y] = x[q.qy] - d * s;
          g[q.hr] = r;
          g[q.hd] = d;
-         g[q.comp] = r * (1.0 - d) - (relaxed_.empty() || !relaxed_[b] ? t : 0.0);
+         g[q.comp] = r * (1.0 - d) - (!relaxed_.empty() && relaxed_[b] ? 0.0
+                                      : t_cell_.empty()             ? t
+                                                                    : std::max(t, t_cell_[b]));
       }
       if (ha_ >= 0) g[ha_] = x[ha_alpha_];
       for (const Link& l : links_) g[l.row] = x[l.copy] - x[l.orig];
@@ -441,6 +472,7 @@ public:
             return false;
          }
       }
+      if (follow && penalty <= 0.0 && it.zu) follow_cells(it);
       double comp = 0.0;   // max r(1 − δ) at this iterate (global)
       for (const Cell& q : cells_) comp = std::max(comp, it.x[q.r] * (1.0 - it.x[q.d]));
       comp = dd::Comm::max(comp);
@@ -720,6 +752,55 @@ public:
                      relaxed_total, thr);
    }
 
+   // The per-cell t of branch-locked cells: see `follow` above.  Collective.
+   void follow_cells(const Iterate& it) {
+      if (t_cell_.empty()) {
+         t_cell_.assign(cells_.size(), 0.0);
+         lock_streak_.assign(cells_.size(), 0);
+         xi_prev_.assign(cells_.size(), 0.0);
+         rw_prev_.assign(cells_.size(), 0.0);
+      }
+      stall_iters_ = it.mu == mu_prev_ && t == t_prev_ ? stall_iters_ + 1 : 0;
+      mu_prev_ = it.mu;
+      const bool armed = stall_iters_ >= follow_stall;
+      long fresh = 0, now = 0;
+      double tmax = 0.0;
+      for (size_t b = 0; b < cells_.size(); ++b) {
+         if (!relaxed_.empty() && relaxed_[b]) continue;
+         const Cell& q = cells_[b];
+         const double rw = it.x[q.r] * (1.0 - it.x[q.d]), s = it.x[slack(q.comp)];
+         const double xi = it.zu[slack(q.comp)];
+         const double te = std::max(t, t_cell_[b]);
+         if (t_cell_[b] > 0.0) {   // following: lower t_e to the product (never raise it here)
+            t_cell_[b] = std::min(t_cell_[b], rw - s);
+            if (t_cell_[b] <= t) t_cell_[b] = 0.0;   // released
+         }
+         // locked: violated, ξ rising, the product not falling, and t not moving.  While
+         // t falls every active row is briefly violated with ξ rising (the catch-up of
+         // the continuation); only a row that stays violated at a fixed t is locked.
+         const bool locked =
+             armed && rw > te && xi > xi_prev_[b] && rw >= rw_prev_[b] && t == t_prev_;
+         lock_streak_[b] = locked ? lock_streak_[b] + 1 : 0;
+         xi_prev_[b] = xi;
+         rw_prev_[b] = rw;
+         if (lock_streak_[b] >= follow_persist) {
+            t_cell_[b] = std::max(t_cell_[b], rw - s);
+            lock_streak_[b] = 0;
+            ++fresh;
+         }
+         if (t_cell_[b] > t) { ++now; tmax = std::max(tmax, t_cell_[b]); }
+      }
+      fresh = dd::Comm::sum(fresh);
+      follow_events += fresh;
+      follow_now = dd::Comm::sum(now);
+      follow_tmax = dd::Comm::max(tmax);
+      t_prev_ = t;
+      if (print && fresh > 0)
+         std::printf("  [follow] it %d: %ld locked cells raised to their product; %ld followed,"
+                     " max t_e %.2e (t = %.2e, stalled %d iterations)\n",
+                     it.iter, fresh, follow_now, follow_tmax, t, stall_iters_);
+   }
+
    void classify_point(const Iterate& it) {
       const int sc0 = n + (rcomp - rhr);   // the comp slack of cell 0
       std::vector<double> gam(m_q), nu(m_q);
@@ -781,6 +862,13 @@ private:
    std::vector<double> ref_;     // per local variable: u_clean (u), θ_ref (θ), else 0
    std::vector<double> fnode_;   // per own node: the noisy image f
    std::vector<char> relaxed_;   // per local cell: flagged by flag_cells()
+   std::vector<double> t_cell_;  // per local cell: its own t_e (0: none), follow_cells()
+   std::vector<int> lock_streak_;   // ... consecutive locked iterations,
+   std::vector<double> xi_prev_;    //     the last iteration's ξ,
+   std::vector<double> rw_prev_;    //     r(1 − δ)
+   double t_prev_ = -1.0;           //     and t; the last iteration's μ, and how many
+   double mu_prev_ = -1.0;          //     iterations (μ, t) have not moved
+   int stall_iters_ = 0;
    static constexpr char kPinR = 1, kPinD = 2;
    std::vector<char> pinned_;    // per local cell, in the clean-up: r = 0 or δ = 1
    std::vector<double> comp_hist_;   // max min(r, 1 − δ) per iteration (penalty update)
@@ -959,7 +1047,13 @@ private:
          u.swap(u_new);
          if (residual <= 1e-9) break;
       }
+      return lift(u, qx, qy, lam);
+   }
 
+   // A lower-level point (u, q) and the weight, lifted to the unsplit layout:
+   // r = |K u|, δ = |q|, θ = the angle of q.
+   std::vector<double> lift(const std::vector<double>& u, const std::vector<double>& qx,
+                            const std::vector<double>& qy, double lam) const {
       std::vector<double> x(n, 0.0);
       for (int i = 0; i < m_u; ++i) x[ou + i] = u[i];
       for (int a = 0; a < nc; ++a)

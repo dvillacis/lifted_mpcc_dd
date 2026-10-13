@@ -34,6 +34,9 @@ Würzburg preprint 315, 2013).
   ε_k = O(t_k).  The condition is o(t_k), under MPEC-MFCQ, which the lifted problem
   does not satisfy (ker 𝕂* ≠ {0}).  Check the theorem number against the MOR
   version (the preprint calls it 3.2).
+  - **Checked 2026-10-11 against the MOR version** (p. 258, page image): it is
+    Theorem 2 and states **ε_k = O(t_k)** under MPEC-MFCQ.  The manuscript's
+    citation is right; only the MPEC-MFCQ caveat remains.
 - **Code:** the level gate stops at inf_du ≤ √t = 100·t, which violates even O(t).
 
 **Raghunathan & Biegler, "An interior point method for MPCCs", SIAM J. Optim.
@@ -375,3 +378,212 @@ is consistent with κ(∇c) = O(1/√t) in the manuscript.
   run to reproduce IPOPT-C's configuration, which has no floor on t.
 - **What 1e-4 means for the certificate.** At t_min = 1e-4 it is approximate:
   the residuals plus the §5 multiplier classification.
+
+## 11. t_min = 1e-5 from the two-stage start (2026-10-11)
+
+Instance: cameraman N=128, one weight, 8×8 tiles, 4 ranks, `--gate kkt`, stage 1
+to convergence.  At t_min = 1e-4 it passes the gate in 39 iterations.  At 1e-5
+it reaches the 3000-iteration limit (210 restoration phases, max ξ 376, 6 M
+cells at ε = 3√t).
+
+**Where it breaks** (`--verbose 1`, first 300 iterations).
+- Identical to the 1e-4 run down to t = 8.3e-5 (iteration 41: inf_pr 1.2e-4,
+  inf_du 1.9e-2).
+- Iteration 42: μ falls 10^-5.1 → 10^-5.6 in one iteration (κ_ε = 1000), and t
+  follows to 2.6e-5 within two iterations.
+- From then on:
+  - inf_du swings between 1e-2 and 80 from one iteration to the next;
+  - the line search backtracks to α_pr ≈ 1e-3 … 1e-9, with ‖dp‖ ≈ 1e-2;
+  - restoration phases come one after another (16 in 300 iterations), and t
+    never reaches 1e-5.
+  - δ_w stays at 1e-4 … 1e-5 until the first restoration phase and is ≈ 1 after
+    it.  So the inertia correction is not what starts the failure.
+
+**Two hypotheses tested** (400 iterations each; none converges):
+
+| variant | t at the end | inf_du at the end | restoration phases |
+|---|---|---|---|
+| default | 2.6e-5 (at 300) | ~1e2 | 16 |
+| `--dual-reg 0` (no fixed δ_c) | 1e-5, μ = 1e-6 | 1.5e4; max ξ 5.5e3 | 16 |
+| `--max-soc 4` (IPOPT's SOC) | 8.3e-5, stuck: the same iterate repeats | 8.4 | 0 |
+| both | 2.6e-5 | 4.7e4 | 7 |
+
+- **δ_c.** The idea was that δ_c·dλ breaks θ-descent once ξ is large.  Without
+  δ_c, t does reach t_min, but ξ then grows to 5.5e3 on the same handful of M
+  cells and inf_du to 1e4.  δ_c only caps the multipliers.
+- **SOC.** Second-order corrections do not unblock the line search.  They stall
+  earlier, at 8.3e-5.
+- **First reading (corrected by step 1 below).** The end game is held by a few
+  cells (6 M-stationary cells out of 16k) where ξ grows without bound as t → 0,
+  as Ralph–Wright and Kanzow–Schwartz predict at non-S points.  The unscaled
+  max-norm inf_du in the gate is dominated by them.
+  - Step 1 shows the cells that hold it are not biactive; see below.
+
+**Step 1: where the residual sits** (`--endgame-diag`, the same run, 400 iterations).
+- **From t = 8.3e-5 on, one cell holds the maximum** in almost every iteration:
+  cell (74, 0) on the left image edge, on its product-row slack (−ξ + z_s).
+  - Its ξ grows steadily: 18 → 540 (iteration 59) → 1.1e3 (iteration 150).
+  - Off the cells (u, α, copies) the residual stays ≤ 1e-3.
+- **The high-ξ cells are not biactive** (`fz30.csv`, the per-cell record).
+  - They are on the r → 0 branch, with r stuck at 1e-4…2.5e-3 and w = 1 − δ at
+    0.01…0.6.  So r·w is above the cell's t: the product row is violated, and ξ
+    grows trying to flatten a gradient that does not vanish.
+  - γ = a − ξw is very negative there (−20 … −350).  For a cell in I_{0+} this is
+    not a stationarity defect: its multiplier is free.
+  - The classes at ε = √t do not see them: all biactive cells are S in the
+    frozen run.
+- **They form small clusters:**
+  - left edge, rows 73–77, columns 0–4: a flat dark region of the clean image
+    (the coat) meeting the image boundary;
+  - rows 118–121, columns 18–20;
+  - (60–63, 7–8) and (16–19, 84–85).
+- **ξ keeps growing at fixed t.**  A frozen cell's ξ still rises (1.2e3 at
+  t_e = 8.3e-5).  So it is not ξ ~ 1/√t: at those cells the barrier problem at a
+  fixed t is itself not being solved.
+- **The stall is above t_min.**  μ stops at 10^-5.6, because E_μ never gets
+  below κ_ε·μ, and t stays at 10μ = 2.56e-5 for hundreds of iterations.  A cell
+  frozen during that stall (t_e = 2.56e-5) changes nothing: `--freeze-xi 100`
+  ran identically to the default.
+
+**Step 2: `--freeze-xi X`** (opt-in; cells with ξ ≥ X for 3 iterations keep their
+t; 4 ranks, three jobs at a time, so times are indicative; loss = exact loss with
+200k PDHG iterations).
+
+| run | its | t at the end | restoration phases | frozen (t_e) | exact loss | S/M/C at √t |
+|---|---|---|---|---|---|---|
+| cam128 scalar, default (v2) | 3000, limit | 1e-5 | 210 | — | 14.7708297 | 833/0/0 |
+| X = 10 | **494, gate** | 1e-5 | 17 | 23 (2.6e-5–8.3e-5) | 14.7705853 | 993/0/0 |
+| X = 20 | 600, limit | 1e-5 | 27 | 10 | 14.7706263 | 936/0/0 |
+| X = 30 | **198, gate**, 39 s | 1e-5 | 2 | 12 (2.6e-5–8.3e-5) | 14.7706810 | 932/0/0 |
+| X = 50 | 600, limit | 1e-5 | 23 | 22 | 14.7705446 | 936/0/0 |
+| X = 100 | = default (all freezes at 2.56e-5) | | | 16 | | |
+| X = 30, cam N=64 scalar / 4×4 / 8×8, mariposa 8×8 | 57 / 58 / 86 / 46 | 1e-5 | 0 | 0 | identical to v2 | identical |
+| X = 30, BSDS 8×8 | 91 (v2: 97) | 1e-5 | 1 | 1 | 4.1461344 (v2: 4.1462153) | 2498/0/0 |
+| X = 30, cam128 8×8 | 200 | 1e-5 | 0 | 0 | identical to v2 | identical |
+
+- **Harmless where nothing goes wrong.**  On the six instances that converge
+  anyway, X = 30 freezes nothing or one cell, and the results are identical or
+  slightly better.
+- **Not a reliable fix.**  On the failing instance, X = 30 and 10 pass the gate
+  but X = 20 and 50 do not: the outcome is not monotone in X.
+  - The run that works froze (74, 0) early, at t = 8.3e-5, before the stall.
+  - Once the stall at t = 2.56e-5 has begun, freezing does not end it.
+- **Reading.**  The failure mode is a few cells locked between the branches,
+  with r·w > t and ξ diverging at fixed t, not ξ ~ 1/√t at non-S biactive cells.
+  Freezing early lets the rest of the problem go on and can get past it, but it
+  does not remove the lock.  What would target the lock directly (not tried):
+  - detect r·w > t_e with ξ rising, and let such a cell keep t_e = r·w (an
+    adaptive, per-cell t that follows the iterate's own product); or
+  - pin the branch locally, r = 0, the manuscript's clean-up restricted to these
+    few cells (the global clean-up of §7 failed on ~40% ambiguous cells; here
+    there are about 10–25).
+
+**Step 3: `--follow-comp K`, a per-cell t that follows the product** (opt-in,
+2026-10-11; 4 ranks, three jobs at a time; exact loss with 200k PDHG iterations).
+- **The rule.**
+  - Trigger: a cell is locked when, for K iterations in a row, its product row is
+    violated (r·w > t_e), ξ rises, the product does not fall, and t has not
+    moved.
+  - Action: t_e = r·w − s, so the row holds at the current point.
+  - Afterwards t_e is only lowered, to r·w − s each iteration, and the cell is
+    released once t_e ≤ t.
+- **A first version without "the product does not fall, t has not moved" was a
+  false pass.**  It raised t_e on 2–15k cells, mistaking the continuation's
+  normal catch-up (every active row is briefly violated after t halves) for a
+  lock.  Those runs pass the gate fast with t_e up to 1e-2, worse loss
+  (14.7718–14.7780) and far fewer biactive cells.  Discarded.
+
+| run | its | exact loss | S/M/C at √t | raises; cells left with t_e > t (max t_e) | v2 default |
+|---|---|---|---|---|---|
+| cam128 scalar, K = 2 | **199, gate** | **14.7705414** | 1037/0/0 | 177; 27 (2.5e-4) | 3000 limit, 14.7708297 |
+| cam128 scalar, K = 3 | **221, gate** | 14.7709798 | 1020/0/0 | 121; 25 (2.0e-4) | |
+| cam128 scalar, K = 5 | **544, gate** | 14.7709840 | 1042/0/0 | 122; 31 (2.0e-4) | |
+| cam128 8×8, K = 3 | 239 | 11.9283885 (−0.05%) | 921/0/0 | 20; 15 (2.4e-4) | 200, 11.9347870 |
+| cam64 scalar | 86 | 4.0908399 (+0.007%) | 212/0/0 | 13; 13 (4.9e-4) | 57, 4.0905736 |
+| cam64 4×4 | 58 | identical | 188/5/5 | 0 | 58 |
+| cam64 8×8 | 80 | 3.4937227 | 196/0/0 | 15; 8 (3.5e-5) | 86, 3.4937371 |
+| mariposa 8×8 | 66 | 4.9059660 (+0.017%) | 118/0/0 | 212; 212 (2.2e-3) | 46, 4.9051133 |
+| BSDS 8×8 | 97 | identical | 2525/0/0 | 0 | 97 |
+
+- **It fixes the failing instance for every K tried** (2, 3, 5).  This is unlike
+  `--freeze-xi`, whose outcome was not monotone in X.
+- **The price is cells left relaxed:** 25–31 cells end with t_e ≤ 2.5e-4 instead
+  of 1e-5.  The certificate there is that of a larger t.
+- **It also fires on instances that converge without it,** because the lock test
+  holds in an ordinary end phase at t = t_min.
+  - Mariposa: 212 cells left at up to 2.2e-3, 20 more iterations, loss +0.017%.
+  - Cameraman N=64 scalar: 13 cells, 29 more iterations, loss +0.007%.
+  - Cameraman N=128 8×8: 15 cells, a lower loss (−0.05%), a different
+    stationary point.
+- **Not a default as it stands.**  It would need a trigger that fires only in a
+  real stall (e.g. after a restoration phase, or when μ has not moved for M
+  iterations), and the report must list the cells with t_e > t_min next to the
+  S/M/C classes.
+
+**Step 4: the lock test armed only in a stall** (`--follow-stall M`, default 20:
+μ and t unchanged for M iterations in a row; same instances and settings).
+
+| run | its | exact loss | S/M/C at √t | raises; left with t_e > t (max t_e) | v2 default |
+|---|---|---|---|---|---|
+| cam128 scalar, K = 2 | **271, gate** | 14.7709777 | 1060/0/0 | 437; 37 (1.8e-4) | 3000 limit, 14.7708297 |
+| cam128 scalar, K = 3 | **179, gate** | 14.7705871 | 1030/0/0 | 126; 36 (2.1e-4) | |
+| cam128 scalar, K = 3, M = 10 | **165, gate** | 14.7705666 | 1048/0/0 | 145; 37 (1.7e-4) | |
+| cam128 scalar, K = 5 | 600, limit, t = 2.6e-5 | 14.7720683 | — | 213; 11 | |
+| cam128 8×8, K = 3 | 197 | 11.9345098 | 926/0/0 | 1; 0 | 200, 11.9347870 |
+| cam64 scalar / 4×4, mariposa 8×8 (M = 20 and 10), BSDS 8×8 | identical to v2 | identical | identical | 0 | |
+| cam64 8×8 | 86 | 3.4937373 (v2 3.4937371) | 196/0/0 | 4; 2 (1.1e-5) | 86 |
+
+- **No collateral effect.**  On the six instances that converge without it, it
+  does not fire at all (four instances), or it raises 1–4 cells and leaves none,
+  or two at t_e ≈ t_min.
+- **On the failing instance it passes for K = 2 and 3** (165–271 iterations
+  instead of the 3000 limit), with 36–37 cells ending at t_e ≤ 2.1e-4.  K = 5
+  reacts too slowly: the stall at t = 2.6e-5 persists.
+- **The certificate.**  Every biactive cell at ε = √t is S.  The 36–37 followed
+  cells are certified only at their own t_e (≤ 2.1e-4, about 20 t_min).  The
+  report lists their number and largest t_e.
+- **Candidate default `--follow-comp 3 --follow-stall 20`,** but tested on one
+  failing instance only.  Before switching: other runs that stall
+  - cameraman N=64 scalar at t_min = 1e-6 (1685 its before);
+  - mariposa N=96/128 scalar;
+  - cameraman N=256.
+
+**Step 5: other runs that stall** (scalar weight, two-stage start, `--gate kkt
+--classify`, exact loss with 200k PDHG iterations; 4 ranks, three jobs at a
+time, so times are indicative; F = `--follow-comp 3 --follow-stall 20`).
+
+| instance | default: its, restoration phases, time, exact loss | F: its, time, exact loss | F: raises; left with t_e > t_min (max t_e) | F: S/M/C at √t |
+|---|---|---|---|---|
+| cam N=64, t_min = 1e-6 | 2000 limit, 214, 1556 s, 4.0905769 | **300, gate**, 15 s, 4.0905760 | 287; 125 (5.5e-5) | 118/0/0 |
+| mariposa N=96, 1e-5 | 51, gate, 0, 7 s, 12.1049150 | identical (no raise) | 0 | 353/5/12 |
+| mariposa N=128, 1e-5 | 1000 limit, 47, 1141 s, 18.4801669 | **244, gate**, 68 s, 18.4635336 (−0.09%) | 275; 49 (1.1e-4) | 801/0/0 |
+| cam N=256 16×16 tiles, 1e-5 | 800 limit at t = 2.6e-5, 56, 2972 s, 45.9069812 | **559, gate**, 496 s, 45.8878595 (−0.04%) | 11 205; 399 (2.3e-4) | 4899/0/0 |
+
+- **Every stalling run passes the gate with F; none passes without it.**  The
+  defaults stall the way cam N=128 did: at a fixed (μ, t), with t = 2.6e-5 at
+  N=256, and restoration phases one after another.
+- **The exact loss is equal or lower** (−0.04% to −0.09% on the two large runs).
+- **The cost is the cells left relaxed:** 49 (mariposa 128), 125 (cam64 at
+  1e-6, 55·t_min) and 399 (cam256; 0.6% of 65k cells) end with t_e ≤ 2.3e-4.
+  N=256 needed 11k raises, so its stall is wider than one cluster.
+- **Instances that do not stall are unchanged** (mariposa N=96, and the six of
+  step 4).
+- **What a default would need, for the paper:**
+  - the report of the followed cells next to the S/M/C classes (already
+    printed);
+  - a statement that the certificate on those cells holds at their t_e;
+  - optionally, the classes of the followed cells at ε = √t_e.
+
+**Step 6: the default, in both binaries (2026-10-11).**
+- `--follow-comp 3 --follow-stall 20` is now the default in `tv_learn` and `tv_dd`.
+  - `TvMpcc` has the same `follow_cells()`.
+  - It is off under `--penalty`, and it skips cells flagged by `--relax-cells`.
+  - `--follow-comp 0` turns it off.
+  - In `tv_learn`, `--freeze-xi` turns it off.
+- **The bit-identity gate still passes:** cameraman 32, 4×4 tiles, `--start uniform`: 40 identical iterations, the same as before the change, with no raise.
+- **`tv_dd` at its defaults (`--gate kkt --classify -`) gives the same numbers as `tv_learn` with F:**
+
+  | instance | its | raises | cells left | max t_e | biactive at √t |
+  |---|---|---|---|---|---|
+  | cameraman N=128 scalar | 179 | 126 | 36 | 2.05e-4 | S 1030 |
+  | mariposa N=128 | 244 | 275 | 49 | 1.14e-4 | S 801 |

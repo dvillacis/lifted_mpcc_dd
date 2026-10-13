@@ -6,13 +6,15 @@
 
 The folder is self-contained: nothing is included from the rest of the repository. It needs only Eigen, LAPACK and zlib, with no IPOPT and no HSL. MUMPS (sequential) is optional and strongly recommended for the tile factorizations. It contains exactly one configuration, the one that came out best in the comparisons made in `../archive/cpp_dd_toy` (see "Provenance").
 
+A second binary, `tv_learn` (`tv_learn.hpp`), uses the same IPM and decomposition to learn a weight *map* on B×B blocks over a *set* of images, for denoising, inpainting and deblurring, with TV or directional TV. With its defaults it solves `tv_dd`'s problem bit for bit (see "tv_learn").
+
 ## The method in one page
 
 **Problem** (`tv_mpcc.hpp`). This is the bilevel TV-weight learning problem, with the lower level replaced by its optimality system:
 - The gradient and the dual are lifted to polar form (r, θ) and (δ, θ). This leaves smooth equations plus one complementarity r(1 − δ) = 0, relaxed to r(1 − δ) ≤ t (Scholtes).
 - **Consensus form.** Every variable referenced by two tiles (border u, border qx/qy, and α) gets a local copy per tile, plus a linking row `copy − consensus = 0`. Every row then belongs to one tile, and the tiles couple only through the consensus variables. This is the structure (1) of Lueg et al.
 - **μ-coupled continuation.** t = max(t_min, 10μ), at most halving per iteration. A level gate stops the solve once inf_pr and μ are ≤ √t at t = t_min; the dual infeasibility is not tested (`--gate kkt` adds inf_du ≤ √t, the rule before 2026-10-07 and in the measurements below).
-- **Start.** Chambolle–Pock for plain TV denoising, lifted to the MPCC variables.
+- **Start: two stages** (the default since 2026-10-09; see "The two-stage method"). Stage 1, the smoothed bilevel method (`smoothed.hpp`), finds the basin; stage 2, the MPCC, starts from stage 1's weight and its Huber lower-level solution, lifted to the MPCC variables, and refines it on the exact problem. `--start uniform`: Chambolle–Pock for plain TV denoising at α₀ = 0.7σ, lifted (the start before 2026-10-09).
 
 **IPM** (`ipm.hpp`). Primal-dual barrier method.
 - **Steps:** a filter line search on (θ = ‖constraints‖₁, barrier objective φ_μ) in the style of Wächter & Biegler (IPOPT's constants), backtracking from the fraction-to-the-boundary step. `--line-search none` gives the paper's plain fraction-to-the-boundary method.
@@ -71,6 +73,13 @@ The folder is self-contained: nothing is included from the rest of the repositor
 | `image.hpp`, `third_party/stb_image.h` | image → clean/noisy instance |
 | `partition.hpp` | k×k tiles |
 | `save.hpp`, `npz_writer.hpp` | `.npz` output, readable by `../python/plot_slurm.py` |
+| `main_learn.cpp` | `tv_learn`: CLI, per-image report, CSV line, `.npz` files and JSON report |
+| `tv_learn.hpp` | the MPCC of `tv_learn`: S images, operators, block-wise α, sharing tables |
+| `learn_partition.hpp` | k×k tiles per image (image-major ids), α blocks, cuts snapped to the blocks |
+| `operators.hpp` | the data terms (denoise, inpaint, deblur), the Gaussian blur, DTV weights, K_ξ |
+| `pdhg.hpp` | the lower level solved directly (warm start, held-out evaluation) |
+| `dataset.hpp` | folder / manifest listing and selection (from `../archive/cpp/dataset.hpp`) |
+| `save_learn.hpp`, `learn_util.hpp` | `tv_learn`'s outputs; PSNR, memory, `--check-derivatives` |
 
 ## Build and run
 
@@ -110,7 +119,7 @@ Elsewhere, give the flags directly: `MUMPS_CFLAGS="-I…/include" MUMPS_LIBS="-L
 | `--size` | 32 | N (image is N×N) |
 | `--nsub` | 4 | tiles per side (k×k tiles) |
 | `--sigma`, `--seed` | 0.1, 0 | noise level and seed |
-| `--t-min` | 1e-4 | final relaxation level; IPM tol = max(1e-8, 0.1·t_min), acceptable tol = max(1e-8, t_min) |
+| `--t-min` | 1e-5 | final relaxation level (1e-4 before 2026-10-11; the measurements below say which they used); IPM tol = max(1e-8, 0.1·t_min), acceptable tol = max(1e-8, t_min) |
 | `--schur` | `pcg` | `pcg` or `direct` |
 | `--cg-tol`, `--cg-maxit` | 1e-10, 2000 | PCG |
 | `--block-solver` | `mumps` (with MUMPS), else `sparse` | `dense` = Bunch–Kaufman on every W_k (reference) |
@@ -140,10 +149,21 @@ Elsewhere, give the flags directly: `MUMPS_CFLAGS="-I…/include" MUMPS_LIBS="-L
 | `--diag` | off | per iteration: where the dual residual sits and what blocked the step (see "The end game") |
 | `--dual-reg C`, `--dual-reg-exp K` | 1e-6, 0 | δ_c = C·μ^K in every Newton system; C = 0: only on demand (the behaviour before) |
 | `--classify FILE\|-` | off | per end-game iteration: MPCC multipliers γ = a − ξ(1−δ), ν = b − ξr and their sign classes on the near-biactive cells; FILE: the last point per cell (CSV) |
+| `--follow-comp K`, `--follow-stall M` | 3, 20 | once μ and t have not moved for M iterations, a cell whose product row stays violated while ξ rises, K iterations in a row, gets its own level t_e = its product, lowered as the product falls; 0: off (see "End-game tools" and `endgame_literature.md` §11) |
 | `--relax-cells THR` | 0 (off) | sign-driven per-cell relaxation (experiment, see `endgame_literature.md`); `--relax-shift 1e-4`, `--relax-persist 5`, `--relax-exp 0.7` |
 | `mpirun -np R` | 1 | MPI ranks (build with `MPI=1`); tiles are split into R contiguous ranges |
 | `--save-solution` | — | `.npz` with the instance, solution, run summary and μ-trace |
 | `--quiet`, `--verbose 0/1/2` | | iteration table off; linear-algebra detail |
+| `--start` | `smoothed` | two stages (stage 1 on rank 0, its weight and fields broadcast); `uniform`: Chambolle–Pock at `--alpha0` |
+| `--start-gamma`, `--start-iters`, `--start-ftol` | 1e-3, 1000, 1e-9 | stage 1: Huber parameter; L-BFGS iterations (a safeguard: stage 1 stops on its convergence tests; 100 before 2026-10-11); stop once J falls by less than this (relative) over 5 iterations |
+| `--start-solver` | `auto` | stage 1's Newton systems: `eigen` (sparse LDLᵀ), `mumps`; `auto` = MUMPS for N ≥ 128 |
+| `--start-newton` | `primal` | stage 1's lower-level Newton: `primal` (Newton on the Huber energy) or `pd` (the primal-dual semismooth Newton of De los Reyes–Schönlieb–Valkonen, (SSN-1)–(SSN-3): the dual its own unknown, projected onto the unit ball where it enters H, H symmetrized) |
+| `--start-huber` | `c2` | `--start ipm` only: the C² Huber (3.2) of De los Reyes–Schönlieb–Valkonen (`c2`), Definition 1's (`c1`, as stage 1), that Huber as rows max(γ, \|Ku\|) q − Ku = 0 with q its own unknown (`dual`), and those rows with q projected onto \|q\| ≤ 1 in their derivatives (`dualproj`) |
+| `--start-ipm-init` | `pdhg` | `--start ipm` only: its start, the exact TV solution at `--alpha0` lifted (`pdhg`), or the smoothed lower level at `--alpha0` with q = h(Ku), feasible for `c1` and the dual rows (`smoothed`) |
+| `--alpha0` | 0.7σ | the uniform start's weight, and stage 1's start |
+| `--color` | `auto` | `always`, `never`; `auto` is plain under mpirun/srun or when not a terminal; `NO_COLOR` and `CLICOLOR_FORCE` are honoured |
+
+**Output.** Homebrew-style sections (`ui.hpp`): `==>` headers per stage, `✔` / `Warning:` / `Error:` outcome lines, aligned key–value rows. Only the `CSV,` line is meant for machines (the slurm scripts read it).
 
 Every run ends with one machine-readable line, starting `CSV,`, with these fields:
 
@@ -296,7 +316,7 @@ Both stop at the level gate (t = 10⁻⁴); the 16×16 log is bit-identical on 4
 
     - **Below what can be seen.** Every pixel agrees to within one gray level, below the image's quantization; the noise (σ = 0.1) is about 25 gray levels. The reconstruction error is the same to the fourth digit, and α\* moves less than it does between tilings.
     - **Why.** A cell holding both a gradient and |q| < 1 has r ≈ 1 − |q| ≈ √t: 2.5 gray levels at t = 10⁻⁴, a quarter of one at 10⁻⁶.
-    - **What a smaller t would sharpen is the stationarity certificate, not the image.** The theory is a limit t → 0 with tolerances o(t) (Kanzow–Schwartz; `endgame_literature.md` §1), which no finite t, and not the √t gate, satisfies exactly. At 10⁻⁴ the certificate is approximate: the residuals and the multiplier classification (`--classify`; S-stationary to solve accuracy except a few clusters, §5).
+    - **What a smaller t would sharpen is the stationarity certificate, not the image.** The theory is a limit t → 0 with tolerances O(t) (Kanzow–Schwartz 2015, Thm 2 of the published version, under MPEC-MFCQ; `endgame_literature.md` §1), which no finite t, and not the √t gate, satisfies exactly. At 10⁻⁴ the certificate is approximate: the residuals and the multiplier classification (`--classify`; S-stationary to solve accuracy except a few clusters, §5).
     - **The runs below at t ≈ 10⁻⁶ therefore probe the method's limits, not the operating point.**
 
   - **Slowing μ, or lowering t only on solved barrier problems, is worse** (IPM its (+ restoration its), 600 = iteration limit):
@@ -407,8 +427,180 @@ Both stop at the level gate (t = 10⁻⁴); the 16×16 log is bit-identical on 4
   - **What is left at N=1024 is MUMPS:** the live heap after 5 iterations is 185 MB of the 2 GB footprint; the rest is MUMPS's factors and its workspace during factorization (64×64-pixel tiles, t_k ≈ 70k). The ordering is what sets the factor size; this MUMPS build uses AMD whatever ICNTL(7) asks for, so a MUMPS with METIS is the next thing to try.
   - **Peak RSS is not a reliable measure here.** Under memory pressure macOS compresses pages, which RSS does not count: at N=1024 the peak RSS of the same binary varied between 1.3 and 1.7 GB. The footprint above does count them.
 
+## tv_learn: weight maps, other operators, datasets
+
+`tv_learn` learns the weight of the lower level
+
+  u_s(α) = argmin_u ½uᵀA_s u − F_sᵀu + Σ_e α_e |(K_ξ u)_e|
+
+over training images s = 1..S, minimizing the mean (`--loss mean`, the default) or the sum of ½‖u_s − u_clean,s‖². The upper level is that of `tv_dd`, generalized in three ways.
+
+- **α on blocks** (`--block B`): α_e is constant on B×B blocks of cells and shared by all images; B = 0 (default) is one scalar.
+  - With B ≥ 2 the tile cuts move to the nearest multiple of B, so no tile cuts a block.
+  - B = 1 on one image is ill-posed (one weight per cell), so expect over-fitting.
+  - The ridge is ½·10⁻⁴‖α‖², as for the scalar. There is no smoothness penalty between blocks yet: it would make every block on a tile edge a consensus variable.
+- **Operators** (`--op`, `operators.hpp`):
+  - `denoise`: A = I, F = f.
+  - `inpaint`: A = diag(m + ε(1−m)), F = m∘f + ε(1−m)·f̄. Here m is the random mask of observed pixels (`--mask-frac` missing), f̄ the mean of the observed values and ε = `--mask-eps` (10⁻³). The ε term keeps the lower level strongly convex on the holes.
+  - `deblur`: A = CᵀC, F = Cᵀf, with C a Gaussian blur (`--blur-sigma`) truncated at w = ⌈2σ_b⌉ and reflected at the border.
+- **Directional TV** (`--reg dtv`): K_ξ = M_e·K with M_e = I − γξξᵀ and ξ = ∇v/√(|∇v|² + η²), where v is a smoothed guide.
+  - The guide comes from `--guide clean|data` (default `clean`, an oracle). Held-out images always use their data.
+
+### The formulation
+
+The weight stays where `tv_mpcc.hpp` has it: h1 = A u − F + K_ξᵀ(α∘q), with δ ∈ [0, 1] and the product r(1 − δ) ≤ t. So with one image, A = I, K and one block, the NLP **is** `TvMpcc`'s, in the same order (variables, rows, nonzeros, and the order of every floating-point sum).
+
+Scaling the dual instead (p = αq, which takes α out of h1) was considered and left out:
+- it would make the h3 residuals O(α), so the gate inf_pr ≤ √t would be about 14× looser;
+- it would need the continuation re-validated.
+
+### Sharing
+
+Which tiles read what follows from the stencils (`tiles_of_u`, `tiles_of_q`, `LearnPartition::alpha_tiles`):
+- **u:** the h2 cells, as before. With a blur, also every h1 row within R = 2w nodes, so the border becomes a band 4w wide and tiles must be at least 4w cells wide.
+- **q:** for DTV, the three nodes of its cell for both components.
+- **α_b:** the nodes next to the block, in every image. A block inside one tile is a tile variable; any other block is a consensus variable with a copy per tile.
+
+Tile ids are image-major (s·k² + tile). The construction checks that no row reads a variable of another tile.
+
+### Checks (laptop, 2026-10-08)
+
+**Against `tv_dd`.** `tv_learn` with `--start uniform` (and the other defaults) is bit-identical to `tv_dd` in the whole iteration log, status, iterations, α\* and PSNR:
+- cameraman N=32 2×2, 4×4, 8×8; N=48 4×4; mariposa N=32, 48 4×4 (1 and 3 ranks);
+- cameraman N=128 8×8 (8 ranks).
+
+**Identity cases.** These are also bit-identical to plain denoising:
+- an inpainting mask with no holes and ε = 0;
+- a blur of radius 0;
+- one block covering the image (`--nsub 1 --block 31`).
+
+**Derivatives.** `--check-derivatives` (central differences on every column, plus Hessian directions) gives relative errors ≤ 3·10⁻⁹ for blocks (B = 1, 3, 4, 8), inpainting, deblurring, DTV and their combinations.
+
+**Rank independence.** Runs are bit-identical for any number of ranks:
+- a block map (cameraman N=33, 4×4 tiles, B = 8: 1, 2, 4 ranks);
+- a dataset (S = 3, 3×3 tiles each, B = 16: 1, 2, 5 ranks, where ranks hold tiles of two images).
+
+**Lower level.** Every run reports max|u_s − u_PDHG(α\*)|, the MPCC's u against the lower level solved at the learned map. It is ≤ 8·10⁻³ (√t = 10⁻²) in the runs below, except inpainting: 1.6·10⁻², where the holes are conditioned by ε = 10⁻³.
+
+| instance (4 ranks, 4×4 tiles) | its | α\* | PSNR f → u | note |
+|---|---|---|---|---|
+| cameraman N=33, scalar / B=8 / B=4 | 23 / 49 / 49 | 0.0687 / mean 0.0793 / mean 0.0841 | 20.16 → 25.53 / 25.95 / 26.52 dB | training PSNR grows with the blocks |
+| phantom N=64, B=8 (σ=0.1) | 98 | blocks 0.069–0.116 | 20.37 → 30.86 dB | flat blocks 0.082, blocks with an edge 0.075 on average |
+| cameraman N=64, TV | 45 | 0.0700 | 20.39 → 27.00 dB | p = 748 |
+| cameraman N=64, DTV, guide data / clean | 31 / 153 | 0.0765 / 0.0749 | 27.07 / 28.05 dB | `clean` is an oracle |
+| cameraman N=64, inpaint 30%, σ=0.05 | 27 | 0.0343 | 9.84 → 27.37 dB | f = 0 on the holes |
+| cameraman N=64, deblur σ_b=1, σ=0.02 | 74 | 0.0106 | 25.29 → 27.54 dB | p = 2875: the band of CᵀC |
+| cameraman, mariposa, phantom N=49, B=16; held out: mariposa, phantom | 24 | 0.069–0.072 | train 26.80, held-out 26.60 dB | `plot_dataset.py` reads the report |
+
+**Two copies of one image.** With the same noise and the mean loss, two copies give α\* = 0.070133, against 0.070181 for the image alone. This is not bitwise, nor should it be: the barrier terms of the image variables double while that of α does not, so the central path differs.
+
+**DTV with γ = 0** gives α\* = 0.070165 against TV's 0.070181 (N=48). Its stencil keeps structural zeros and its warm start is PDHG, so it is not bit-identical either.
+
+### Running it
+
+```bash
+TARGETS=tv_learn MPI=1 ./build.sh          # leaves tv_dd as it is
+mpirun -np 4 ./tv_learn --size 64 --nsub 4 --block 8
+mpirun -np 4 ./tv_learn --size 64 --nsub 4 --op deblur --blur-sigma 1 --sigma 0.02
+mpirun -np 4 ./tv_learn --train kodak/train.txt --val kodak/val.txt --size 64 --nsub 2 \
+    --save-report run/reports/report_k.json --save-solution run/sols/sol_k --tag k
+(cd ../python && uv run python plot_dataset.py --run ../cpp/run/reports/report_k.json)
+```
+
+**Data.** `--train` / `--val` take a folder (sorted), a `.txt` manifest (one path per line) or one image; `--skip/--stride/--limit` select from the training list.
+- Prepared sets live in `../images/<set>/` with `train.txt` and `val.txt`. The PNGs stay out of git; the lists are tracked.
+  - `kodak`: train kodim01–16, held out 17–24.
+  - `bsds64`: BSDS500 crops from `../python/make_datasets.py bsds`; 400 train (BSD400), 100 held out (the val folder, which contains BSD68).
+  - `cartoon64`: the Google Cartoon Set 10k from `make_datasets.py cartoon` (CC BY 4.0); 1000 train, 500 held out, composited on white.
+- The raw archives sit in `../images/` and are unpacked into `../images/raw/`, both ignored by git.
+- `./run_dataset.sh SET SIZE [options]` runs a set and draws its figures (`./run_kodak.sh SIZE` = `run_dataset.sh kodak`). Each run goes to `../results/tvlearn_<SET>_N<SIZE>_<options>/`, never over an existing one unless `FORCE=1`.
+- Training image i has noise seed `--seed` + i.
+- Held-out image i has seed + 10⁶ + i.
+- The mask seed is `--mask-seed` + the image's seed.
+
+**The start (two stages by default; see "The two-stage method" below).** `--start smoothed`: stage 1 runs the smoothed bilevel method (`smoothed.hpp`) on the same block map, and stage 2 the MPCC from its result. `--start uniform` is `tv_dd --start uniform` (the uniform weight `--alpha0`, Chambolle–Pock with A = I and TV, else `pdhg.hpp` to `--warm-tol`), and the only start that reproduces `tv_dd` bit for bit with `tv_learn`'s other defaults; `--alpha-init FILE` starts from a given map (lower levels by PDHG).
+
+**Held-out images** are evaluated by `pdhg.hpp` at the learned map; so are the training images, as the lower-level check.
+
+**Outputs.**
+- `--save-solution`: one `.npz` per image (`_s000` training, `_v000` held-out; one image: the file itself) with `plot_slurm.py`'s keys plus `alpha_map`, `mask`, `block`, `op`.
+- `--save-report`: the JSON `plot_dataset.py` reads.
+- The CSV line has `tv_dd`'s fields (α = the map's mean, PSNR = training means) plus `S, op, dtv, block, n_alpha, psnr_val`.
+- `tv_learn.slurm` runs it on the cluster.
+
+**End-game tools.** `--follow-comp` is on by default in both `tv_dd` and `tv_learn`; `--endgame-diag` and `--freeze-xi` are `tv_learn` only.
+- `--endgame-diag FILE` (read-only; the run is unchanged). Each iteration prints one `[du]` line: where the dual residual sits, on the cells or off them (u, α, copies), with the cell and entry that hold its maximum, the number of cells above √t, and the cell with the largest ξ. At the end, FILE gets the last iteration's per-cell record as CSV: r, w = 1 − δ, ξ, a, b, γ, ν, the cell's residual and its entry, t_e.
+- `--freeze-xi X` (opt-in; off by default; `--freeze-persist 3`). A cell whose ξ has stayed ≥ X for 3 iterations while t > t_min keeps that iteration's t in its product row, r(1 − δ) ≤ t_e, while t falls elsewhere. At the moment of freezing t_e = t, so the problem does not jump. The report prints the number of frozen cells and the range of their t_e. See "The end game at t_min = 10⁻⁵" in `endgame_literature.md` §11.
+- `--follow-comp K` (default 3; 0: off; `--freeze-xi` turns it off, and the two cannot be asked for together). A cell is locked when, K iterations in a row, its product row is violated, ξ rises, the product does not fall and t has not moved. Its t_e is then set to r(1 − δ) − s, so its row holds at the current point, and afterwards only lowered, following the product; the cell is released once t_e ≤ t. The report prints the raises and the cells still above t at the end, with their largest t_e. On cameraman N=128 scalar at t_min = 10⁻⁵ it passes the gate for K = 2, 3 and 5 (199–544 iterations instead of the 3000-iteration limit), leaving 25–31 cells at t_e ≤ 2.5·10⁻⁴. The test is armed only after μ and t have not moved for `--follow-stall 20` iterations; unarmed, it fired on runs that converge anyway (mariposa 8×8: 212 cells left at up to 2.2·10⁻³). Armed (K = 3), it passes cameraman N=128 scalar at t_min = 10⁻⁵ in 179 iterations instead of the 3000-iteration limit, with 36 cells left at t_e ≤ 2.1·10⁻⁴, and leaves the six instances that converge anyway unchanged or nearly so. K = 5 is too slow. On the other stalling runs (cameraman N=64 at t_min = 10⁻⁶, mariposa N=128, cameraman N=256; all fail at the defaults) it passes the gate in 244–559 iterations with an equal or lower exact loss, leaving 49–399 cells at t_e ≤ 2.3·10⁻⁴; runs that do not stall are unchanged. The default since 2026-10-11 (`endgame_literature.md` §11, steps 3–5). A followed cell's certificate holds at its own t_e, not at t_min: the report's `followed cells` line gives how many are left and their largest t_e, to be reported with the S/M/C classes.
+
+**Baselines** (one rank; no MPCC solve). Both print the result's upper-level loss with the *exact* TV lower level (`pdhg.hpp`), training and held-out PSNR and SSIM, and a `CSV-GRID` / `CSV-SMOOTH` line; the MPCC run prints the same exact loss (`upper-level loss: ... with the exact lower level at alpha*`), so the three are compared on one objective.
+- `--grid A0:A1:N`: N log-spaced scalar weights, each image's lower level solved by PDHG; the best weight by the training loss.
+- `--smoothed G` (`smoothed.hpp`): the standard smoothed bilevel method. Huber-TV lower level with parameter G by Newton (sparse LDLᵀ of A + K_ξᵀDK_ξ), gradient by the adjoint equation with the same factorization (checked against central differences: relative error ≤ 2·10⁻⁵), projected L-BFGS on α ≥ 0. Same operators, blocks and ridge as the MPCC. `--smoothed-tol 1e-6`, `--smoothed-iters 100`.
+- First comparison, cameraman N=64: scalar weight, the three agree (α\* 0.07001 MPCC, 0.06984 grid, 0.07036 / 0.06991 / 0.07001 smoothed with G = 10⁻² / 10⁻³ / 10⁻⁴; exact loss 4.09057–4.09068, the MPCC lowest). 8×8 blocks: the smoothed method (G = 10⁻³) reaches an exact loss of 3.4948, the MPCC 3.5715 (default gate), 3.5266 (dual gate at 10⁻²·√t) and 3.5257 (t_min = 10⁻⁶, iteration limit): a different, worse stationary point of the nonconvex problem.
+- The table that set the default (2026-10-09; smoothed ≤ 400 iterations, "from smoothed": `--alpha-init` with the map and a PDHG start; "tight": `--gate kkt --gate-scale 0.01`), cameraman 8×8 / 4×4 / 16×16, mariposa 8×8, phantom 8×8, BSDS 16 images 8×8: MPCC from the uniform start 3.5715 / 3.1323 / 3.8611 / 5.2607 / 1.6685 / 4.1745, smoothed 3.4948 / 2.9070 / 3.7816 / 4.9057 / 1.4117 / 4.1458, MPCC from smoothed 3.4950 / 2.9065 / 3.7822 / 4.9058 / 1.4113 / 4.1463, + tight gate 3.4938 / 2.9048 / 3.7819 / 4.9053 / 1.4108 / 4.1460. Superseded by the two-stage table below.
+
+### The two-stage method
+
+The upper level is nonconvex, and the MPCC is a local method: from a uniform weight it reaches a strongly stationary point of that weight's basin, which on block weights is a worse one. The method is therefore a hybrid (decided 2026-10-10, and so presented in the paper):
+
+- **Stage 1 explores** (`smoothed.hpp`): Huber-TV lower level (`--start-gamma 1e-3`) by Newton, the gradient by the adjoint, projected L-BFGS on α ≥ 0 from the uniform `--alpha0`. It stops on its convergence tests: the projected gradient below 10⁻⁶ of its first value, J falling by less than `--start-ftol 1e-9` (relative) over 5 iterations, or a line search at the precision of J. `--start-iters 1000` is only a safeguard. Before 2026-10-11 the cap was 100, which bound on every block instance and once left stage 1 in a worse basin (mariposa 8×8: final exact loss 4.9055 against 4.9042 from the converged stage 1).
+  - Its last lower-level solutions are the MPCC's start, lifted directly: u, the Huber dual q = K_ξu / max(γ, |K_ξu|) (so h1 holds to Newton's tolerance and |q| ≤ 1), r = |K_ξu|, δ = |q|, θ from q, α the stage-1 map. No PDHG or Chambolle–Pock solve.
+  - In `tv_learn` stage 1 runs on every rank with the images split over the ranks (contiguous blocks, per-image parts summed in image order: the same bits for any number of ranks). 16 BSDS images 8×8: 6.56 / 4.20 / 2.36 / 1.53 s on 1 / 2 / 4 / 8 ranks (4.3×). `tv_dd` runs it on rank 0 and broadcasts the weight and the fields.
+  - The Hessian pattern is fixed (explicit zeros keep 4 entries per cell), so it is analysed once per image.
+  - Its Huber function is Definition 1 of De los Reyes–Valkonen (*The structure of optimal parameters*, and Def. 2.1 of the TGV paper) with the reciprocal parameter: `--start-gamma` γ̂ is their 1/γ (γ̂ = 10⁻³ is their γ = 1000).
+  - The Hessian H = A + K_ξᵀDK_ξ is refilled in place (2026-10-12): its pattern, A's and a 3×3 block per cell, is fixed once, then each Newton iteration writes the values (H equals the old A + KᵀDK by products to 1.7·10⁻¹⁶ relative, for denoise, DTV and deblur; the stage-1 path changes at roundoff, e.g. cameraman 8×8: 252 instead of 256 iterations, final exact loss 3.493626 against 3.493737). Stage 1 alone, one rank, 30 iterations, 8×8 blocks, peak memory before → after: N = 128 59 → 51 MB (MUMPS), 41 → 33 (CG); 256 174 → 156, 89 → 66; 512 654 → 590, 270 → 204. The assembly time (in "factorizations") with CG: N = 512 40 → 3.4 s, 256 6.2 → 0.4 s.
+  - `--start-newton pd` (2026-10-12): the same solutions (to 10⁻¹¹–10⁻¹⁶) and the same gradient (to 10⁻¹³; at convergence the dual is reset to ψ(u), so the adjoint uses the exact Hessian). Cold solves at N = 64, α = 0.07, primal → pd Newton iterations: denoise 22/54/143 → 9/14/21 for γ̂ = 10⁻²/10⁻³/10⁻⁴, DTV 21/61/116 → 9/14/19, deblur 76/209/300 → 15/20/23. Stage 1 at N = 256, 30 iterations (the same α): 594 → 233 Newton iterations with MUMPS, 631 → 332 with CG. It does not change the L-BFGS tail (the cost of cameraman 4×4), and the stage-1 path differs (cameraman 8×8: 336 against 252 iterations; final exact loss 3.493633 against 3.493626).
+  - Its Newton systems (`--start-solver`): `eigen` (sparse LDLᵀ), `mumps` (positive definite; `auto` for N ≥ 128), or, in `tv_learn`, `pcg-jacobi` / `pcg-ic` (Newton–CG with inexact directions, forcing η = min(0.1, √‖∇E‖)). Stage 1 alone (`--stage1-only`), one denoised image, MUMPS against Newton–CG with Jacobi: N = 128 1.6 / 1.4 s, 256 9.9 / 3.4 s, 512 67 / 15 s (peak memory 654 / 273 MB). Deblurring is slower (N = 128: 244 / 54 s; N = 256 with CG failed in its first evaluation), and inpainting from u = f has lower-level failures (8–32 per run at N = 256).
+- **Stage 2 refines and certifies**: the MPCC on the exact TV lower level. It removes the smoothing bias, lowers the exact loss in every instance below, and gives the multipliers and the S/M/C classes of the biactive cells (`--classify`). Use `--gate kkt` for that certificate.
+
+Measured 2026-10-10 (N = 64, σ = 0.1, 4×4 tiles per image, BSDS one tile per image; 4 ranks; `--gate kkt --classify`; exact upper-level loss; times in s):
+
+| instance | MPCC alone (`--start uniform`): loss, its, time | stage 1 alone (`--smoothed 1e-3 --smoothed-iters 100`, 1 rank): loss, time | two stages: loss, MPCC its, stage 1 + 2 | biactive S / M / C (two stages; MPCC alone) |
+|---|---|---|---|---|
+| cameraman scalar | 4.090574, 45, 0.63 | 4.090591, 0.35 | **4.090573**, 37, 0.37 + 0.37 | 1301 / 148 / 66; 1260 / 169 / 81 |
+| cameraman 4×4 | 3.09280, 94, 1.16 | 2.91336, 1.80 | **2.90511**, 42, 1.87 + 0.51 | 1044 / 145 / 77; 1401 / 1 / 0 |
+| cameraman 8×8 | 3.57184, 92, 1.30 | 3.49474, 1.48 | **3.49397**, 33, 1.58 + 0.37 | 1020 / 181 / 71; 1359 / 57 / 6 |
+| cameraman 16×16 | 3.83105, 94, 1.17 | 3.78160, 1.12 | **3.78154**, 36, 1.20 + 0.38 | 1336 / 14 / 1; 1459 / 11 / 0 |
+| mariposa 8×8 | 5.03412, 178, 2.19 | 4.90617, 1.83 | **4.90548**, 31, 1.91 + 0.35 | 762 / 169 / 84; 1090 / 3 / 1 |
+| phantom 8×8 | 1.64198, 107, 1.26 | 1.41166, 1.29 | **1.41072**, 123, 1.32 + 1.47 | 650 / 4 / 4; 1370 / 0 / 0 |
+| BSDS 16 images 8×8 | 4.17362, 88, 21.80 | 4.1457788, 6.81 | **4.1457770**, 39, 1.84 + 6.18 | 23538 / 283 / 3; 23719 / 313 / 8 |
+
+- The two stages give the lowest exact loss everywhere. Over stage 1 alone the gain is small (0.0004–0.28%; PSNR the same to 0.01 dB): what stage 2 adds is exactness and the certificate. Over the MPCC alone it is 0.7–16% on block weights.
+- MPCC iterations fall from 88–178 to 31–42 (phantom: 123 against 107).
+- On one 64×64 image stage 1 is the larger part (1.2–1.9 s against about 0.4 s); on 16 images the MPCC is (1.8 against 6.2 s), and the two stages take less time in total than the MPCC alone (8.0 against 21.8 s).
+
+**At the defaults since 2026-10-11** (stage 1 to convergence, t_min = 10⁻⁵; `--gate kkt --classify`, 4 ranks, one run at a time; exact loss with `--rof-iters 200000`, which equals 2M. The default 20k under-converges PDHG on cameraman block maps by up to 2·10⁻⁴ in the loss.) Columns: smoothed γ = 10⁻³ / 10⁻⁴ (converged, 1 rank) / two stages, then MPCC iterations, stage 1 + 2 in s, biactive S/M/C at ε = √t:
+
+| instance | sm. 1e-3 | sm. 1e-4 | two stages | its | s | S/M/C |
+|---|---|---|---|---|---|---|
+| cameraman scalar | 4.0905911 | 4.0905744 | **4.0905736** | 57 | 0.5 + 0.8 | 214/0/0 |
+| cameraman 4×4 | 2.906797 | 2.906294 | **2.902742** | 58 | 24.6 (cap) + 1.4 | 188/5/5 |
+| cameraman 8×8 | 3.494887 | 3.493984 | **3.493737** | 86 | 5.6 + 1.8 | 196/0/0 |
+| mariposa 8×8 | 4.905732 | **4.904316** | 4.905113 | 46 | 9.9 + 1.0 | 120/0/0 |
+| BSDS 16 crops 8×8 | 4.1457788 | **4.1456925** | 4.1462153 | 97 (1 restoration) | 3.4 + 36.1 | 2525/0/0 |
+| cameraman N=128 scalar | | | 14.77083 | **3000, gate not passed** | 3.6 + 1693 | 833/0/0 |
+| cameraman N=128 8×8 | | | 11.93479 | 200 | 146 (cap) + 36 | 935/0/0 |
+
+- The certificate holds at 10⁻⁵ everywhere except cameraman 4×4. The exact loss is within ±0.02% of the best smoothed point (lower on 3 of 5); PSNR is equal to 0.01 dB.
+- **t_min = 10⁻⁵ breaks the end game on cameraman N=128 scalar**: δ > 0 in 2952 of 3000 iterations, 210 failed line searches each followed by a restoration phase, inf_du never ≤ √t. At 10⁻⁴ the same run takes 39 iterations. See "Known limitations". With `--follow-comp 3` (now the default) it passes the gate in 179 iterations, 36 cells left at t_e ≤ 2.1·10⁻⁴ (see "End-game tools").
+
+**Alternatives for the start, tried and not kept** (2026-10-09/10; the options still exist):
+- `--start scalar`: stage 1 on one weight, which then starts every block. Cheaper stage 1 (0.3–1.6 s), but the MPCC ends between the uniform and the two-stage results (cameraman 8×8: 3.5706; mariposa 8×8: 5.0490).
+- `--start ipm`: the smoothed problem solved by this IPM in the lifted variables, q = h(K u) with h the C¹ Huber clipping (`--start-gamma`, `--start-tol`); also the polar and the Cartesian √ smoothings before it. With γ = 10⁻³ it reached the 3000-iteration limit; it converges for γ ≥ 0.03, but the MPCC then ends worse (cameraman 8×8 / 4×4 / 16×16, mariposa: 3.649 / 2.992 / 4.739 / 4.996).
+- `--start ipm` with other Huber forms (`--start-huber`, 2026-10-12; cameraman 64×64 8×8, exact loss after stage 2, against 3.4936 for the two stages). Every one reached the 3000-iteration limit in stage 1 (35–468 restoration phases entered): c2 6.724 (γ̂ = 10⁻²) / 3.802 (10⁻³); c1 3.505 / 3.682; dual 3.509 / 4.753; dualproj 3.501 / **3.49366** (stage 2 in 103 iterations, the basin of the two stages). So the C² Huber's second derivative (−c³ = −10⁹ at γ̂ = 10⁻³ in the band of width γ̂²) is not what stops it, and the README's earlier "converges for γ ≥ 0.03" does not reach 10⁻². The projected Jacobian is the only form that finds the basin; it still does not converge. An explicit ball |q|² ≤ 1 with the dual rows was not tried: it is implied by the rows, active wherever |Ku| > γ, and fails LICQ and MFCQ there.
+- `--start ipm --start-ipm-init smoothed` (2026-10-12, same instance): stage 1 from the smoothed lower level at α₀, inf_pr 2·10⁻¹⁴. The first step, accepted by the filter (θ_max = 10⁴ from a feasible point), puts inf_pr back to 2 (Huber rows) or 12–100 (dual rows); every run again reached 3000 iterations. Loss after stage 2, γ̂ = 10⁻² / 10⁻³: c1 4.099 / 83 821 (α diverged), c2 stopped by hand (stalled at steps of 10⁻⁷) / 3.528, dual 3.533 / 3.695, dualproj 3.515 / 3.49389. The infeasible start is not the cause; the full steps far outside the region of width about γ where the linearization holds are. Not tried: `--max-soc`, a smaller θ_max.
+- `--start interior` (`--t0`): the start of the earlier MPCC codes (`bimpcc`): u = f, q = 0, δ = 0, r = |Ku|, θ the angle of Ku, a large first t. With `--t0` 1 (the default t) or 1000 it reached the iteration limit in 10 of 12 runs, α unbounded (up to 4·10⁵) or collapsing to 0; the two runs that reached the gate are useless (cameraman 4×4: 4.091, the scalar loss; BSDS: 18.7, α ≈ 0.001).
+- A PDHG warm start of stage 1's Newton solves: rejected (a warm start for the warm start); stage 1 is made faster by its own solvers instead.
+- Lower first μ (< 0.1), a slower t continuation, a tighter first t, a larger Huber γ in stage 1: no better or worse.
+- Continuation in stage 1's γ (`--start-gamma0 G`, `--start-gamma-rate 0.1`, `--start-gamma-sigma 0.1`; Hintermüller–Wu 2015, Alg. 6.2), 2026-10-12. Cameraman 4×4, stage 1 alone, 1000 iterations each: from 10⁻¹ with σ = 0.1 it never left γ = 10⁻² (J and the projected gradient crawl there as at 10⁻³); with σ = 1, from 10⁻² / 10⁻¹, J = 2.91027 / 2.91111 in 30.4 / 26.7 s, against 2.91057 in 33.3 s at a fixed 10⁻³. The cost is not the small γ: at every γ, J is within 0.05% of its final value by iteration 200, and then L-BFGS crawls with the projected gradient at 5–10% of its first value. The large-γ weights are also larger (mean 0.28, max 1.23 at 10⁻², against 0.105 / 0.40), so a coarse level does not start the next one close.
+
+**Limits.**
+- The warm start is computed for every image on every rank, because consensus variables are held everywhere.
+- A scalar α shared by more than about 1000 tiles makes the S̃_k exchange O(K²) (`plan_exchange_S`).
+
 ## Known limitations
 
+- **The end game at t_min = 10⁻⁵ (the default since 2026-10-11) can fail to pass the dual gate.** Cameraman N=128 scalar: 3000 iterations, 210 restoration phases, 1693 s (39 iterations at 10⁻⁴); cameraman N=64 scalar at 10⁻⁶: 1685 iterations, 183 phases. The weight is right in both; the iterate cannot bring inf_du below √t. The cause is a few branch-locked cells (product row violated, ξ rising at a fixed t); `--follow-comp 3`, now the default, gives them their own t_e and passes the gate on all four stalling runs measured (179–559 iterations), at the price of 36–399 cells whose certificate holds only at t_e ≤ 2.3·10⁻⁴ (see "End-game tools").
 - **Nonconvex instances:** the stationary point reached can depend on details: the initial multipliers, the line search, the host (mariposa).
 - **The restoration phase is simpler than IPOPT's.** Its proximity term ζ is fixed for the whole phase (IPOPT ties it to the phase's μ), its slacks have no proximity term, and it does not recurse: a failed line search inside the phase takes the full step.
 - **MUMPS is serialized** within one process (its C interface is not thread-safe). Parallel tile factorizations come from MPI ranks.

@@ -61,7 +61,7 @@ def solution_paths(rep, sols_dir=None):
     """Locate the per-pair solution files belonging to a report.
 
     The driver writes ``<prefix>_s%03d.txt`` for training pairs and
-    ``<prefix>_v%03d.txt`` for held-out ones. The report does not record the
+    ``<prefix>_v%03d.txt`` for held-out ones (``cpp/tv_learn``: ``.npz``). The report does not record the
     prefix (it need not know where the caller put them), so match on the tag:
     ``sol_<tag>_s000.txt`` is what the SLURM script produces.
     """
@@ -71,7 +71,7 @@ def solution_paths(rep, sols_dir=None):
     if not os.path.isdir(sols_dir):
         return out
     for role, suf in (("train", "s"), ("val", "v")):
-        pat = os.path.join(sols_dir, f"*{rep['tag']}_{suf}[0-9][0-9][0-9].txt")
+        pat = os.path.join(sols_dir, f"*{rep['tag']}_{suf}[0-9][0-9][0-9].*")
         out[role] = sorted(glob.glob(pat))
     return out
 
@@ -280,6 +280,78 @@ def fig_contact(rep, sols, out_base, fmt, max_pairs=8, diff="error"):
               + ", ".join(os.path.basename(p) for p in dropped))
 
 
+def fig_alpha(rep, sols, out_base, fmt):
+    """The learned weight map of a ``tv_learn --block B`` run (``cpp/tv_learn``).
+
+    Left: α* per B×B block of cells, on a one-hue sequential scale from the
+    smallest to the largest block value, each block labelled with its value in
+    units of 10^e (two digits before the point) while the blocks are wide
+    enough to hold a label (up to ~12 per side). A nearly flat map therefore still
+    shows its pattern; the title gives the range, so the spread reads in units
+    of α. Right: the first training image with the block grid, to place the
+    blocks (the map is shared by every image of the run).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    a = np.asarray(rep.get("alpha_blocks", []), dtype=float)
+    B, N = int(rep.get("block", 0)), int(rep["N"])
+    nc = N - 1
+    nb = -(-nc // B) if B >= 1 else 1
+    if B < 1 or a.size != nb * nb or a.size < 2:
+        return False
+    grid = a.reshape(nb, nb)
+    edges = np.minimum(np.arange(nb + 1) * B, nc)
+
+    first = (sols["train"] or sols["val"] or [None])[0]
+    img = parse_solution(first)["u_clean"].reshape(N, N) if first else None
+    ncols = 2 if img is not None else 1
+    fig, axes = plt.subplots(1, ncols, figsize=ps.figure_size("twocol", aspect=0.42),
+                             squeeze=False, constrained_layout=True)
+    ax = axes[0][0]
+    # Labels in units of 10^e with two digits before the point (0.0713 → 71.3
+    # for e = -3): the leading "0.0" carries nothing, and a 4-character label
+    # fits a block down to ~16 pt wide.  The font follows the block size.
+    e = int(np.floor(np.log10(np.abs(grid).max()))) - 1
+    shown = grid / 10.0 ** e
+    norm = Normalize(vmin=shown.min(), vmax=shown.max())
+    cmap = plt.get_cmap("Blues")
+    mesh = ax.pcolormesh(edges, edges, shown, cmap=cmap, norm=norm,
+                         edgecolors="white", linewidth=1.0)
+    ax.set_xlim(0, nc); ax.set_ylim(nc, 0); ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    cell_pt = 0.4 * ps.TWO_COLUMN_WIDTH * 72 / nb   # approximate block width in points
+    if cell_pt >= 15:
+        fs = min(7.5, cell_pt / 3.2)
+        for i in range(nb):
+            for j in range(nb):
+                v = shown[i, j]
+                ink = "white" if norm(v) > 0.6 else ps.PALETTE["ink"]
+                ax.text((edges[j] + edges[j + 1]) / 2, (edges[i] + edges[i + 1]) / 2,
+                        f"{v:.1f}", ha="center", va="center", fontsize=fs, color=ink)
+    unit = f"$\\times 10^{{{e}}}$"
+    cb = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.02)
+    cb.set_label(f"$\\alpha^*$ ({unit})", fontsize=7)
+    cb.ax.tick_params(labelsize=6)
+    ax.set_title(f"$\\alpha^*$ ({unit}) on {B}×{B} blocks: {shown.min():.2f} – {shown.max():.2f}"
+                 f" (mean {shown.mean():.2f})", fontsize=7)
+    if img is not None:
+        ax2 = axes[0][1]
+        ax2.imshow(img, cmap="gray", vmin=0, vmax=1, interpolation="nearest",
+                   extent=(0, N, N, 0))
+        for e in edges[1:-1]:
+            ax2.axhline(e, color=ps.PALETTE["orange"], lw=0.6, alpha=0.8)
+            ax2.axvline(e, color=ps.PALETTE["orange"], lw=0.6, alpha=0.8)
+        ax2.set_xticks([]); ax2.set_yticks([])
+        role = "train" if sols["train"] else "val"
+        name = _col_path(rep, role, 0, [(role, None)])
+        ax2.set_title(f"block grid on {_short(name, 24)}", fontsize=7)
+    fig.suptitle(f"{rep['tag']}   S={rep['S']}  N={N}", fontsize=8)
+    ps.savefig(fig, out_base, fmt)
+    ps.close(fig)
+    return True
+
+
 def _col_path(rep, role, j, parsed):
     """Pair name for column j: the report's per-role order matches the files."""
     same = [p for p in rep["pairs"] if p["role"] == role]
@@ -312,6 +384,8 @@ def run_single(rep, out_dir, fmt, max_pairs, diff, sols_dir):
     else:
         print("    no solution files found — skipping contact sheet and "
               "continuation (pass --sols, or re-run with --save-solution)")
+    # the weight map of a block run (no figure for a scalar: it is in every title)
+    fig_alpha(rep, sols, os.path.join(out_dir, f"{tag}_alpha"), fmt)
 
 
 # --------------------------------------------------------------------------

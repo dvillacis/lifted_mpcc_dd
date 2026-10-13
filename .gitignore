@@ -57,3 +57,12 @@ python/*.png
 !archive/cpp/data/*.txt
 
 runs/sols
+
+# Downloaded datasets (python/make_datasets.py): the raw archives and their
+# contents stay local; the prepared images/<set>/*.png are ignored by *.png,
+# only their train/val lists are tracked.
+images/*.tgz
+images/raw/
+images/kodak
+images/cartoon64
+images/bsds64
