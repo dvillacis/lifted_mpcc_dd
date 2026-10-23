@@ -867,6 +867,8 @@ public:
          int nback = 0;
          char ltype = ' ';
          bool restored = false;
+         const bool curv = nlp.curvilinear();
+         bool curved = false;
          if (o.line_search) {
             const double th0 = theta_of(A), ph0 = phi_of(p, f);
             if (theta_max < 0.0) {
@@ -957,6 +959,7 @@ public:
             bool accepted = false, ftype = false, soc = false;
             for (;;) {
                for (int i = 0; i < np; ++i) pt[i] = p[i] + alpha * d[i];
+               if (curv) nlp.curve(p.data(), d.data(), alpha, pt.data());
                const double ft = nlp.f(pt.data());
                residual_at(pt, At);
                const double tht = theta_of(At), pht = phi_of(pt, ft);
@@ -973,6 +976,7 @@ public:
             }
             if (accepted) {
                if (!soc) ap = alpha;
+               curved = curv && !soc;   // pt is the accepted trial point
                ltype = soc ? (ftype ? 'F' : 'H') : (ftype ? 'f' : 'h');
                if (!ftype) augment_filter(th0, ph0);
             } else {
@@ -996,7 +1000,8 @@ public:
          }
 
          for (int i = 0; i < np; ++i) {
-            p[i] += ap * d[i];
+            if (curved) p[i] = pt[i];
+            else p[i] += ap * d[i];
             zl[i] += ad * dzl[i];
             zu[i] += ad * dzu[i];
             // keep z within a factor κ_Σ of μ/s (IPOPT's safeguard)

@@ -490,9 +490,97 @@ struct Objective {
       }
       return J;
    }
+   // The Gauss–Newton matrix of J at the α of the last evaluation (row-major nb × nb):
+   //   G = c_S Σ_s S_sᵀS_s + ρ_α I,  S_s = ∂u_s/∂α = −H_s⁻¹ K_ξᵀ diag(ψ_s) B,
+   // B the cell-to-block map; column b of S_s with the factorization left by that
+   // evaluation (nb solves per image).  Summed in image order as J and ∇J.
+   std::vector<double> gauss_newton() {
+      const size_t k = (size_t)nb * nb;
+      std::vector<double> parts((size_t)S * k, 0.0);
+      for (int s = s0; s < s1; ++s) {
+         LowerLevel& L = ll[s];
+         if (!L.factorized) continue;
+         const auto t0 = LowerLevel::Clock::now();
+         const Vec g = L.K * L.u;
+         Eigen::MatrixXd R = Eigen::MatrixXd::Zero(2 * m_q, nb);   // diag(ψ) B
+         for (int e = 0; e < m_q; ++e) {
+            const double den = std::max(gamma, std::hypot(g[e], g[m_q + e]));
+            R(e, blk[e]) = g[e] / den;
+            R(m_q + e, blk[e]) = g[m_q + e] / den;
+         }
+         const Eigen::MatrixXd KR = L.Kt * R;
+         Eigen::MatrixXd Sm(KR.rows(), nb);
+         for (int b = 0; b < nb; ++b) Sm.col(b) = L.hsolve(KR.col(b));
+         const Eigen::MatrixXd Gs = loss_scale * (Sm.transpose() * Sm);
+         std::copy(Gs.data(), Gs.data() + k, &parts[(size_t)s * k]);   // symmetric
+         t_adjoint += LowerLevel::since(t0);
+      }
+      gather(parts, (int)k);
+      std::vector<double> G(k, 0.0);
+      for (int s = 0; s < S; ++s)
+         for (size_t i = 0; i < k; ++i) G[i] += parts[(size_t)s * k + i];
+      for (int b = 0; b < nb; ++b) G[(size_t)b * nb + b] += rho;
+      return G;
+   }
 };
 
-// The smoothed bilevel problem over the training images, from the uniform weight alpha0.
+// min ½dᵀGd + gᵀd subject to a + d ≥ 0 (G positive definite, nb small): the primal
+// active-set method from d = 0, bounds on the cells with a_i = 0 active first.
+inline std::vector<double> box_qp(const std::vector<double>& G, const std::vector<double>& g,
+                                  const std::vector<double>& a) {
+   const int n = (int)g.size();
+   const Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+       Gm(G.data(), n, n);
+   const Eigen::Map<const Vec> gv(g.data(), n);
+   Vec d = Vec::Zero(n);
+   std::vector<char> act(n);
+   for (int i = 0; i < n; ++i) act[i] = a[i] <= 0.0;
+   for (int it = 0; it < 4 * n + 10; ++it) {
+      std::vector<int> F;
+      for (int i = 0; i < n; ++i) if (!act[i]) F.push_back(i);
+      // the minimizer on the free variables, the active ones at their bound −a_i
+      Vec dn = d;
+      for (int i = 0; i < n; ++i) if (act[i]) dn[i] = -a[i];
+      if (!F.empty()) {
+         const int m = (int)F.size();
+         Eigen::MatrixXd GF(m, m);
+         Vec r(m);
+         for (int i = 0; i < m; ++i) {
+            r[i] = -gv[F[i]];
+            for (int j = 0; j < n; ++j) if (act[j]) r[i] -= Gm(F[i], j) * dn[j];
+            for (int j = 0; j < m; ++j) GF(i, j) = Gm(F[i], F[j]);
+         }
+         const Vec x = GF.llt().solve(r);
+         for (int i = 0; i < m; ++i) dn[F[i]] = x[i];
+      }
+      // ratio test: stop at the first bound crossed and fix it
+      double tau = 1.0;
+      int block_i = -1;
+      for (int i : F)
+         if (dn[i] < -a[i] && dn[i] < d[i]) {
+            const double t = (d[i] + a[i]) / (d[i] - dn[i]);
+            if (t < tau) { tau = t; block_i = i; }
+         }
+      d += tau * (dn - d);
+      if (block_i >= 0) {
+         d[block_i] = -a[block_i];
+         act[block_i] = 1;
+         continue;
+      }
+      // the multipliers of the active bounds: release the most negative one
+      const Vec gr = Gm * d + gv;
+      int rel = -1;
+      double most = 0.0;
+      for (int i = 0; i < n; ++i)
+         if (act[i] && gr[i] < most) { most = gr[i]; rel = i; }
+      if (rel < 0) break;
+      act[rel] = 0;
+   }
+   return std::vector<double>(d.data(), d.data() + n);
+}
+
+// The smoothed bilevel problem over the training images, from the uniform weight alpha0,
+// or from a_start (one value per block, projected onto alpha >= 0) when it is given.
 // Continuation in γ (gamma0 > gamma; Hintermüller–Wu 2015, Alg. 6.2): start at gamma0;
 // once |proj grad| <= gamma_sigma·(γ/gamma0)·|proj grad|₀ (or J stalls, or the line
 // search fails) set γ ← max(gamma_rate·γ, gamma), forget the L-BFGS memory and go on
@@ -503,7 +591,8 @@ inline Result solve(const std::vector<Instance>& data, const Blur* blur, const L
                     double tol = 1e-6, int max_iter = 100, double newton_tol = 1e-10,
                     double ftol = 1e-9, int solver = 0, bool dist = false,
                     double gamma0 = 0.0, double gamma_rate = 0.1, double gamma_sigma = 0.1,
-                    bool pd_newton = false) {
+                    bool pd_newton = false, const std::vector<double>& a_start = {},
+                    bool gauss_newton = false) {
    const auto t0 = std::chrono::steady_clock::now();
    const int S = (int)data.size(), nb = part.n_blocks;
    const bool cont = gamma0 > gamma;
@@ -530,7 +619,11 @@ inline Result solve(const std::vector<Instance>& data, const Blur* blur, const L
       for (double x : v) m = std::max(m, std::abs(x));
       return m;
    };
-   std::vector<double> a(nb, alpha0), g;
+   if (!a_start.empty() && (int)a_start.size() != nb)
+      throw std::runtime_error("--start-alpha: " + std::to_string(a_start.size()) +
+                               " values for " + std::to_string(nb) + " blocks");
+   std::vector<double> a = a_start.empty() ? std::vector<double>(nb, alpha0) : a_start, g;
+   project(a);
    double J = evaluate(a, g);
    const double pg0 = std::max(norm_inf(proj_grad(a, g)), 1e-300);
    std::deque<std::vector<double>> Ss, Ys;
@@ -542,8 +635,11 @@ inline Result solve(const std::vector<Instance>& data, const Blur* blur, const L
       if (cont)
          ui::kv("continuation", "gamma from %.0e, x%g once |proj grad| <= %g (gamma/%.0e) x the"
                 " first", gamma0, gamma_rate, gamma_sigma, gamma0);
-      ui::kv("L-BFGS", "projected, to |proj grad| <= %.0e x the first, or J falling by less than"
-             " %.0e (relative) over 5 iterations; at most %d iterations", tol, ftol, max_iter);
+      ui::kv(gauss_newton ? "Gauss-Newton" : "L-BFGS",
+             "%s, to |proj grad| <= %.0e x the first, or J falling by less than"
+             " %.0e (relative) over 5 iterations; at most %d iterations",
+             gauss_newton ? "steps from the box QP with G = c_S sum S'S + rho I" : "projected", tol,
+             ftol, max_iter);
       ui::kv("lower levels", "%sNewton to |grad E| <= %.0e, %s",
              pd_newton ? "primal-dual semismooth " : "", newton_tol,
              solver == 0 ? "Eigen LDL'" : solver == 1 ? "MUMPS"
@@ -649,6 +745,11 @@ inline Result solve(const std::vector<Instance>& data, const Blur* blur, const L
       }
       std::vector<double> d(nb);
       for (int i = 0; i < nb; ++i) d[i] = fr[i] ? -q[i] : 0.0;
+      // Gauss–Newton: the step of the box QP on G at a (the lower levels are at a: a is
+      // the last evaluation, or the first), then the same Armijo backtracking.  (A
+      // Levenberg–Marquardt damping instead of backtracking was tried, 2026-10-17: on
+      // cameraman 4x4 it left for a worse basin and stalled.)
+      if (gauss_newton) d = box_qp(evaluate.gauss_newton(), g, a);
       double gd = 0.0;
       for (int i = 0; i < nb; ++i) gd += g[i] * d[i];
       if (gd >= 0.0) {   // not a descent direction: steepest descent, and forget the memory

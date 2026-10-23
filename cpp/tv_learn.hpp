@@ -61,6 +61,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -101,6 +102,15 @@ public:
    // Hessian ((SSN-3) of De los Reyes et al.; the rows themselves stay exact): the
    // derivatives are then those of an inexact Newton model, not of c
    bool cart_dual_proj = false;
+   // ... or the rows q − h(K_ξu) of cart_c1 / the C² Huber unchanged, with the derivative of
+   // h written with the dual itself (the earlier code, ~/Downloads/bimpcc_2, utils_reg.py):
+   // where h is not linear, ∂h/∂g = φ(I − ĝĝᵀ) + ψ'ĝĝᵀ with φĝĝᵀ = h ĝᵀ/s replaced by
+   // q̄ĝᵀ/s, q̄ = q projected onto |q| ≤ 1 (Hintermüller–Stadler); exact where q = h(g)
+   bool cart_proj = false;
+   // the Hessian of the Lagrangian without the constraints' curvature (the objective's
+   // only: ℓ on u, ρ_α on α); the reduced Hessian is then ‖∂u/∂α·‖² + ρ_α‖·‖², positive
+   // definite, as a quasi-Newton model (the earlier code ran IPOPT with L-BFGS)
+   bool cart_gn = false;
    // q, or its projection onto the unit ball (cart_dual_proj), for the derivatives
    void cart_qbar(const double* x, size_t b, double& qx, double& qy) const {
       qx = x[cells_[b].qx];
@@ -117,6 +127,11 @@ public:
    // M (one of them within τ of 0), C (both < 0), W (the rest), τ = 1e-3·max|γ, ν|;
    // for ε = 3√t and √t.  As tv_mpcc.hpp's classify_point, counted over all ranks.
    bool classify = false;
+   // the lifted start's products r(1 − δ) above 1e-12, one per cell where the exact
+   // complementarity fails (from the smoothed method: its Huber band 0 < |K_ξu| < γ,
+   // up to γ/4; from PDHG: its inexactness), and the number of cells (all images)
+   std::vector<double> start_products;
+   long start_cells = 0;
    struct Classes {
       int iter = -1;
       double eps[2] = {0, 0}, tau = 0, gmin[2] = {0, 0}, nmin[2] = {0, 0}, xiB[2] = {0, 0};
@@ -149,6 +164,14 @@ public:
    // a fixed (μ, t) for hundreds of iterations).
    bool follow = true;
    int follow_persist = 3, follow_stall = 20;
+   // --rho-step (opt-in): curvilinear trial points that move the scaled dual, (Pα)∘δ
+   // and Q(α)q, along the Newton step instead of δ and q.  With w the weight a q (copy
+   // or original) or δ is multiplied by and w⁺ = w + a·dw its trial value,
+   // q ← q + a(w/w⁺)dq and δ ← δ + a(w/w⁺)dδ; δ keeps the straight step where this
+   // would take it within 1% of the bounds 0, 1.  On a flat block the direction
+   // "α up, δ down with (Pα)δ fixed" is then followed exactly.
+   bool rho_step = false;
+   long rho_straight = 0;              // δ entries of trial points that kept the straight step
    long follow_events = 0;             // raises so far (all ranks)
    long follow_now = 0;                // cells with t_e > t at the last iteration
    double follow_tmax = 0.0;           // ... their largest t_e
@@ -238,6 +261,21 @@ public:
    }
 
    void start(double* x) const override { std::copy(x_start.begin(), x_start.end(), x); }
+
+   bool curvilinear() const override { return rho_step && !cart_; }
+   void curve(const double* p, const double* d, double a, double* pt) override {
+      for (const auto& [v, w] : rho_q_) {
+         const double w1 = p[w] + a * d[w];
+         if (w1 > 0.0) pt[v] = p[v] + a * (p[w] / w1) * d[v];
+      }
+      for (const auto& [v, w] : rho_d_) {
+         const double w1 = p[w] + a * d[w];
+         if (w1 <= 0.0) continue;
+         const double dl = p[v] + a * (p[w] / w1) * d[v];
+         if (dl >= 0.01 * p[v] && 1.0 - dl >= 0.01 * (1.0 - p[v])) pt[v] = dl;
+         else ++rho_straight;
+      }
+   }
 
    double f(const double* x) override {
       for (int l = 0; l < num_vars(); ++l) {
@@ -356,9 +394,11 @@ public:
       const double fu = scale_ == 1.0 ? obj_factor : obj_factor * scale_;
       for (size_t i = 0; i < u_orig_.size(); ++i) values[k++] = fu;                  // (u,u)
       if (cart_) {
+         const int k0 = k;
          cart_hess(x, lam, values, k);
          for (const auto& e : div_x_) values[k++] = e.v * lam[nodes_[e.r].h1];      // (α,qx)
          for (const auto& e : div_y_) values[k++] = e.v * lam[nodes_[e.r].h1];      // (α,qy)
+         if (cart_gn) std::fill(values + k0, values + k, 0.0);
          for (size_t k2 = 0; k2 < tile_alpha_.size(); ++k2) values[k++] = 0.0;
          for (size_t k2 = 0; k2 < alpha_orig_.size(); ++k2) values[k++] = obj_factor * kRegAlpha;
          return;
@@ -773,10 +813,20 @@ private:
          const double s = std::hypot(gx, gy);
          cart_profile(s, phi, d1, d2);
          const double e = s > 0.0 ? d1 / s : 0.0;
-         const double jxx = phi + e * gx * gx, jxy = e * gx * gy, jyy = phi + e * gy * gy;
+         double jxx = phi + e * gx * gx, jxy = e * gx * gy, jyx = jxy, jyy = phi + e * gy * gy;
+         if (cart_proj && s > 0.0 && d1 != 0.0) {   // φI − q̄ĝᵀ/s + ψ'ĝĝᵀ, ψ' = φ's + φ
+            double qx = x[cells_[b].qx], qy = x[cells_[b].qy];
+            const double n = std::hypot(qx, qy);
+            if (n > 1.0) { qx /= n; qy /= n; }
+            const double hx = gx / s, hy = gy / s, p1 = d1 * s + phi;
+            jxx = phi - qx * hx / s + p1 * hx * hx;
+            jxy = -qx * hy / s + p1 * hx * hy;
+            jyx = -qy * hx / s + p1 * hx * hy;
+            jyy = phi - qy * hy / s + p1 * hy * hy;
+         }
          for (int j = 0; j < 3; ++j) values[k++] = -(jxx * c.bx[j] + jxy * c.by[j]);
          values[k++] = 1.0;
-         for (int j = 0; j < 3; ++j) values[k++] = -(jxy * c.bx[j] + jyy * c.by[j]);
+         for (int j = 0; j < 3; ++j) values[k++] = -(jyx * c.bx[j] + jyy * c.by[j]);
          values[k++] = 1.0;
       }
    }
@@ -868,6 +918,7 @@ private:
    std::vector<std::pair<int, int>> ha_;    // own rows ha: (row, the α it reads)
    std::vector<int> u_orig_, alpha_orig_;   // the original u / α variables held here
    std::vector<int> tile_alpha_;            // every α variable an own tile reads, by tile
+   std::vector<std::pair<int, int>> rho_q_, rho_d_;   // --rho-step: (q or δ, its weight α)
    std::vector<Tri> data_;                  // A u in h1
    std::vector<DivTri> div_x_, div_y_;      // K_ξᵀ(α∘q) in h1: qx terms, then qy terms
    std::vector<Tri> grad_x_, grad_y_;       // K_ξ u in h2
@@ -975,6 +1026,13 @@ private:
             }
       }
       for (int b = 0; b < n_blocks; ++b) x[oa + b] = ainit.empty() ? lam : ainit[b];
+      if (!cart_) {
+         start_cells = (long)S * m_q;
+         for (long o = 0; o < start_cells; ++o) {
+            const double c = x[oR + o] * (1.0 - x[oD + o]);
+            if (c > 1e-12) start_products.push_back(c);
+         }
+      }
       return x;
    }
 
@@ -1298,6 +1356,7 @@ private:
                cells_.push_back({s, e, lv(oR + o), lv(oD + o), lv(oTh + o), lv(seen_by(oqx + o, k)),
                                  lv(seen_by(oqy + o, k)), lr(rh2x + o), lr(rh2y + o), lr(rh3x + o),
                                  lr(rh3y + o), lr(rhr + o), lr(rhd + o), lr(rcomp + o)});
+            if (!cart_) rho_d_.push_back({lv(oD + o), lv(seen_by(oa + part_.block(e), k))});
             const int n00 = lv(seen_by(ou + s * m_u + a * N + b, k));
             const int n01 = lv(seen_by(ou + s * m_u + a * N + b + 1, k));
             const int n10 = lv(seen_by(ou + s * m_u + (a + 1) * N + b, k));
@@ -1325,6 +1384,23 @@ private:
          }
       }
       for (const auto& l : own_links) links_.push_back({lr(l[2]), lv(l[0]), lv(l[1])});
+      {  // --rho-step: the weight of every q a node reads (its tile's α), and of the
+         // originals of q copies (the original α), so that the links stay linear
+         std::unordered_map<int, int> orig_of, wq;
+         for (const auto& l : links_) orig_of[l.copy] = l.orig;
+         for (const auto* L : {&div_x_, &div_y_})
+            for (const auto& e : *L) wq.emplace(e.c, grp_alpha_[e.g]);
+         std::vector<std::pair<int, int>> origs;
+         for (const auto& [v, w] : wq) {
+            const auto iv = orig_of.find(v);
+            if (iv == orig_of.end()) continue;
+            const auto iw = orig_of.find(w);
+            origs.push_back({iv->second, iw != orig_of.end() ? iw->second : w});
+         }
+         for (const auto& o : origs) wq.emplace(o.first, o.second);
+         rho_q_.assign(wq.begin(), wq.end());
+         std::sort(rho_q_.begin(), rho_q_.end());
+      }
       for (size_t l = 0; l < gvar_.size() && gvar_[l] < ou + MU; ++l) u_orig_.push_back((int)l);
       for (int b = 0; b < n_blocks; ++b) {
          const int l = lv(oa + b);

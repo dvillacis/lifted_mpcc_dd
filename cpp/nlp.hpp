@@ -75,6 +75,11 @@ public:
    // inequality row, in row order) is one.  For Raghunathan & Biegler's
    // modified complementarity block (IPM::Options::vw_mu).
    virtual void complementarity_bounds(char* /*lo*/, char* /*up*/) const {}
+   // Curvilinear trial points (opt-in): the IPM's trial point pt = p + a·d of its
+   // [x | s] is corrected in place by curve(); the line search judges, and the step
+   // takes, the corrected point.  false: the straight step.
+   virtual bool curvilinear() const { return false; }
+   virtual void curve(const double* /*p*/, const double* /*d*/, double /*a*/, double* /*pt*/) {}
 
    // ---- partition
    virtual int n_tiles() const = 0;                        // all tiles, on all ranks

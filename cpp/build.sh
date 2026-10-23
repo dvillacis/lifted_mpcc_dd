@@ -14,7 +14,8 @@
 # (e.g. conda-forge's mumps-seq).  With MUMPS, mumps_check is built too: run it
 # once on every machine before using MUMPS tiles.
 #
-# macOS: Homebrew Eigen (and libomp for OMP=1); LAPACK from Accelerate.
+# macOS: Eigen from the active conda env, else Homebrew (and libomp for OMP=1);
+#        LAPACK from Accelerate.
 # Linux: Eigen through pkg-config eigen3 (or $CONDA_PREFIX/include/eigen3) and
 #        -llapack -lblas; override with LAPACK_LIBS="-lopenblas" etc.  In a
 #        conda env, conda-forge's mumps-seq is picked up when nothing else is.
@@ -58,7 +59,15 @@ if [ "$(uname)" = "Darwin" ]; then
   SDK="$(xcrun --show-sdk-path)"
   # the Command Line Tools' own libc++ headers can be missing: use the SDK's
   FLAGS+=(-nostdinc++ -isystem "$SDK/usr/include/c++/v1" -isysroot "$SDK")
-  FLAGS+=(-I"$(brew --prefix eigen)/include/eigen3")
+  # Eigen from the active conda env if it has one, else from Homebrew
+  if [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/include/eigen3/Eigen/Dense" ]; then
+    FLAGS+=(-I"$CONDA_PREFIX/include/eigen3")
+  elif command -v brew >/dev/null 2>&1 && [ -d "$(brew --prefix eigen)/include/eigen3" ]; then
+    FLAGS+=(-I"$(brew --prefix eigen)/include/eigen3")
+  else
+    echo "build.sh: no Eigen found.  conda install -c conda-forge eigen  (or brew install eigen)" >&2
+    exit 1
+  fi
   LIBS+=(${LAPACK_LIBS:--framework Accelerate})
   if [ "${OMP:-0}" = "1" ]; then
     LIBOMP="$(brew --prefix libomp)"
@@ -108,11 +117,11 @@ if [ "${MUMPS:-1}" != "0" ]; then
     MFLAGS=(-DDD_HAVE_MUMPS $(pkg-config --cflags coinmumps))
     MLIBS=($(pkg-config --libs coinmumps) -Wl,-rpath,"$(pkg-config --variable=libdir coinmumps)")
   elif [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/include/dmumps_c.h" ] \
-       && [ -e "$CONDA_PREFIX/lib/libdmumps_seq.so" ]; then   # conda-forge mumps-seq
+       && { [ -e "$CONDA_PREFIX/lib/libdmumps_seq.so" ] || [ -e "$CONDA_PREFIX/lib/libdmumps_seq.dylib" ]; }; then   # conda-forge mumps-seq
     MFLAGS=(-DDD_HAVE_MUMPS -isystem "$CONDA_PREFIX/include")
-    MLIBS=(-L"$CONDA_PREFIX/lib")
+    MLIBS=(-L"$CONDA_PREFIX/lib" -Wl,-rpath,"$CONDA_PREFIX/lib")
     for l in dmumps_seq mumps_common_seq pord_seq mpiseq_seq; do
-      [ -e "$CONDA_PREFIX/lib/lib$l.so" ] && MLIBS+=(-l$l)
+      { [ -e "$CONDA_PREFIX/lib/lib$l.so" ] || [ -e "$CONDA_PREFIX/lib/lib$l.dylib" ]; } && MLIBS+=(-l$l)
     done
   fi
   if [ "$HPC" = "1" ] && [ ${#MFLAGS[@]} -eq 0 ]; then

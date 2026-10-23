@@ -17,6 +17,7 @@ is deterministic for a given ``--seed``.
 
   uv run python make_datasets.py bsds --size 64 --per-image 1
   uv run python make_datasets.py cartoon --size 64 --train-count 1000 --val-count 500
+  uv run python make_datasets.py phantom --size 64
 
 The archives are unpacked into images/raw/ (ignored by git) on first use.
 """
@@ -106,18 +107,35 @@ def cartoon(args):
     write_set(args.name or f"cartoon{P}", items, P)
 
 
+def phantom(args):
+    P = args.size
+    y, x = (np.mgrid[0:P, 0:P] + 0.5) / P
+    u = np.full((P, P), 0.2)
+    u[(x > 0.08) & (x < 0.55) & (y > 0.10) & (y < 0.45)] = 0.75   # rectangle
+    u[(x > 0.20) & (x < 0.40) & (y > 0.20) & (y < 0.35)] = 0.45   # its inset
+    u[(x - 0.72) ** 2 + (y - 0.70) ** 2 < 0.17 ** 2] = 0.9         # disk
+    for i in range(3):                                            # small squares
+        for j in range(3):
+            if (i + j) % 2 == 0:
+                x0, y0 = 0.10 + 0.11 * i, 0.60 + 0.11 * j
+                u[(x >= x0) & (x < x0 + 0.08) & (y >= y0) & (y < y0 + 0.08)] = 0.6
+    path = os.path.join(IMAGES, args.name or f"phantom{P}.png")
+    Image.fromarray(np.round(255 * u).astype(np.uint8), mode="L").save(path)
+    print(f"  {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("set", choices=["bsds", "cartoon"])
+    ap.add_argument("set", choices=["bsds", "cartoon", "phantom"])
     ap.add_argument("--size", type=int, default=64, help="P: images are P×P")
     ap.add_argument("--per-image", type=int, default=1, help="bsds: crops per image")
     ap.add_argument("--train-count", type=int, default=1000, help="cartoon: training images")
     ap.add_argument("--val-count", type=int, default=500, help="cartoon: held-out images")
     ap.add_argument("--seed", type=int, default=0, help="bsds: crop positions")
-    ap.add_argument("--name", default="", help="images/<name> (default bsds<P> / cartoon<P>)")
+    ap.add_argument("--name", default="", help="images/<name> (default bsds<P> / cartoon<P> / phantom<P>.png)")
     args = ap.parse_args()
-    {"bsds": bsds, "cartoon": cartoon}[args.set](args)
+    {"bsds": bsds, "cartoon": cartoon, "phantom": phantom}[args.set](args)
 
 
 if __name__ == "__main__":

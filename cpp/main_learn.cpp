@@ -62,7 +62,9 @@ static void usage() {
       "               --start-gamma, times --start-gamma-rate 0.1 once |proj grad| <=\n"
       "               --start-gamma-sigma 0.1 (gamma/G) x the first;\n"
       "               --start-newton primal|pd: its lower-level Newton, on the primal Huber\n"
-      "               energy or primal-dual semismooth (De los Reyes-Schoenlieb-Valkonen))\n"
+      "               energy or primal-dual semismooth (De los Reyes-Schoenlieb-Valkonen);\n"
+      "               --start-outer lbfgs|gn: its outer method, projected L-BFGS or Gauss-Newton\n"
+      "               steps (G = sum S'S + rho I, S = du/dalpha, nb solves per image; also --smoothed))\n"
       "               then the MPCC from its weight map and its lower-level solutions, lifted;\n"
       "               scalar: stage 1 on one weight, which then starts every block;\n"
       "               interior: no stage 1; the MPCC from u = f, q = 0, delta = 0, r = |Ku|,\n"
@@ -71,7 +73,9 @@ static void usage() {
       "               the dual (gamma: --start-gamma; --start-huber c2: the C2 Huber (3.2) of\n"
       "               De los Reyes et al., c1: Definition 1's, g/max(gamma, |g|), dual: that\n"
       "               Huber as rows max(gamma, |Ku|) q - Ku = 0, q its own unknown; dualproj:\n"
-      "               those rows, q projected onto |q| <= 1 in their derivatives), solved by\n"
+      "               those rows, q projected onto |q| <= 1 in their derivatives; c1proj, c2proj:\n"
+      "               the c1 / c2 rows with h's derivative written with q projected, as bimpcc_2;\n"
+      "               --start-ipm-hess exact|gn: gn drops the constraints' curvature), solved by\n"
       "               this IPM from the uniform\n"
       "               start (--start-ipm-init pdhg: the exact TV solution at --alpha0, lifted;\n"
       "               smoothed: the smoothed lower level at --alpha0, q = h(Ku), feasible),\n"
@@ -82,12 +86,18 @@ static void usage() {
       "             --t0 T (the first relaxation t, instead of 10 mu0)\n"
       "             --bound-push K (IPOPT's bound_push = bound_frac; default 1e-2)\n"
       "             --alpha-init FILE (start from this map: one value per block, whitespace\n"
-      "               separated)  --save-alpha FILE (write the learned block values)\n"
+      "               separated; no stage 1, the lower levels by PDHG)\n"
+      "             --start-alpha FILE (stage 1, and --smoothed, start from this map instead\n"
+      "               of --alpha0: one value per block of stage 1's map, i.e. one with\n"
+      "               --start scalar)  --save-alpha FILE (write the learned block values)\n"
       "             --stage1-only (stop after stage 1, with its peak memory)\n"
+      "             --save-stage1-alpha FILE (write stage 1's block values)\n"
       "             --color auto|always|never (auto: a terminal, unless NO_COLOR; plain under\n"
       "               mpirun, where --color always or CLICOLOR_FORCE=1 asks for colour)\n"
       "             --classify (the MPCC multipliers and the class S/M/C/W of the biactive cells\n"
       "               at the last iterate with t = t_min)\n"
+      "             --rho-step (curvilinear trial points: (P alpha) delta and Q(alpha) q follow\n"
+      "               the Newton step instead of delta and q; opt-in)\n"
       "             --warm-tol 1e-6  --warm-iters 20000 (PDHG warm start, when A != I or DTV)\n"
       "  operator   --op denoise|inpaint|deblur\n"
       "             --blur-sigma 1  --blur-radius w (default ceil(2 sigma_b); tiles >= 4w wide)\n"
@@ -182,16 +192,19 @@ static int run(int argc, char** argv) {
    OpConfig cfg;
    double kappa_sigma = 1e10, dual_reg = 1e-6, dual_reg_exp = 0.0, kappa_eps = 1000.0;
    int max_soc = 0;
-   std::string grid_spec, alpha_init_file, save_alpha_file, start = "smoothed";
+   std::string grid_spec, alpha_init_file, start_alpha_file, save_alpha_file, save_stage1_file,
+       start = "smoothed";
    double start_gamma = 1e-3, mu0 = 0.1, bound_push = 1e-2, start_ftol = 1e-9, start_tol = 1e-6;
    double start_gamma0 = 0.0, start_gamma_rate = 0.1, start_gamma_sigma = 0.1;   // stage 1's γ continuation
    std::string start_newton = "primal";   // stage 1's lower-level Newton: primal | pd
+   std::string start_outer = "lbfgs";     // stage 1's (and --smoothed's) outer method: lbfgs | gn
    std::string start_huber = "c2";        // --start ipm: the Huber of (3.2) (c2) or Definition 1 (c1)
    std::string start_ipm_init = "pdhg";   // --start ipm: its start, exact TV (pdhg) or smoothed
+   std::string start_ipm_hess = "exact";  // --start ipm: its Hessian, exact or gn (no constraint curvature)
    double t0 = 0.0;   // > 0: the first relaxation t (else 10·μ0, as tv_dd)
    std::string start_solver = "auto", color_mode = "auto";
    int start_iters = 1000;
-   bool classify = false, stage1_only = false;
+   bool classify = false, stage1_only = false, rho_step = false;
    std::string diag_file;
    double freeze_xi = 0.0;
    int freeze_persist = 3;
@@ -219,6 +232,7 @@ static int run(int argc, char** argv) {
       if (a == "--check-derivatives") { check = true; continue; }
       if (a == "--same-seed") { same_seed = true; continue; }
       if (a == "--classify") { classify = true; continue; }
+      if (a == "--rho-step") { rho_step = true; continue; }
       if (a == "--stage1-only") { stage1_only = true; continue; }
       if (a == "--help" || a == "-h") { if (root) usage(); return 0; }
       if (i + 1 >= argc) { if (root) usage(); return 1; }
@@ -299,14 +313,18 @@ static int run(int argc, char** argv) {
       else if (a == "--start-gamma-rate") start_gamma_rate = std::stod(v);
       else if (a == "--start-gamma-sigma") start_gamma_sigma = std::stod(v);
       else if (a == "--start-newton") start_newton = v;
+      else if (a == "--start-outer") start_outer = v;
       else if (a == "--start-huber") start_huber = v;
       else if (a == "--start-ipm-init") start_ipm_init = v;
+      else if (a == "--start-ipm-hess") start_ipm_hess = v;
       else if (a == "--start-tol") start_tol = std::stod(v);
       else if (a == "--start-solver") start_solver = v;
       else if (a == "--color") color_mode = v;
       else if (a == "--start-iters") start_iters = std::stoi(v);
       else if (a == "--alpha-init") alpha_init_file = v;
+      else if (a == "--start-alpha") start_alpha_file = v;
       else if (a == "--save-alpha") save_alpha_file = v;
+      else if (a == "--save-stage1-alpha") save_stage1_file = v;
       else if (a == "--smoothed") smooth_gamma = std::stod(v);
       else if (a == "--smoothed-tol") smooth_tol = std::stod(v);
       else if (a == "--smoothed-iters") smooth_iters = std::stoi(v);
@@ -338,8 +356,13 @@ static int run(int argc, char** argv) {
       ui::error("--start must be smoothed, scalar, uniform, interior or ipm");
       return 1;
    }
-   if (start_huber != "c1" && start_huber != "c2" && start_huber != "dual" && start_huber != "dualproj") {
-      ui::error("--start-huber must be c1, c2, dual or dualproj");
+   if (start_huber != "c1" && start_huber != "c2" && start_huber != "dual" && start_huber != "dualproj" &&
+       start_huber != "c1proj" && start_huber != "c2proj") {
+      ui::error("--start-huber must be c1, c2, dual, dualproj, c1proj or c2proj");
+      return 1;
+   }
+   if (start_ipm_hess != "exact" && start_ipm_hess != "gn") {
+      ui::error("--start-ipm-hess must be exact or gn");
       return 1;
    }
    if (start_ipm_init != "pdhg" && start_ipm_init != "smoothed") {
@@ -350,7 +373,21 @@ static int run(int argc, char** argv) {
       ui::error("--start-newton must be primal or pd");
       return 1;
    }
+   if (start_outer != "lbfgs" && start_outer != "gn") {
+      ui::error("--start-outer must be lbfgs or gn");
+      return 1;
+   }
    if (alpha0 < 0.0) alpha0 = 0.7 * sigma;
+   std::vector<double> start_alpha;   // stage 1's (and --smoothed's) first weights
+   if (!start_alpha_file.empty()) {
+      if (!alpha_init_file.empty() ||
+          (smooth_gamma <= 0.0 && start != "smoothed" && start != "scalar")) {
+         if (root) std::fprintf(stderr, "--start-alpha needs stage 1 (--start smoothed|scalar) or"
+                                " --smoothed, and excludes --alpha-init\n");
+         return 1;
+      }
+      start_alpha = read_alpha(start_alpha_file);
+   }
    if (dopt.fallback == dd::Backend::Sparse) dopt.fallback = dd::Backend::Dense;
    const bool use_mumps = dopt.blocks == dd::Backend::Mumps ||
                           (dopt.blocks == dd::Backend::Sparse && dopt.fallback == dd::Backend::Mumps);
@@ -404,12 +441,12 @@ static int run(int argc, char** argv) {
 
    // The exact (TV) lower level of one image at a weight per cell: loss ½‖u − u_clean‖²,
    // PSNR, SSIM (pdhg.hpp to 1e-9, at most --rof-iters iterations).
-   struct Eval { double loss, psnr, ssim; int iters; };
+   struct Eval { double loss, psnr, ssim; int iters; std::vector<double> u; };
    auto exact_eval = [&](const Instance& in, const std::vector<double>& acell, double tol) {
-      const PdhgResult P = pdhg(in, bp, acell, tol, rof_iters);
+      PdhgResult P = pdhg(in, bp, acell, tol, rof_iters);
       double l = 0.0;
       for (size_t i = 0; i < P.u.size(); ++i) l += 0.5 * (P.u[i] - in.clean[i]) * (P.u[i] - in.clean[i]);
-      return Eval{l, psnr(in.clean, P.u.data()), ssim(in.clean, P.u.data(), N), P.iters};
+      return Eval{l, psnr(in.clean, P.u.data()), ssim(in.clean, P.u.data(), N), P.iters, std::move(P.u)};
    };
 
    // ---- the baselines: a grid search over a scalar weight, the smoothed bilevel method
@@ -419,13 +456,32 @@ static int run(int argc, char** argv) {
          return 1;
       }
       const int m_q = (N - 1) * (N - 1);
-      auto report_exact = [&](const char* what, const std::vector<double>& acell, double ridge) {
-         double Jtr = ridge, ptr = 0, str = 0, pva = 0, sva = 0;
-         for (const Instance& in : train) {
+      // uref (optional): a lower-level solution per training image, compared with the exact one
+      auto report_exact = [&](const char* what, const std::vector<double>& acell, double ridge,
+                              const std::vector<std::vector<double>>* uref = nullptr) {
+         double Jtr = ridge, ptr = 0, str = 0, pva = 0, sva = 0, du = 0;
+         // flat cells, |∇u| (forward differences) below 1e-6 / 1e-4: exact, then uref's
+         long flat[2][2] = {{0, 0}, {0, 0}}, cells = 0;
+         auto count_flat = [&](const std::vector<double>& u, long* f) {
+            for (int a = 0; a + 1 < N; ++a)
+               for (int b = 0; b + 1 < N; ++b) {
+                  const double g = std::hypot(u[a * N + b + 1] - u[a * N + b], u[(a + 1) * N + b] - u[a * N + b]);
+                  f[0] += g < 1e-6;
+                  f[1] += g < 1e-4;
+               }
+         };
+         for (size_t s = 0; s < train.size(); ++s) {
+            const Instance& in = train[s];
             const Eval e = exact_eval(in, acell, 1e-9);
             Jtr += loss_scale * e.loss;
             ptr += e.psnr / S;
             str += e.ssim / S;
+            if (uref) {
+               for (size_t i = 0; i < e.u.size(); ++i) du = std::max(du, std::abs((*uref)[s][i] - e.u[i]));
+               count_flat(e.u, flat[0]);
+               count_flat((*uref)[s], flat[1]);
+               cells += (long)(N - 1) * (N - 1);
+            }
          }
          for (const Instance& in : val) {
             const Eval e = exact_eval(in, acell, 1e-9);
@@ -434,6 +490,13 @@ static int run(int argc, char** argv) {
          }
          (void)what;
          ui::kv("upper-level loss", "%.8e (the exact lower level)", Jtr);
+         if (uref) {
+            ui::kv("lower level", "max|u - u_exact| %.2e (its own solutions against the exact"
+                   " ones at the same weights)", du);
+            ui::kv("flat cells", "|grad u| < 1e-6: exact %.1f%%, own %.1f%%; < 1e-4: exact %.1f%%, own %.1f%%",
+                   100.0 * flat[0][0] / cells, 100.0 * flat[1][0] / cells, 100.0 * flat[0][1] / cells,
+                   100.0 * flat[1][1] / cells);
+         }
          ui::kv("PSNR, SSIM", "train %.3f dB, %.4f", ptr, str);
          if (!val.empty()) ui::kv("held-out", "%.3f dB, %.4f", pva, sva);
          return std::array<double, 5>{Jtr, ptr, str, val.empty() ? NAN : pva, val.empty() ? NAN : sva};
@@ -473,8 +536,11 @@ static int run(int argc, char** argv) {
       if (smooth_gamma > 0.0) {
          const LearnPartition spart(N, 1, S, block);
          ui::header("The smoothed bilevel method (Huber, gamma %.0e), L-BFGS", smooth_gamma);
+         if (!start_alpha.empty()) ui::kv("start", "the map in %s", start_alpha_file.c_str());
          const smoothed::Result R = smoothed::solve(train, bp, spart, smooth_gamma, alpha0, loss_scale,
-                                                    true, smooth_tol, smooth_iters);
+                                                    true, smooth_tol, smooth_iters, 1e-10, 1e-9, 0,
+                                                    false, 0.0, 0.1, 0.1, false, start_alpha,
+                                                    start_outer == "gn");
          double am = 0, amin = 1e300, amax = -1e300, ridge = 0;
          for (double v : R.alpha) {
             am += v / R.alpha.size();
@@ -490,7 +556,7 @@ static int run(int argc, char** argv) {
          if (!save_alpha_file.empty()) write_alpha(save_alpha_file, R.alpha);
          std::vector<double> acell(m_q);
          for (int e = 0; e < m_q; ++e) acell[e] = R.alpha[spart.block(e)];
-         const auto r = report_exact("smoothed", acell, ridge);
+         const auto r = report_exact("smoothed", acell, ridge, &R.u);
          std::printf("CSV-SMOOTH,%s,%d,%d,%g,%s,%g,%d,%d,%d,%d,%ld,%d,%.6f,%.8e,%.8e,%.3f,%.4f,%.3f,%.4f,%.2f\n",
                      train_spec.c_str(), N, S, sigma, cfg.op.c_str(), smooth_gamma, block,
                      R.converged ? 1 : 0, R.iters, R.lower_solves, R.newton_iters, R.lower_failures,
@@ -577,7 +643,9 @@ static int run(int argc, char** argv) {
                  f1.u.empty() ? nullptr : &f1, start_gamma);
       p1.print = root;
       p1.bounds_as_rows = bounds_rows;
-      p1.cart_c1 = start_huber == "c1";
+      p1.cart_c1 = start_huber == "c1" || start_huber == "c1proj";
+      p1.cart_proj = start_huber == "c1proj" || start_huber == "c2proj";
+      p1.cart_gn = start_ipm_hess == "gn";
       p1.cart_dual = start_huber == "dual" || start_huber == "dualproj";
       p1.cart_dual_proj = start_huber == "dualproj";
       if (check) {   // the Cartesian rows' derivatives, then exit
@@ -592,12 +660,15 @@ static int run(int argc, char** argv) {
       ipm1.opt.mu_min = 0.0;
       if (root) {
          ui::header("Stage 1: the smoothed problem q = h(Ku) (%s, gamma %.0e), by the IPM",
-                    p1.cart_dual_proj ? "Definition 1's Huber, primal-dual rows, q projected in the derivatives"
+                    p1.cart_proj ? (p1.cart_c1 ? "Huber of Definition 1, derivatives with q projected (bimpcc_2)"
+                                                : "C1 Huber clipping, derivatives with q projected (bimpcc_2)")
+                    : p1.cart_dual_proj ? "Definition 1's Huber, primal-dual rows, q projected in the derivatives"
                     : p1.cart_dual ? "Definition 1's Huber, primal-dual rows max(gamma, |Ku|) q - Ku = 0"
                     : p1.cart_c1 ? "Huber of Definition 1, h = g/max(gamma, |g|)" : "C1 Huber clipping",
                     start_gamma);
          ui::kv("problem", "%d variables, %d constraints (Cartesian: u, q, alpha), to %.0e", p1.n,
                 p1.mcon, start_tol);
+         if (p1.cart_gn) ui::kv("Hessian", "the objective's only (no constraint curvature)");
          ui::kv("start", "%s at alpha %g", f1.u.empty() ? "the exact TV solution (lifted)"
                 : "the smoothed lower level, q = h(Ku)", alpha0);
       }
@@ -633,6 +704,7 @@ static int run(int argc, char** argv) {
       if (root)
          ui::header("Stage 1: the smoothed bilevel method (Huber, gamma %.0e)%s, L-BFGS", start_gamma,
                     start == "scalar" ? " on one weight" : "");
+      if (root && !start_alpha.empty()) ui::kv("start", "the map in %s", start_alpha_file.c_str());
       const smoothed::Result R1 = smoothed::solve(train, bp, spart, start_gamma, alpha0, loss_scale,
                                                   !quiet && root, 1e-6, start_iters, 1e-10,
                                                   start_ftol,
@@ -643,8 +715,10 @@ static int run(int argc, char** argv) {
                                                       ? 1
                                                       : 0,
                                                   true, start_gamma0, start_gamma_rate,
-                                                  start_gamma_sigma, start_newton == "pd");
+                                                  start_gamma_sigma, start_newton == "pd",
+                                                  start_alpha, start_outer == "gn");
       ainit = start == "scalar" ? std::vector<double>(part.n_blocks, R1.alpha[0]) : R1.alpha;
+      if (root && !save_stage1_file.empty()) write_alpha(save_stage1_file, R1.alpha);
       stage1_wall = R1.wall;
       fields.u = R1.u;
       fields.qx = R1.qx;
@@ -665,6 +739,7 @@ static int run(int argc, char** argv) {
    TvLearn problem(train, part, bp, alpha0, loss_scale, warm_tol, warm_max_iter, ainit,
                    fields.u.empty() ? nullptr : &fields);
    problem.classify = classify;
+   problem.rho_step = rho_step;
    problem.diag = !diag_file.empty();
    problem.freeze_xi = freeze_xi;
    problem.freeze_persist = freeze_persist;
@@ -695,6 +770,14 @@ static int run(int argc, char** argv) {
       ui::kv("problem", "%d variables, %d constraints (%d inequalities), %d copies; %d weight%s",
              problem.n, problem.mcon, problem.n_ineq, problem.n_link, part.n_blocks,
              part.n_blocks > 1 ? "s" : "");
+      if (problem.start_cells > 0) {   // how far the lifted start is from the exact problem
+         const auto& P = problem.start_products;
+         const long above = std::count_if(P.begin(), P.end(), [&](double c) { return c > t_min; });
+         const double pmax = P.empty() ? 0.0 : *std::max_element(P.begin(), P.end());
+         ui::kv("start", "r(1-delta) > t_min on %ld of %ld cells (%.1f%%), max %.2e (> 1e-12 on %zu)%s",
+                above, problem.start_cells, 100.0 * above / problem.start_cells, pmax, P.size(),
+                above ? ": not feasible for the relaxed problem at t_min" : "");
+      }
       std::string cuts;
       for (int c : part.cut) cuts += (cuts.empty() ? "" : " ") + std::to_string(c);
       ui::kv("tiles", "%dx%d per image (%d in all); cuts at cells %s%s", nsub, nsub, part.n_tiles,
@@ -742,6 +825,7 @@ static int run(int argc, char** argv) {
    const double ts = dd::Comm::max(s.t_sdirect), tp = dd::Comm::max(s.t_precond);
    const double tsol = dd::Comm::max(s.t_solve), tts = dd::Comm::max(s.t_tile_solves);
    const double ti = dd::Comm::max(s.t_interface);
+   const long rho_straight = dd::Comm::sum(problem.rho_straight);   // collective: before the return
    if (!root) return ok ? 0 : 2;
 
    ui::outcome(ok, "%s %s (status %d) after %d iterations, t = %.1e, %.2f s",
@@ -759,6 +843,9 @@ static int run(int argc, char** argv) {
       }
       if (max_soc > 0)
          ui::kv("second order", "%ld corrections computed, %ld taken", r.soc_tried, r.soc_accepted);
+      if (rho_step)
+         ui::kv("rho step", "curvilinear trial points; %ld delta entries kept the straight step",
+                rho_straight);
       ui::kv("linear systems", "%d tiles, KKT dimension %d, border %d (max per tile %d), max tile %d;"
              " %ld factorizations (%ld sparse fallbacks)", s.n_tiles, s.dim, s.p, s.max_pk, s.max_tk,
              s.factorizations, s.fallbacks);
